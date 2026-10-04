@@ -60,8 +60,10 @@ class Agent {
 	clone() {
 		this.dir = mkdtempSync(join(tmpdir(), `braid-${this.name}-`));
 		execFileSync("git", ["-c", `http.extraHeader=Authorization: Bearer ${this.gitToken}`, "clone", "-q", this.remote, this.dir], { stdio: "pipe" });
-		// Scope the credential to this remote only, so fetching trunk with its own token still works.
+		// Each credential is scoped to its own remote: write on the attempt, read on trunk.
 		this.git("config", `http.${this.remote}.extraHeader`, `Authorization: Bearer ${this.gitToken}`);
+		this.git("remote", "add", "trunk", this.trunkRemote);
+		this.git("config", `http.${this.trunkRemote}.extraHeader`, `Authorization: Bearer ${this.trunkToken}`);
 		this.git("config", "user.name", this.name);
 		this.git("config", "user.email", `${this.name}@agents.braid.dev`);
 	}
@@ -203,8 +205,8 @@ await pause("Next: land the reset button (I3), which is now two landings behind.
 const late = await land(haiku);
 if (!late.landed) {
 	// The other way to reconcile: plain git. Merge trunk into the attempt, fix it in the working copy, push.
-	const { trunk_url } = await haiku.call("sync");
-	haiku.git("fetch", "-q", trunk_url, "main");
+	await haiku.call("sync");
+	haiku.git("fetch", "-q", "trunk", "main");
 	try { haiku.git("merge", "FETCH_HEAD"); } catch { say(haiku.name, "git merge of trunk stopped on conflicts, resolving in the working copy"); }
 	const trunkApp = haiku.git("show", "FETCH_HEAD:app.js");
 	writeFileSync(join(haiku.dir, "app.js"), trunkApp

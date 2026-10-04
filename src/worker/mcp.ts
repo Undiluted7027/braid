@@ -25,7 +25,7 @@ export const TOOLS = [
 	tool("reconciliation", "If landing conflicted: both versions of each conflicting file, their common base, and why trunk's side exists (the other intent and its decisions)."),
 	tool("resolve", "Answer a reconciliation with full merged file contents that satisfy both intents, plus a rationale. Braid then lands the attempt.",
 		{ resolutions: { type: "array", items: { type: "object", properties: { path: str, content: str }, required: ["path", "content"] } }, rationale: str }, ["resolutions", "rationale"]),
-	tool("sync", "How to merge the current trunk into your attempt with git, including a read token for trunk."),
+	tool("sync", "How to merge the current trunk into your attempt with git."),
 ];
 
 const INSTRUCTIONS = "Braid coordinates several agents changing one codebase at once. Call `brief` first. Claim paths before editing, record every decision, checkpoint after every push, and read `heads_up` in every response.";

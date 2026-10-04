@@ -119,6 +119,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const { data: diff } = useAsync(() => api<DiffFile[]>("GET", `/p/${slug}/attempts/${a.id}/diff`), [a.id, a.headSha, a.baseSha]);
 	const decisions = state.decisions.filter((d) => d.attemptId === a.id);
 	const [preview, setPreview] = useState(false);
+	const key = state.previewKeys?.[a.id];
+	const previewUrl = `/preview/${slug}/${a.id}${key ? `~${key}` : ""}/`;
 	const [showSession, setShowSession] = useState(true);
 	const [frame, setFrame] = useState(0);
 	useEffect(() => setFrame((f) => f + 1), [a.headSha]);
@@ -175,9 +177,9 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			<div className="row section-head">
 				<h3>Preview</h3><span className="spacer" />
 				<button onClick={() => setPreview(!preview)}>{preview ? "Hide" : "Run it"}</button>
-				<a className="button" href={`/preview/${slug}/${a.id}/`} target="_blank" rel="noreferrer">Open</a>
+				<a className="button" href={previewUrl} target="_blank" rel="noreferrer">Open</a>
 			</div>
-			{preview && <iframe key={frame} className="preview" src={`/preview/${slug}/${a.id}/`} title={`Preview of attempt ${a.id}`} sandbox="allow-scripts allow-forms allow-modals" />}
+			{preview && <iframe key={frame} className="preview" src={previewUrl} title={`Preview of attempt ${a.id}`} sandbox="allow-scripts allow-forms allow-modals" />}
 
 			<h3>Changes {diff && <span className="dim">({diff.length})</span>}</h3>
 			{diff?.length === 0 && <p className="dim small">Nothing pushed yet.</p>}

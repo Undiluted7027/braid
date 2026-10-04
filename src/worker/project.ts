@@ -7,17 +7,20 @@ import { asText, diffTrees, listTree, mergeBase, predict } from "./gitops";
 import { commitFiles, land, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
+import { redact } from "../shared/redact";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
 	Intent, JoinResult, Landing, Overlap, Reconciliation, SessionEvent, State,
 } from "../shared/types";
 
-export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string };
+export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string };
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
 const MAX_TEXT = 400_000;
 const MAX_EVENT_TEXT = 4000;
+// Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
+const MAX_RESULT_TEXT = 800;
 const MAX_EVENTS = 20_000;
 const now = () => Date.now();
 const short = (sha: string) => sha.slice(0, 7);
@@ -130,7 +133,7 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	private note(kind: string, actor: string, text: string, intentId: number | null = null, attemptId: string | null = null) {
-		this.sql.exec("INSERT INTO activity (at, kind, actor, text, intent_id, attempt_id) VALUES (?, ?, ?, ?, ?, ?)", now(), kind, actor, text, intentId, attemptId);
+		this.sql.exec("INSERT INTO activity (at, kind, actor, text, intent_id, attempt_id) VALUES (?, ?, ?, ?, ?, ?)", now(), kind, actor, redact(text), intentId, attemptId);
 		this.broadcast();
 	}
 	private signal(to: string, kind: string, body: unknown) {
@@ -211,6 +214,13 @@ export class Project extends DurableObject<BraidEnv> {
 		return { remote: this.meta("remote"), branch: this.branch, gitToken: await this.host.token(this.trunk, "write", 900) };
 	}
 
+	/** Read access to the context repo, for cloning the recorded why. */
+	async contextCredentials() {
+		const remote = this.meta("context_remote");
+		if (!remote) throw new BraidError("nothing has landed yet, so there is no context repo", 404);
+		return { remote, branch: "main", gitToken: await this.host.token(`${this.meta("slug")}--context`, "read", 3600) };
+	}
+
 	async destroy() {
 		this.requireProject();
 		for (const repo of [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
@@ -283,6 +293,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.note("attempt", agent, `${agent} started attempt ${id} on I${intent.id} from ${short(base)}`, intent.id, id);
 		return {
 			attemptId: id, intentId: intent.id, branch: this.branch, remote: forked.remote, gitToken: forked.token, agentToken: token,
+			trunkRemote: this.meta("remote"), trunkToken: await this.host.token(this.trunk, "read", 86400),
 			mcpUrl: `${input.origin}/mcp/${this.meta("slug")}`, brief: this.briefText(this.attempt(id)),
 		};
 	}
@@ -455,7 +466,7 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const e of events.slice(0, 200)) {
 			if (!kinds.has(e.kind) || typeof e.text !== "string" || !e.text) continue;
 			const row = this.rows("INSERT INTO session (attempt_id, at, kind, tool, text) VALUES (?, ?, ?, ?, ?) RETURNING *",
-				attemptId, typeof e.at === "number" ? e.at : now(), e.kind, e.tool ? String(e.tool).slice(0, 80) : null, e.text.slice(0, MAX_EVENT_TEXT))[0];
+				attemptId, typeof e.at === "number" ? e.at : now(), e.kind, e.tool ? String(e.tool).slice(0, 80) : null, redact(e.text).slice(0, e.kind === "result" ? MAX_RESULT_TEXT : MAX_EVENT_TEXT))[0];
 			added.push(this.toEvent(row));
 		}
 		if (!added.length) return;
@@ -483,6 +494,8 @@ export class Project extends DurableObject<BraidEnv> {
 	/**
 	 * Commit an attempt's intent, decisions, and session transcript to the project's context
 	 * repo in Artifacts, so the why of a landing can be cloned and read like the code.
+	 * Git history cannot be taken back, so command output is left out: a result keeps only its
+	 * first line (status and size). The full session stays in this object, where it can be deleted.
 	 */
 	private async saveContext(intent: Intent, a: Attempt, landingSha: string) {
 		const repo = `${this.meta("slug")}--context`;
@@ -498,7 +511,7 @@ export class Project extends DurableObject<BraidEnv> {
 			[`intents/${intent.id}/intent.json`]: JSON.stringify({ ...intent, landedSha: landingSha, landedAttempt: a.id }, null, "\t") + "\n",
 			[`${base}/attempt.json`]: JSON.stringify({ id: a.id, agent: a.agent, kind: a.kind, repo: a.repo, baseSha: a.baseSha, headSha: a.headSha, landedAs: landingSha, summary: a.summary, files: a.files.map((f) => `${f.status} ${f.path}`), checks: a.checks }, null, "\t") + "\n",
 			[`${base}/decisions.json`]: JSON.stringify(this.decisionsFor(a.id), null, "\t") + "\n",
-			[`${base}/session.jsonl`]: events.map((e) => JSON.stringify({ at: e.at, kind: e.kind, tool: e.tool, text: e.text })).join("\n") + "\n",
+			[`${base}/session.jsonl`]: events.map((e) => JSON.stringify({ at: e.at, kind: e.kind, tool: e.tool, text: e.kind === "result" ? e.text.split("\n")[0].slice(0, 160) : e.text })).join("\n") + "\n",
 		}, `Context for I${intent.id}: ${intent.title} (attempt ${a.id}, landed ${short(landingSha)})`, { name: "Braid", email: "context@braid.dev" }, empty);
 		this.note("context", "braid", `Saved the why and ${events.length} session events of attempt ${a.id} to ${repo} as ${short(sha)}`, intent.id, a.id);
 	}
@@ -534,14 +547,14 @@ export class Project extends DurableObject<BraidEnv> {
 				const kind = (["decision", "assumption", "rejected", "question", "note"].includes(args.kind) ? args.kind : "decision") as DecisionKind;
 				if (!args.title) throw new BraidError("record needs a title");
 				this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-					me.id, me.intentId, me.agent, kind, String(args.title), String(args.body ?? ""), json((args.files ?? []).map(String)), me.headSha, now());
+					me.id, me.intentId, me.agent, kind, redact(String(args.title)), redact(String(args.body ?? "")), json((args.files ?? []).map(String)), me.headSha, now());
 				this.note("why", me.agent, `${me.agent} recorded ${kind}: ${args.title}`, me.intentId, me.id);
 				return { recorded: true };
 			}
 			case "checkpoint": {
 				await this.serial(() => this.recompute());
 				const a = this.attempt(me.id);
-				if (args.summary) { a.summary = String(args.summary); this.saveAttempt(a); }
+				if (args.summary) { a.summary = redact(String(args.summary)); this.saveAttempt(a); }
 				return {
 					head: a.headSha, changed: a.files.map((f) => `${f.status} ${f.path}`), behind_trunk_by: a.behind,
 					would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id),
@@ -557,7 +570,7 @@ export class Project extends DurableObject<BraidEnv> {
 				return out;
 			}
 			case "message": {
-				const body = String(args.body ?? "");
+				const body = redact(String(args.body ?? ""));
 				const targets = args.to && args.to !== "all" ? [this.attempt(String(args.to))] : this.attempts().filter((a) => LIVE.has(a.status) && a.id !== me.id);
 				for (const t of targets) this.signal(t.id, "message", { from: { attempt: me.id, agent: me.agent, intent: me.intentId }, body });
 				this.note("message", me.agent, `${me.agent} → ${targets.map((t) => t.agent).join(", ") || "nobody"}: ${body}`, me.intentId, me.id);
@@ -575,7 +588,7 @@ export class Project extends DurableObject<BraidEnv> {
 				const a = this.attempt(me.id);
 				if (a.headSha === a.baseSha) throw new BraidError("nothing pushed yet: push your commits to the attempt remote before marking ready");
 				if (a.status === "working") a.status = "ready";
-				if (args.summary) a.summary = String(args.summary);
+				if (args.summary) a.summary = redact(String(args.summary));
 				this.saveAttempt(a);
 				this.note("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id);
 				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id) };
@@ -589,16 +602,15 @@ export class Project extends DurableObject<BraidEnv> {
 				if (!r) throw new BraidError("no open reconciliation for this attempt");
 				return this.submitResolution(r.id, args.resolutions ?? [], String(args.rationale ?? ""), me.agent);
 			}
-			case "sync": {
-				const token = await this.host.token(this.trunk, "read", 3600);
-				const url = this.meta("remote").replace("https://", `https://x:${token.split("?expires=")[0]}@`);
+			case "sync":
+				// No token here: this answer lands in the agent's transcript. The read credential for trunk is
+				// set up in the attempt's git config at join (see cli/braid.mjs) and refreshed by `braid auth`.
 				return {
 					trunk_head: this.meta("head"),
-					trunk_url: url,
-					commands: [`git fetch ${url} ${this.branch}`, "git merge FETCH_HEAD", `git push origin HEAD:${this.branch}`],
-					note: "Merging trunk into your attempt and resolving conflicts in your working copy is always a valid way to reconcile. Call checkpoint after pushing.",
+					commands: [`git fetch trunk ${this.branch}`, "git merge FETCH_HEAD", `git push origin HEAD:${this.branch}`],
+					note: "Merging trunk into your attempt and resolving conflicts in your working copy is always a valid way to reconcile. Call checkpoint after pushing. " +
+						"If the `trunk` remote is missing or the fetch is refused, run `braid auth` in the attempt directory to set it up again.",
 				};
-			}
 			default:
 				throw new BraidError(`unknown tool ${tool}`);
 		}
@@ -853,13 +865,16 @@ export class Project extends DurableObject<BraidEnv> {
 	async credentials(agentToken: string) {
 		const row = this.rows("SELECT * FROM attempts WHERE token = ?", agentToken)[0];
 		if (!row) throw new BraidError("unknown agent token", 401);
-		return { remote: row.remote as string, gitToken: await this.host.token(row.repo, "write", 86400) };
+		return {
+			remote: row.remote as string, gitToken: await this.host.token(row.repo, "write", 86400),
+			trunkRemote: this.meta("remote"), trunkToken: await this.host.token(this.trunk, "read", 86400),
+		};
 	}
 }
 
 /** One line saying what a Braid tool call was about, for the session record. */
 function describeCall(tool: string, args: Record<string, any>): string {
-	const clip = (s: unknown) => String(s ?? "").replace(/\s+/g, " ").slice(0, 300);
+	const clip = (s: unknown) => redact(String(s ?? "")).replace(/\s+/g, " ").slice(0, 300);
 	switch (tool) {
 		case "claim": return `claim ${(args.paths ?? []).join(", ")}${args.reason ? `: ${clip(args.reason)}` : ""}`;
 		case "record": return `record ${args.kind ?? "decision"}: ${clip(args.title)}`;

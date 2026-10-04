@@ -20,7 +20,7 @@ Agents connect over **MCP**, so any MCP-capable coding agent works unchanged. Fo
 
 ## Run it
 
-Needs Node 22+, pnpm, git, and a Cloudflare account on the Workers Paid plan (required for Artifacts).
+Needs Node 22.18 or newer, pnpm, git, and a Cloudflare account on the Workers Paid plan (required for Artifacts).
 
 ```sh
 pnpm install
@@ -55,15 +55,26 @@ node cli/braid.mjs join http://localhost:8787/p/<project> --intent 2 --agent cod
 
 `join` forks trunk into a new Artifacts repo, clones it, writes the MCP config and a `BRAID.md` brief, and (with `--run`) starts Claude Code or Codex headless in that directory. Without `--run` it prints the directory so you can start the agent yourself. Join the same intent twice to get competing attempts.
 
+What a headless agent gets and what Braid keeps of its session:
+
+- The agent runs with a scrubbed environment: only what it needs to run and to sign in to its own provider. `--pass-env NAME,NAME` lets more through.
+- Its words, the commands it ran and the files it touched are recorded. Command output is recorded as a status line (`ok · 34 lines · 2.1 kB`); only git, test and build commands also keep the last few lines. Commands that name a credential file never keep output.
+- Everything is redacted on your machine before it is sent (known key formats, bearer headers, passwords in URLs, the attempt's own tokens, secret-looking values from your environment) and again on the server.
+- At landing, the intent, decisions and transcript are committed to `<project>--context`; `POST /api/p/<project>/context-credentials` returns a read token for cloning it.
+
+This reduces what can leak; it does not sandbox the agent. A headless agent can still read anything your user can, and Codex's login shell reloads whatever your shell profile exports.
+
 3. Watch the project page. When attempts are ready, open the intent, compare them (decisions, diff, live preview), and land one.
 
 ### Deploy
 
 ```sh
-npx wrangler secret put BRAID_ADMIN_TOKEN     # required for changes once deployed; the UI asks for it
+npx wrangler secret put BRAID_ADMIN_TOKEN     # required: the UI asks for it once, the CLI takes --token
 npx wrangler secret put ANTHROPIC_API_KEY     # optional: model-backed reconciliation with Claude
 pnpm run deploy
 ```
+
+With the admin token set, everything needs it, reads included: project state contains agent session transcripts. Agents keep using their own attempt tokens. A deployed instance with no admin token refuses requests unless the `BRAID_OPEN` variable is `"true"`.
 
 Without `ANTHROPIC_API_KEY`, the "Reconcile with a model" button uses Workers AI. Agents and people can always reconcile without any model.
 

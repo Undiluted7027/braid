@@ -32,15 +32,52 @@ export class PushWorkflow extends WorkflowEntrypoint<BraidEnv, any> {
 	}
 }
 
-/** With BRAID_ADMIN_TOKEN set, anything that changes state needs it. Agents use their own attempt tokens over MCP. */
-function authorized(request: Request, env: BraidEnv, seg: string[]) {
-	if (!env.BRAID_ADMIN_TOKEN || request.method === "GET" || seg[2] === "ws" || seg[2] === "credentials" || seg[2] === "session") return true;
-	return request.headers.get("authorization") === `Bearer ${env.BRAID_ADMIN_TOKEN}`;
+const COOKIE = "braid_session";
+const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const sha256 = async (text: string) => hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+/** Compare without stopping at the first difference. */
+function same(a: string, b: string) {
+	let diff = a.length ^ b.length;
+	for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i % (b.length || 1));
+	return diff === 0;
 }
+/** What the browser holds after signing in: derived from the admin token, so the token itself is not kept in a cookie. */
+const sessionValue = (token: string) => sha256(`braid-session:${token}`);
+/** Lets a sandboxed preview frame load one ref. Its requests carry no cookie, so the key travels in the path. */
+async function previewKey(token: string, slug: string, ref: string) {
+	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+	return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`preview:${slug}:${ref}`))).slice(0, 32);
+}
+
+/**
+ * Who may use this instance. With BRAID_ADMIN_TOKEN set, everything needs it: reads too, because
+ * project state includes agent session transcripts. Without one, Braid is open, which is only
+ * allowed on localhost unless BRAID_OPEN is "true".
+ */
+async function access(request: Request, env: BraidEnv, url: URL): Promise<"ok" | "denied" | "unconfigured"> {
+	const token = env.BRAID_ADMIN_TOKEN;
+	if (!token) return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || env.BRAID_OPEN === "true" ? "ok" : "unconfigured";
+	if (same(request.headers.get("authorization") ?? "", `Bearer ${token}`)) return "ok";
+	const cookie = (request.headers.get("cookie") ?? "").split(/;\s*/).find((c) => c.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1) ?? "";
+	return same(cookie, await sessionValue(token)) ? "ok" : "denied";
+}
+const refuse = (how: "denied" | "unconfigured") => how === "denied"
+	? Response.json({ error: "this Braid instance needs its admin token" }, { status: 401 })
+	: Response.json({ error: "this Braid instance has no admin token. Set the BRAID_ADMIN_TOKEN secret, or set BRAID_OPEN to \"true\" to run it open to anyone." }, { status: 503 });
 
 async function api(request: Request, env: BraidEnv, url: URL): Promise<Response> {
 	const seg = url.pathname.split("/").filter(Boolean).slice(1); // after "api"
-	if (!authorized(request, env, seg)) return Response.json({ error: "this Braid instance needs an admin token for changes" }, { status: 401 });
+	if (seg[0] === "login" && request.method === "POST") {
+		const given = String(((await request.json().catch(() => ({}))) as any)?.token ?? "");
+		if (!env.BRAID_ADMIN_TOKEN || !same(given, env.BRAID_ADMIN_TOKEN)) return Response.json({ error: "wrong admin token" }, { status: 401 });
+		return Response.json({ ok: true }, { headers: {
+			"set-cookie": `${COOKIE}=${await sessionValue(env.BRAID_ADMIN_TOKEN)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${url.protocol === "https:" ? "; Secure" : ""}`,
+		} });
+	}
+	// Launchers and agents sign these two with their attempt token, which the project checks.
+	const byAttemptToken = request.method === "POST" && seg[0] === "p" && (seg[2] === "credentials" || seg[2] === "session") && seg.length === 3;
+	const allowed = byAttemptToken ? "ok" : await access(request, env, url);
+	if (allowed !== "ok") return refuse(allowed);
 	const body = async () => ((await request.json().catch(() => ({}))) ?? {}) as Record<string, any>;
 	const { method } = request;
 	const registry = project(env, REGISTRY);
@@ -67,7 +104,12 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 
 	if (rest[0] === "ws") return p.fetch(request);
 	if (method === "GET") {
-		if (rest.length === 0) return Response.json(await p.state());
+		if (rest.length === 0) {
+			const state = await p.state();
+			const token = env.BRAID_ADMIN_TOKEN;
+			if (token) state.previewKeys = Object.fromEntries(await Promise.all(["trunk", ...state.attempts.map((a) => a.id)].map(async (ref) => [ref, await previewKey(token, slug, ref)])));
+			return Response.json(state);
+		}
 		if (rest[0] === "attempts" && rest[2] === "session") return Response.json(await p.session(rest[1], Number(q.get("after") ?? 0)));
 		if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
 		if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
@@ -91,14 +133,19 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		// Session events from an agent's launcher, authenticated by the attempt token.
 		if (rest[0] === "session") return Response.json(await p.ingest((request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), b.events));
 		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
+		if (rest[0] === "context-credentials") return Response.json(await p.contextCredentials());
 		if (rest[0] === "credentials") return Response.json(await p.credentials(String(b.agentToken ?? "")));
 	}
 	return Response.json({ error: "not found" }, { status: 404 });
 }
 
 /** Serve any file from trunk or an attempt straight out of Artifacts: a live preview with no build. */
-async function preview(env: BraidEnv, url: URL): Promise<Response> {
-	const [, , slug, ref, ...parts] = url.pathname.split("/");
+async function preview(request: Request, env: BraidEnv, url: URL): Promise<Response> {
+	const [, , slug, refAndKey = "", ...parts] = url.pathname.split("/");
+	// `<ref>~<key>`: files inside the frame are fetched without cookies, so the key is part of every relative URL.
+	const [ref, key = ""] = refAndKey.split("~");
+	const allowed = env.BRAID_ADMIN_TOKEN && same(key, await previewKey(env.BRAID_ADMIN_TOKEN, slug, ref)) ? "ok" : await access(request, env, url);
+	if (allowed !== "ok") return refuse(allowed);
 	let path = decodeURIComponent(parts.join("/"));
 	if (path === "" || path.endsWith("/")) path += "index.html";
 	const bytes = await project(env, slug).raw(ref, path);
@@ -119,7 +166,7 @@ export default {
 		const url = new URL(request.url);
 		try {
 			if (url.pathname.startsWith("/api/")) return await api(request, env, url);
-			if (url.pathname.startsWith("/preview/")) return await preview(env, url);
+			if (url.pathname.startsWith("/preview/")) return await preview(request, env, url);
 			if (url.pathname.startsWith("/mcp/")) {
 				const slug = url.pathname.split("/")[2];
 				const token = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");

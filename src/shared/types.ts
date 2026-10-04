@@ -99,6 +99,8 @@ export interface Landing {
 export interface Activity { id: number; at: number; kind: string; actor: string; text: string; intentId: number | null; attemptId: string | null }
 export interface ProjectInfo { slug: string; name: string; description: string; repo: string; remote: string; branch: string; head: string; contextRemote: string | null; llm: string | null }
 export interface State {
+	/** Set when the instance has an admin token: the key that lets a sandboxed preview frame load each ref. */
+	previewKeys?: Record<string, string>;
 	project: ProjectInfo;
 	intents: Intent[];
 	attempts: Attempt[];
@@ -108,7 +110,7 @@ export interface State {
 	landings: Landing[];
 	activity: Activity[];
 }
-export interface JoinResult { attemptId: string; intentId: number; branch: string; remote: string; gitToken: string; agentToken: string; mcpUrl: string; brief: string }
+export interface JoinResult { attemptId: string; intentId: number; branch: string; remote: string; gitToken: string; agentToken: string; trunkRemote: string; trunkToken: string; mcpUrl: string; brief: string }
 export interface DiffFile { path: string; status: FileChange["status"]; base: string | null; head: string | null; binary: boolean }
 export interface BlameLine { text: string; sha: string | null }
 export interface FileView { path: string; content: string | null; binary: boolean; blame: BlameLine[]; trail: Landing[] }

@@ -22,7 +22,10 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
 1. **Real repositories.** Import an existing repo (starting with Braid's own) and run the whole loop on a project with a build and a test suite. This comes first because it will break things and makes everything after it honest.
    - Done: a trunk can start from an imported repository (any default branch) or from a local repository via `braid init`. Braid's own repository is a Braid project.
    - Open: the local working copy and the Braid trunk are two separate histories. Decide how changes made outside Braid reach trunk.
-2. **Captured context, not volunteered notes.** Stream each agent's session into Braid and store it with the attempt in Artifacts, so the why is the actual record of the work. This also delivers the live view described below.
+2. **Captured context, not volunteered notes.** Stream each agent's session into Braid and store it with the attempt in Artifacts, so the why is the actual record of the work.
+   - Done: `braid join --run` streams what Claude Code and Codex say, run and get back; the server records every Braid tool call for any agent; the attempt view shows the session live with decisions placed in time; at landing the intent, decisions and transcript are committed to `<project>--context` in Artifacts.
+   - Done: capture is narrowed and redacted. Agents start with a scrubbed environment; command output is stored as a status line (plus a short tail for git, test and build commands); text is redacted in the launcher and again on the server; the committed transcript keeps only each result's status line; `sync` no longer returns a token, the clone has a read-only `trunk` remote instead.
+   - Open: agents not started by the launcher leave only their Braid calls. The Why view does not yet link a line of code to the moment in the session that produced it. Agents still run with the user's own file access; real confinement comes with hosted agents (item 4).
 3. **Evidence-based review.** Run each attempt's tests and build in Cloudflare Sandbox on every push, and give every attempt a real deployed preview. Compare then shows results side by side.
 4. **Agents hosted on Cloudflare.** Start agents from the UI in Sandbox, so opening an intent is enough to get attempts.
 5. **Agents that coordinate.** A planner that splits a goal into intents, a reviewer agent that judges attempts against acceptance, and a landing queue that re-verifies after each landing.
@@ -37,22 +40,6 @@ Items 2 and 3 are the direct answers to the competition brief's questions about 
 - The 5 to 10 minute demo video.
 - A public source repository and a pass over the run instructions once deployed.
 
-## Live view of what each agent is doing
-
-Today the UI updates live over a WebSocket, but only when Braid's own state changes: a claim, a recorded decision, a push, a checkpoint, a landing. Between those moments an agent is invisible. You cannot see what it is reading, editing, or running.
-
-What to add:
-
-- A per-attempt live stream: the agent's current step, the tool it just called, the file it is editing, the command it is running.
-- A panel on the attempt (and a compact line per strand in the braid diagram) showing that stream as it happens.
-- Scrollback, so a reviewer can replay how an attempt got to where it is.
-
-Open questions:
-
-- **Where the stream comes from.** Braid only sees MCP calls and pushes. The rest of an agent's activity lives in its own process. Options: have `braid join --run` tee the agent's output (`claude -p --output-format stream-json`, `codex exec --json`) to a new ingest endpoint; or add a `progress` MCP tool agents call themselves. The first is complete but only works for agents started through the launcher; the second works for any agent but depends on the agent bothering to call it.
-- **Transport.** The project Durable Object already holds the UI's WebSockets, so it can fan the stream out. High-volume output should not go through SQLite row by row; keep a bounded ring buffer in memory and persist a trimmed transcript.
-- **What to show.** Raw transcripts include file contents and command output. Decide what is safe and useful to show by default.
-
 ## Not built yet
 
 - **Hosted agents.** Agents run wherever you start them. Running them in Cloudflare Sandbox, started from the UI, is not built.
@@ -64,4 +51,5 @@ Open questions:
 
 - **Push-event Workflow.** It only fires on a deployed Worker and has never run.
 - **Model-backed reconciliation.** Written for Claude and Workers AI; never called.
-- **Admin token guard** for a deployed instance.
+
+Checked locally on October 4, 2026: the admin token guard (every route class, cookie sign-in, keyed previews, the socket), the context repo's contents read back from a clone, and capture and redaction with real Claude Code and Codex sessions that ran `env`, `cat .mcp.json` and `git config --list`.

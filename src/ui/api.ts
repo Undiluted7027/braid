@@ -1,23 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionEvent, State } from "../shared/types";
 
-const TOKEN_KEY = "braid:admin-token";
-const stored = () => { try { return localStorage.getItem(TOKEN_KEY) ?? ""; } catch { return ""; } };
+// A protected instance answers 401 until the browser has signed in; ask for the admin token once,
+// however many requests were refused at the same moment. The server keeps the session in a cookie.
+let signingIn: Promise<boolean> | null = null;
+function signIn() {
+	signingIn ??= (async () => {
+		const token = window.prompt("This Braid instance needs its admin token:") ?? "";
+		if (!token) return false;
+		const res = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
+		if (!res.ok) window.alert("That is not this instance's admin token.");
+		return res.ok;
+	})().finally(() => { signingIn = null; });
+	return signingIn;
+}
 
 export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
-	const send = (token: string) => fetch(`/api${path}`, {
-		method, body: body ? JSON.stringify(body) : undefined,
-		headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
-	});
-	let res = await send(stored());
-	if (res.status === 401) {
-		// A deployed instance protects changes with an admin token; ask once and remember it.
-		const token = window.prompt("This Braid instance needs its admin token to make changes:") ?? "";
-		if (token) {
-			try { localStorage.setItem(TOKEN_KEY, token); } catch {}
-			res = await send(token);
-		}
-	}
+	const send = () => fetch(`/api${path}`, { method, body: body ? JSON.stringify(body) : undefined, headers: { "content-type": "application/json" } });
+	let res = await send();
+	if (res.status === 401 && await signIn()) res = await send();
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) throw new Error((data as any).error ?? `${res.status} ${res.statusText}`);
 	return data as T;
