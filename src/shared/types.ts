@@ -104,7 +104,9 @@ export interface RunStep { name: string; command: string; status: "running" | "p
 export interface Run {
 	id: number; ref: string; sha: string;
 	status: "queued" | "running" | "pass" | "fail" | "error" | "superseded";
-	steps: RunStep[]; preview: boolean; nothingToRun: boolean; error: string | null; startedAt: number; finishedAt: number | null;
+	steps: RunStep[]; preview: boolean;
+	/** The preview's /api/ calls are answered by this Braid instance, read-only (braid.json: preview.api = "braid"). */
+	previewApi: boolean; nothingToRun: boolean; error: string | null; startedAt: number; finishedAt: number | null;
 }
 export interface State {
 	/** Set when the instance has an admin token: the key that lets a sandboxed preview frame load each ref. */

@@ -111,10 +111,8 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 			if (token) state.previewKeys = Object.fromEntries(await Promise.all(["trunk", ...state.attempts.map((a) => a.id)].map(async (ref) => [ref, await previewKey(token, slug, ref)])));
 			return Response.json(state);
 		}
-		if (rest[0] === "attempts" && rest[2] === "session") return Response.json(await p.session(rest[1], Number(q.get("after") ?? 0)));
-		if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
-		if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
-		if (rest[0] === "file") return Response.json(await p.file(q.get("path") ?? ""));
+		const read = await reads(p, rest, q);
+		if (read) return read;
 	}
 	if (method === "DELETE" && rest.length === 0) {
 		await p.destroy();
@@ -141,7 +139,52 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 	return Response.json({ error: "not found" }, { status: 404 });
 }
 
-/** Serve any file from trunk or an attempt straight out of Artifacts: a live preview with no build. */
+/** The read-only views of one project, shared by the API and by previews that are allowed to read it. */
+async function reads(p: Project, rest: string[], q: URLSearchParams): Promise<Response | null> {
+	if (rest[0] === "attempts" && rest[2] === "session") return Response.json(await p.session(rest[1], Number(q.get("after") ?? 0)));
+	if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
+	if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
+	if (rest[0] === "file") return Response.json(await p.file(q.get("path") ?? ""));
+	return null;
+}
+
+/**
+ * A preview whose repository says `"preview": { "api": "braid" }` gets its /api/ calls answered by this
+ * instance: reads only, and only of the project the preview belongs to. That is what lets Braid's own
+ * UI be previewed against real data. The code asking is an attempt's, so it gets nothing it could
+ * change and nothing from other projects.
+ */
+async function previewApi(request: Request, env: BraidEnv, slug: string, path: string, q: URLSearchParams): Promise<Response> {
+	const seg = path.split("/").filter(Boolean).slice(1); // after "api"
+	const p = project(env, slug);
+	const cors = (r: Response) => { const out = new Response(r.body, r); out.headers.set("access-control-allow-origin", "*"); return out; };
+	if (request.method === "OPTIONS") return cors(new Response(null, { status: 204, headers: { "access-control-allow-headers": "content-type, authorization", "access-control-allow-methods": "GET" } }));
+	const readOnly = () => cors(Response.json({ error: "this is a preview: it can read this project and change nothing" }, { status: 403 }));
+	if (request.method !== "GET") return readOnly();
+	if (seg[0] === "projects" && seg.length === 1) return cors(Response.json((await project(env, REGISTRY).listProjects()).filter((x) => x.slug === slug)));
+	if (seg[0] !== "p" || seg[1] !== slug) return readOnly();
+	const rest = seg.slice(2);
+	if (rest[0] === "ws" && rest.length === 1) return p.fetch(request);
+	if (rest.length === 0) return cors(Response.json(await p.state()));
+	return cors((await reads(p, rest, q)) ?? Response.json({ error: "not found" }, { status: 404 }));
+}
+
+/**
+ * Put in front of a built page. The page is served under /preview/<project>/<ref>/ but was built to
+ * live at the root of a site, so requests it makes to "/..." are sent under the preview path, and its
+ * router is shown the path it expects.
+ */
+const shim = (base: string) => `<script>(function(){var B=${JSON.stringify(base)};
+function fix(u){try{var x=new URL(u,location.href);if(x.host===location.host&&x.pathname!==B&&x.pathname.indexOf(B+"/")!==0)x.pathname=B+x.pathname;return x.href}catch(e){return u}}
+var p=location.pathname;if(p===B||p.indexOf(B+"/")===0){try{history.replaceState(history.state,"",(p.slice(B.length)||"/")+location.search+location.hash)}catch(e){}}
+var f=window.fetch;window.fetch=function(i,o){if(typeof i==="string"||i instanceof URL)i=fix(String(i));else if(i instanceof Request)i=new Request(fix(i.url),i);return f.call(this,i,o)};
+var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=fix(u);return xo.apply(this,arguments)};
+var W=window.WebSocket;window.WebSocket=function(u,pr){return pr===undefined?new W(fix(u)):new W(fix(u),pr)};window.WebSocket.prototype=W.prototype;
+if(window.EventSource){var E=window.EventSource;window.EventSource=function(u,c){return new E(fix(u),c)};window.EventSource.prototype=E.prototype}
+document.addEventListener("click",function(e){var a=e.target&&e.target.closest&&e.target.closest("a[href]");if(a&&!e.defaultPrevented&&a.host===location.host&&!a.target){a.href=fix(a.href)}});
+})();</script>`;
+
+/** Serve a ref's preview: the build Braid made of it, or its files straight out of Artifacts when there is nothing to build. */
 async function preview(request: Request, env: BraidEnv, url: URL): Promise<Response> {
 	const [, , slug, refAndKey = "", ...parts] = url.pathname.split("/");
 	// `<ref>~<key>`: files inside the frame are fetched without cookies, so the key is part of every relative URL.
@@ -152,18 +195,26 @@ async function preview(request: Request, env: BraidEnv, url: URL): Promise<Respo
 	if (path === "" || path.endsWith("/")) path += "index.html";
 	const file = await project(env, slug).raw(ref, path);
 	if (!file) return new Response("not found in this attempt", { status: 404 });
+	if ("proxy" in file) return previewApi(request, env, slug, path, url.searchParams);
 	const ext = file.path.slice(file.path.lastIndexOf(".") + 1).toLowerCase();
 	let body: BodyInit = file.bytes as Uint8Array<ArrayBuffer>;
+	const base = `/preview/${slug}/${refAndKey}`;
 	// Built sites usually link their assets from the site root; point those at this preview instead.
-	if (file.built && ext === "html") body = new TextDecoder().decode(file.bytes).replace(/\b(src|href)=(["'])\/(?!\/)/g, `$1=$2/preview/${slug}/${refAndKey}/`);
+	if (file.built && ext === "html") {
+		const html = new TextDecoder().decode(file.bytes).replace(/\b(src|href)=(["'])\/(?!\/)/g, `$1=$2${base}/`);
+		body = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (head) => head + shim(base)) : shim(base) + html;
+	}
+	// Agent-written code runs here; give it an opaque origin so it cannot call the Braid API as the viewer.
+	let csp = "sandbox allow-scripts allow-forms allow-modals";
+	// A preview that can read the project must not be able to send what it reads anywhere else.
+	if (file.api) csp += `; default-src ${url.origin} data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src ${url.origin} ${url.origin.replace(/^http/, "ws")}; form-action 'none'`;
 	return new Response(body, {
 		headers: {
 			"content-type": MIME[ext] ?? "application/octet-stream",
 			"cache-control": "no-store",
 			// The frame has an opaque origin, and module scripts and fonts are fetched with CORS even from their own site.
 			"access-control-allow-origin": "*",
-			// Agent-written code runs here; give it an opaque origin so it cannot call the Braid API as the viewer.
-			"content-security-policy": "sandbox allow-scripts allow-forms allow-modals",
+			"content-security-policy": csp,
 		},
 	});
 }

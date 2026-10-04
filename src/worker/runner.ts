@@ -40,7 +40,7 @@ export class RegistryGateway extends WorkerEntrypoint<BraidEnv> {
 	}
 }
 
-interface Plan { install: string | null; checks: [string, string][]; previewDir: string | null }
+interface Plan { install: string | null; checks: [string, string][]; previewDir: string | null; previewApi: boolean }
 
 export class Runner extends DurableObject<BraidEnv> {
 	constructor(ctx: DurableObjectState, env: BraidEnv) {
@@ -122,7 +122,7 @@ export class Runner extends DurableObject<BraidEnv> {
 		const passed = steps.every((s) => s.status === "pass");
 		let preview = false;
 		if (plan.previewDir && steps.find((s) => s.name === "build")?.status !== "fail") preview = await this.savePreview(container, plan.previewDir);
-		return finish({ status: passed ? "pass" : "fail", preview, nothingToRun: plan.checks.length === 0 });
+		return finish({ status: passed ? "pass" : "fail", preview, previewApi: preview && plan.previewApi, nothingToRun: plan.checks.length === 0 });
 	}
 
 	/** What to run: the repository's braid.json if it has one, otherwise what its package.json offers. */
@@ -140,7 +140,7 @@ export class Runner extends DurableObject<BraidEnv> {
 		let previewDir: string | null = typeof config?.preview?.dir === "string" ? config.preview.dir : null;
 		// Decided before the build, from what the project says or where builds usually land; checked again after.
 		if (!previewDir && config?.preview !== false) previewDir = pkg?.scripts?.build ? "auto" : (await has("index.html")) ? "." : null;
-		return { install, checks, previewDir };
+		return { install, checks, previewDir, previewApi: config?.preview?.api === "braid" };
 	}
 
 	/** Copy the built site out of the instance into this object, so the preview outlives the sandbox. */

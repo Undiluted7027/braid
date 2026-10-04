@@ -68,9 +68,11 @@ export class Project extends DurableObject<BraidEnv> {
 			CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT, at INTEGER, kind TEXT, tool TEXT, text TEXT);
 			CREATE INDEX IF NOT EXISTS session_attempt ON session (attempt_id, id);
 			CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, sha TEXT, status TEXT, steps TEXT, preview INTEGER,
-				nothing_to_run INTEGER, error TEXT, started_at INTEGER, finished_at INTEGER);
+				nothing_to_run INTEGER, error TEXT, started_at INTEGER, finished_at INTEGER, preview_api INTEGER DEFAULT 0);
 			CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, kind TEXT, actor TEXT, text TEXT, intent_id INTEGER, attempt_id TEXT);
 		`);
+		// Added after the first projects existed.
+		try { this.sql.exec("ALTER TABLE runs ADD COLUMN preview_api INTEGER DEFAULT 0"); } catch {}
 	}
 
 	// ── storage helpers ──────────────────────────────────────────────────────
@@ -466,7 +468,7 @@ export class Project extends DurableObject<BraidEnv> {
 	// ── verification: each commit of an attempt is run in a sandbox ──────────
 
 	private toRun = (r: any): Run => ({
-		id: r.id, ref: r.ref, sha: r.sha, status: r.status, steps: JSON.parse(r.steps), preview: !!r.preview, nothingToRun: !!r.nothing_to_run,
+		id: r.id, ref: r.ref, sha: r.sha, status: r.status, steps: JSON.parse(r.steps), preview: !!r.preview, previewApi: !!r.preview_api, nothingToRun: !!r.nothing_to_run,
 		error: r.error, startedAt: r.started_at, finishedAt: r.finished_at,
 	});
 	private latestRun(ref: string): Run | null {
@@ -500,8 +502,8 @@ export class Project extends DurableObject<BraidEnv> {
 		const row = this.rows("SELECT * FROM runs WHERE id = ?", runId)[0];
 		if (!row) return;
 		const run = { ...this.toRun(row), ...patch };
-		this.sql.exec("UPDATE runs SET status = ?, steps = ?, preview = ?, nothing_to_run = ?, error = ?, finished_at = ? WHERE id = ?",
-			run.status, json(run.steps), run.preview ? 1 : 0, run.nothingToRun ? 1 : 0, run.error ?? null, run.finishedAt ?? null, runId);
+		this.sql.exec("UPDATE runs SET status = ?, steps = ?, preview = ?, preview_api = ?, nothing_to_run = ?, error = ?, finished_at = ? WHERE id = ?",
+			run.status, json(run.steps), run.preview ? 1 : 0, run.previewApi ? 1 : 0, run.nothingToRun ? 1 : 0, run.error ?? null, run.finishedAt ?? null, runId);
 		if (!patch.finishedAt || run.status === "superseded") return this.broadcast();
 
 		const a = run.ref === "trunk" ? null : this.attempt(run.ref);
@@ -922,17 +924,19 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	/** A file for the preview of `ref`: from the build Braid made of its current commit if there is one, otherwise straight from the repository. */
-	async raw(ref: string, path: string): Promise<{ bytes: Uint8Array; path: string; built: boolean } | null> {
+	async raw(ref: string, path: string): Promise<{ bytes: Uint8Array; path: string; built: boolean; api: boolean } | { proxy: true } | null> {
 		this.requireProject();
 		const { repo, ref: gitRef } = this.where(ref);
 		const head = ref === "trunk" ? this.meta("head") : this.attempt(ref).headSha;
-		const built = this.rows("SELECT id FROM runs WHERE ref = ? AND sha = ? AND preview = 1 ORDER BY id DESC LIMIT 1", ref, head)[0];
+		const built = this.rows<{ preview_api: number }>("SELECT preview_api FROM runs WHERE ref = ? AND sha = ? AND preview = 1 ORDER BY id DESC LIMIT 1", ref, head)[0];
 		if (built) {
+			const api = !!built.preview_api;
+			if (api && (path === "api" || path.startsWith("api/"))) return { proxy: true };
 			const file = await this.runner(ref)!.file(path);
-			return file ? { bytes: new Uint8Array(file.body), path: file.path, built: true } : null;
+			return file ? { bytes: new Uint8Array(file.body), path: file.path, built: true, api } : null;
 		}
 		const bytes = await this.host.readFile(repo, gitRef, path);
-		return bytes ? { bytes, path, built: false } : null;
+		return bytes ? { bytes, path, built: false, api: false } : null;
 	}
 
 	/** A trunk file with line-level why: which landing (and so which intent) last wrote each line. */

@@ -87,7 +87,9 @@ Without `ANTHROPIC_API_KEY`, the "Reconcile with a model" button uses Workers AI
 - **Workflow on push events** (`PushWorkflow`): a `cf.artifacts.repo.pushed` trigger on the whole namespace starts a Workflow for every push, which tells the owning project to re-read that attempt and recompute overlaps. Agents also call `checkpoint` after pushing, which does the same thing synchronously.
 - **Runner, one per attempt** (`src/worker/runner.ts`): a Durable Object with a container. For each new commit it starts a fresh Linux instance, fetches that commit, installs, and runs the project's checks, reporting each step to the project as it goes. After a build it copies the output into its own storage and serves it as the attempt's preview, so the preview outlives the sandbox.
   - The instance has no Internet access and is given no credentials. Git and package traffic leave it only through two Worker entrypoints: one adds a read token for that attempt's repository and refuses everything else (pushes, other repositories); the other allows reads from the npm registry.
-  - What runs: `braid.json` at the repository root if present (`{ "install": "...", "checks": { "name": "command" }, "preview": { "dir": "dist" } }`), otherwise the `typecheck`, `lint`, `test` and `build` scripts in `package.json`. A repository with neither is served as it is.
+  - What runs: `braid.json` at the repository root if present (`{ "install": "...", "checks": { "name": "command" }, "preview": { "dir": "dist", "api": "braid" } }`), otherwise the `typecheck`, `lint`, `test` and `build` scripts in `package.json`. A repository with neither is served as it is.
+  - A built page is served under `/preview/<project>/<attempt>/` but was built to live at a site root, so Braid puts a small script in front of it that sends its `/...` requests under the preview path and shows its router the path it expects.
+  - `"api": "braid"` is for a project whose backend is Braid itself (this repository): the preview's `/api/` calls are answered by the instance it runs on, reads only and only for that project, so an attempt's UI can be reviewed against real data. Such a preview may only talk to its own instance.
 - **Model** (`src/worker/resolver.ts`): optional. Claude via the Anthropic SDK if a key is set, otherwise Workers AI.
 
 ## Agent tools (MCP)
@@ -98,7 +100,7 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 
 ## Limits
 
-- A built preview is static files. An app that needs its own backend loads but its API calls fail (Braid's own UI is one of these).
+- A built preview is static files. An app that needs its own backend loads but its API calls fail. Braid's own UI is the exception: it reads from the instance it is previewed on. Assets a build loads by root path from inside JavaScript or CSS (lazy chunks, `url(/...)`) are not redirected.
 - Verification supports Node projects (npm or pnpm). Each step has ten minutes.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`).
