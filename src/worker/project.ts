@@ -386,6 +386,9 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const a of live) {
 			if (a.headSha !== a.baseSha) await this.verify(a.id).catch((e) => console.error("verify", a.id, e));
 		}
+		// Trunk too, however its head moved: a landing, or a push from outside Braid.
+		// A merge of two attempts that each passed can still be broken.
+		if (this.meta("head")) await this.verify("trunk").catch((e) => console.error("verify trunk", e));
 
 		const next = new Map<string, Overlap>();
 		const put = (o: Overlap) => {
@@ -830,8 +833,6 @@ export class Project extends DurableObject<BraidEnv> {
 				}
 			}
 			await this.recompute();
-			// Trunk is verified too: a merge of two attempts that each passed can still be broken.
-			await this.verify("trunk").catch((e) => console.error("verify trunk", e));
 			return { landed: true as const, sha: result.sha };
 		});
 	}
