@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import type { Attempt, Intent, State } from "../shared/types";
-import { api, ago, intentColor, short } from "./api";
+import { api, ago, intentColor, short, useNow } from "./api";
 import { Link, useAction } from "./App";
 import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
@@ -56,6 +56,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const conflicts = new Set(mine.filter((o) => o.severity === "conflict").map((o) => (o.a === a.id ? o.b : o.a)));
 	const touches = new Set(mine.filter((o) => o.severity !== "conflict").map((o) => (o.a === a.id ? o.b : o.a)));
 	const decisions = state.decisions.filter((d) => d.attemptId === a.id).length;
+	const now = useNow(a.id, a.now);
 	return (
 		<div className={`attempt-row ${a.status}`}>
 			<span className="mono dim">{a.id}</span>
@@ -67,6 +68,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 			{LIVE.has(a.status) && a.trunkConflicts.length > 0 && <span className="chip conflict">conflicts with trunk</span>}
 			{conflicts.size > 0 && <span className="chip conflict">will conflict with {[...conflicts].join(", ")}</span>}
 			{touches.size > 0 && <span className="chip touch">overlaps {[...touches].join(", ")}</span>}
+			{a.status === "working" && now && <p className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</p>}
 		</div>
 	);
 }

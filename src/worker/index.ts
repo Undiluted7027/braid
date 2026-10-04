@@ -34,7 +34,7 @@ export class PushWorkflow extends WorkflowEntrypoint<BraidEnv, any> {
 
 /** With BRAID_ADMIN_TOKEN set, anything that changes state needs it. Agents use their own attempt tokens over MCP. */
 function authorized(request: Request, env: BraidEnv, seg: string[]) {
-	if (!env.BRAID_ADMIN_TOKEN || request.method === "GET" || seg[2] === "ws" || seg[2] === "credentials") return true;
+	if (!env.BRAID_ADMIN_TOKEN || request.method === "GET" || seg[2] === "ws" || seg[2] === "credentials" || seg[2] === "session") return true;
 	return request.headers.get("authorization") === `Bearer ${env.BRAID_ADMIN_TOKEN}`;
 }
 
@@ -68,6 +68,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 	if (rest[0] === "ws") return p.fetch(request);
 	if (method === "GET") {
 		if (rest.length === 0) return Response.json(await p.state());
+		if (rest[0] === "attempts" && rest[2] === "session") return Response.json(await p.session(rest[1], Number(q.get("after") ?? 0)));
 		if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
 		if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
 		if (rest[0] === "file") return Response.json(await p.file(q.get("path") ?? ""));
@@ -87,6 +88,8 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "reconciliations" && rest[2] === "resolve") return Response.json(await p.resolve(Number(rest[1]), b.resolutions ?? [], String(b.rationale ?? ""), b.by));
 		if (rest[0] === "reconciliations" && rest[2] === "auto") return Response.json(await p.resolveWithModel(Number(rest[1])));
 		if (rest[0] === "push") return Response.json((await p.onPush(String(b.repo))) ?? { ok: true });
+		// Session events from an agent's launcher, authenticated by the attempt token.
+		if (rest[0] === "session") return Response.json(await p.ingest((request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), b.events));
 		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
 		if (rest[0] === "credentials") return Response.json(await p.credentials(String(b.agentToken ?? "")));
 	}

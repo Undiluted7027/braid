@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { State } from "../shared/types";
+import type { SessionEvent, State } from "../shared/types";
 
 const TOKEN_KEY = "braid:admin-token";
 const stored = () => { try { return localStorage.getItem(TOKEN_KEY) ?? ""; } catch { return ""; } };
@@ -46,7 +46,13 @@ export function useProject(slug: string) {
 		const connect = () => {
 			ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/p/${slug}/ws`);
 			ws.onopen = () => { setLive(true); reload(); };
-			ws.onmessage = () => {
+			ws.onmessage = (message) => {
+				// Session events are pushed whole; everything else is a hint to refetch state.
+				if (typeof message.data === "string" && message.data.startsWith("{")) {
+					const data = JSON.parse(message.data);
+					if (data.type === "session") window.dispatchEvent(new CustomEvent("braid:session", { detail: data }));
+					return;
+				}
 				// Bursts of changes (a push touches many rows) become one refetch.
 				if (pending.current) return;
 				pending.current = window.setTimeout(() => { pending.current = null; reload(); }, 120);
@@ -90,4 +96,22 @@ export const intentColor = (id: number) => HUES[(id - 1) % HUES.length];
 export function navigate(to: string) {
 	history.pushState(null, "", to);
 	window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+/** Live session events for one attempt, as they are pushed over the project socket. */
+export function onSession(attemptId: string, handler: (events: SessionEvent[]) => void) {
+	const listen = (e: Event) => {
+		const detail = (e as CustomEvent<{ attemptId: string; events: SessionEvent[] }>).detail;
+		if (detail.attemptId === attemptId) handler(detail.events);
+	};
+	window.addEventListener("braid:session", listen);
+	return () => window.removeEventListener("braid:session", listen);
+}
+
+/** What an attempt's agent is doing right now: the latest session event, kept current by the socket. */
+export function useNow(attemptId: string, initial: { kind: string; tool: string | null; text: string; at: number } | null | undefined) {
+	const [now, setNow] = useState(initial ?? null);
+	useEffect(() => setNow(initial ?? null), [attemptId, initial?.at]);
+	useEffect(() => onSession(attemptId, (events) => setNow(events[events.length - 1])), [attemptId]);
+	return now;
 }

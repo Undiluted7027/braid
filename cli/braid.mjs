@@ -111,12 +111,101 @@ Tools: ${TOOLS.join(", ")}.
 		? // Codex's workspace sandbox keeps .git read-only by default, which blocks commits; open it for this attempt.
 		["codex", ["exec", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "-c", `sandbox_workspace_write.writable_roots=["${join(dir, ".git")}"]`, "-c", `mcp_servers.braid.url="${joined.mcpUrl}"`, "-c", `mcp_servers.braid.bearer_token_env_var="BRAID_AGENT_TOKEN"`,
 			// Headless Codex cannot answer approval prompts, so without this every Braid tool call is refused.
-			"-c", `mcp_servers.braid.default_tools_approval_mode="approve"`, PROMPT]]
-		: ["claude", ["-p", PROMPT, "--mcp-config", ".mcp.json", "--permission-mode", "acceptEdits", "--allowedTools", "mcp__braid", "Bash", "Read", "Edit", "Write", "Glob", "Grep"]];
+			"-c", `mcp_servers.braid.default_tools_approval_mode="approve"`, "--json", PROMPT]]
+		: ["claude", ["-p", PROMPT, "--output-format", "stream-json", "--verbose", "--mcp-config", ".mcp.json", "--permission-mode", "acceptEdits", "--allowedTools", "mcp__braid", "Bash", "Read", "Edit", "Write", "Glob", "Grep"]];
 	console.log(`Starting ${cmd} headless…\n`);
 	// No stdin: `codex exec` otherwise waits for piped input forever when not attached to a terminal.
-	const child = spawn(cmd, args, { cwd: dir, env, stdio: ["ignore", "inherit", "inherit"] });
-	child.on("exit", (code) => process.exit(code ?? 0));
+	const child = spawn(cmd, args, { cwd: dir, env, stdio: ["ignore", "pipe", "inherit"] });
+
+	// Both CLIs emit one JSON event per line. Turn each into session events, show them here, and stream them to Braid.
+	const toEvents = agent.startsWith("codex") ? codexEvents : claudeEvents;
+	let queue = [], sending = Promise.resolve();
+	const flush = () => {
+		if (!queue.length) return sending;
+		const events = queue;
+		queue = [];
+		sending = sending.then(() => fetch(`${url.origin}/api/p/${slug}/session`, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: `Bearer ${joined.agentToken}` },
+			body: JSON.stringify({ events }),
+		})).catch(() => {}); // a dropped batch must not stop the agent
+		return sending;
+	};
+	const timer = setInterval(flush, 700);
+	const emit = (events) => {
+		for (const e of events) {
+			console.log(`${e.kind === "say" ? "●" : e.kind === "tool" ? "→" : e.kind === "result" ? "←" : "·"} ${e.tool ? `[${e.tool}] ` : ""}${e.text.split("\n").slice(0, 6).join("\n  ")}`);
+			queue.push({ ...e, at: Date.now() });
+		}
+		if (queue.length >= 25) flush();
+	};
+	emit([{ kind: "system", text: `${cmd} started on attempt ${joined.attemptId}` }]);
+	let buffer = "";
+	child.stdout.on("data", (chunk) => {
+		buffer += chunk;
+		const lines = buffer.split("\n");
+		buffer = lines.pop();
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let event;
+			try { event = JSON.parse(line); } catch { emit([{ kind: "system", text: line }]); continue; }
+			emit(toEvents(event));
+		}
+	});
+	child.on("exit", async (code) => {
+		clearInterval(timer);
+		emit([{ kind: "system", text: `${cmd} exited with code ${code ?? 0}` }]);
+		await flush();
+		process.exit(code ?? 0);
+	});
+}
+
+const clip = (value, max = 1500) => {
+	const s = typeof value === "string" ? value : JSON.stringify(value);
+	return s.length > max ? `${s.slice(0, max)}\n… (${s.length - max} more characters)` : s;
+};
+// Braid tool calls are recorded by the server itself, so the launcher skips them.
+const isBraid = (name) => /(^|_)braid(_|$)/.test(String(name));
+const skipped = new Set(); // ids of tool calls left out, so their results are left out too
+
+/** Claude Code `--output-format stream-json` events. */
+function claudeEvents(e) {
+	if (e.type === "assistant") {
+		return (e.message?.content ?? []).flatMap((b) => {
+			if (b.type === "text" && b.text.trim()) return [{ kind: "say", text: clip(b.text, 4000) }];
+			// ToolSearch only loads tool definitions; it says nothing about the work.
+			if (b.type === "tool_use" && (isBraid(b.name) || b.name === "ToolSearch")) skipped.add(b.id);
+			else if (b.type === "tool_use") {
+				const i = b.input ?? {};
+				return [{ kind: "tool", tool: b.name, text: clip(i.command ?? i.file_path ?? i.pattern ?? i.path ?? i) }];
+			}
+			return [];
+		});
+	}
+	if (e.type === "user") {
+		return (Array.isArray(e.message?.content) ? e.message.content : []).filter((b) => b.type === "tool_result" && !skipped.has(b.tool_use_id)).map((b) => {
+			const text = typeof b.content === "string" ? b.content : (b.content ?? []).map((c) => c.text ?? "").join("\n");
+			return { kind: "result", tool: b.is_error ? "error" : null, text: clip(text.trim() || "(no output)") };
+		});
+	}
+	if (e.type === "result") return [{ kind: "system", text: `finished: ${e.subtype ?? "done"}${e.num_turns ? `, ${e.num_turns} turns` : ""}` }];
+	return [];
+}
+
+/** Codex `exec --json` events. */
+function codexEvents(e) {
+	const item = e.item;
+	if (e.type === "item.completed" && item?.type === "agent_message" && item.text?.trim()) return [{ kind: "say", text: clip(item.text, 4000) }];
+	if (item?.type === "command_execution") {
+		if (e.type === "item.started") return [{ kind: "tool", tool: "shell", text: clip(item.command) }];
+		if (e.type === "item.completed") return [{ kind: "result", tool: item.exit_code ? "error" : null, text: clip(item.aggregated_output || `(exit ${item.exit_code})`) }];
+		return [];
+	}
+	if (e.type === "item.completed" && item?.type === "file_change") return [{ kind: "tool", tool: "edit", text: clip((item.changes ?? []).map((c) => `${c.kind ?? "change"} ${c.path}`).join("\n") || item) }];
+	if (e.type === "item.started" && item?.type === "mcp_tool_call" && !isBraid(item.server)) return [{ kind: "tool", tool: `${item.server}.${item.tool}`, text: clip(item.arguments ?? "") }];
+	if (e.type === "turn.completed") return [{ kind: "system", text: `turn finished${e.usage?.output_tokens ? `, ${e.usage.output_tokens} output tokens` : ""}` }];
+	if (e.type === "error" || e.type === "turn.failed") return [{ kind: "system", text: clip(e.message ?? e.error ?? e) }];
+	return [];
 }
 
 async function initCommand() {

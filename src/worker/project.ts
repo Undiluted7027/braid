@@ -4,12 +4,12 @@ import { DurableObject } from "cloudflare:workers";
 import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
 import { asText, diffTrees, listTree, mergeBase, predict } from "./gitops";
-import { land, seed } from "./land";
+import { commitFiles, land, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Intent, JoinResult, Landing, Overlap, Reconciliation, State,
+	Intent, JoinResult, Landing, Overlap, Reconciliation, SessionEvent, State,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string };
@@ -17,6 +17,8 @@ export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string;
 const LIVE = new Set(["working", "ready", "conflicted"]);
 const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
 const MAX_TEXT = 400_000;
+const MAX_EVENT_TEXT = 4000;
+const MAX_EVENTS = 20_000;
 const now = () => Date.now();
 const short = (sha: string) => sha.slice(0, 7);
 const json = (v: unknown) => JSON.stringify(v);
@@ -59,6 +61,8 @@ export class Project extends DurableObject<BraidEnv> {
 				conflicts TEXT, resolutions TEXT, rationale TEXT, resolved_by TEXT, at INTEGER);
 			CREATE TABLE IF NOT EXISTS landings (sha TEXT PRIMARY KEY, parent_sha TEXT, intent_id INTEGER, attempt_id TEXT, agent TEXT, title TEXT,
 				files TEXT, reconciled INTEGER, at INTEGER);
+			CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT, at INTEGER, kind TEXT, tool TEXT, text TEXT);
+			CREATE INDEX IF NOT EXISTS session_attempt ON session (attempt_id, id);
 			CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, kind TEXT, actor TEXT, text TEXT, intent_id INTEGER, attempt_id TEXT);
 		`);
 	}
@@ -209,7 +213,7 @@ export class Project extends DurableObject<BraidEnv> {
 
 	async destroy() {
 		this.requireProject();
-		for (const repo of [this.trunk, ...this.attempts().map((a) => a.repo)]) {
+		for (const repo of [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
 			try { await this.host.remove(repo); } catch {}
 		}
 		await this.ctx.storage.deleteAll();
@@ -220,10 +224,10 @@ export class Project extends DurableObject<BraidEnv> {
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
-				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), llm: llmName(this.env),
+				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env),
 			},
 			intents: this.intents(),
-			attempts: this.attempts(),
+			attempts: this.attempts().map((a) => ({ ...a, now: this.latestEvent(a.id) })),
 			decisions: this.rows("SELECT * FROM decisions ORDER BY id").map(this.toDecision),
 			overlaps: this.rows<Overlap>("SELECT a, b, path, severity, regions FROM overlaps"),
 			reconciliations: this.rows("SELECT * FROM reconciliations ORDER BY id").map(this.toRecon),
@@ -437,6 +441,68 @@ export class Project extends DurableObject<BraidEnv> {
 		});
 	}
 
+	// ── sessions: the record of what each agent actually did ─────────────────
+
+	private toEvent = (r: any): SessionEvent => ({ id: r.id, attemptId: r.attempt_id, at: r.at, kind: r.kind, tool: r.tool, text: r.text });
+	private latestEvent(attemptId: string) {
+		const r = this.rows("SELECT kind, tool, text, at FROM session WHERE attempt_id = ? ORDER BY id DESC LIMIT 1", attemptId)[0];
+		return r ? { kind: r.kind, tool: r.tool, text: String(r.text).slice(0, 200), at: r.at } : null;
+	}
+
+	private addEvents(attemptId: string, events: { kind: string; tool?: string | null; text: string; at?: number }[]) {
+		const kinds = new Set(["say", "tool", "result", "braid", "system"]);
+		const added: SessionEvent[] = [];
+		for (const e of events.slice(0, 200)) {
+			if (!kinds.has(e.kind) || typeof e.text !== "string" || !e.text) continue;
+			const row = this.rows("INSERT INTO session (attempt_id, at, kind, tool, text) VALUES (?, ?, ?, ?, ?) RETURNING *",
+				attemptId, typeof e.at === "number" ? e.at : now(), e.kind, e.tool ? String(e.tool).slice(0, 80) : null, e.text.slice(0, MAX_EVENT_TEXT))[0];
+			added.push(this.toEvent(row));
+		}
+		if (!added.length) return;
+		// Keep a long attempt bounded: drop the oldest events past the cap.
+		this.sql.exec("DELETE FROM session WHERE attempt_id = ? AND id <= (SELECT id FROM session WHERE attempt_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)", attemptId, attemptId, MAX_EVENTS);
+		const message = json({ type: "session", attemptId, events: added });
+		for (const ws of this.ctx.getWebSockets()) {
+			try { ws.send(message); } catch {}
+		}
+	}
+
+	/** Session events streamed by the agent's launcher (see cli/braid.mjs). */
+	async ingest(token: string, events: { kind: string; tool?: string | null; text: string; at?: number }[]) {
+		const row = this.rows<{ id: string }>("SELECT id FROM attempts WHERE token = ?", token)[0];
+		if (!row) throw new BraidError("unknown agent token", 401);
+		this.addEvents(row.id, Array.isArray(events) ? events : []);
+		return { ok: true };
+	}
+
+	async session(attemptId: string, after = 0): Promise<SessionEvent[]> {
+		this.attempt(attemptId);
+		return this.rows("SELECT * FROM session WHERE attempt_id = ? AND id > ? ORDER BY id LIMIT 5000", attemptId, after).map(this.toEvent);
+	}
+
+	/**
+	 * Commit an attempt's intent, decisions, and session transcript to the project's context
+	 * repo in Artifacts, so the why of a landing can be cloned and read like the code.
+	 */
+	private async saveContext(intent: Intent, a: Attempt, landingSha: string) {
+		const repo = `${this.meta("slug")}--context`;
+		let empty = false;
+		if (!this.meta("context_remote")) {
+			await this.host.remove(repo).catch(() => {});
+			this.setMeta("context_remote", (await this.host.create(repo, `Braid context (why and sessions) for ${this.meta("name")}`)).remote);
+			empty = true;
+		}
+		const base = `intents/${intent.id}/attempt-${a.id}`;
+		const events = this.rows("SELECT * FROM session WHERE attempt_id = ? ORDER BY id", a.id).map(this.toEvent);
+		const sha = await commitFiles(this.meta("context_remote"), await this.host.token(repo, "write", 600), "main", {
+			[`intents/${intent.id}/intent.json`]: JSON.stringify({ ...intent, landedSha: landingSha, landedAttempt: a.id }, null, "\t") + "\n",
+			[`${base}/attempt.json`]: JSON.stringify({ id: a.id, agent: a.agent, kind: a.kind, repo: a.repo, baseSha: a.baseSha, headSha: a.headSha, landedAs: landingSha, summary: a.summary, files: a.files.map((f) => `${f.status} ${f.path}`), checks: a.checks }, null, "\t") + "\n",
+			[`${base}/decisions.json`]: JSON.stringify(this.decisionsFor(a.id), null, "\t") + "\n",
+			[`${base}/session.jsonl`]: events.map((e) => JSON.stringify({ at: e.at, kind: e.kind, tool: e.tool, text: e.text })).join("\n") + "\n",
+		}, `Context for I${intent.id}: ${intent.title} (attempt ${a.id}, landed ${short(landingSha)})`, { name: "Braid", email: "context@braid.dev" }, empty);
+		this.note("context", "braid", `Saved the why and ${events.length} session events of attempt ${a.id} to ${repo} as ${short(sha)}`, intent.id, a.id);
+	}
+
 	// ── agent tools (called through MCP with the attempt's token) ────────────
 
 	async agent(token: string, tool: string, args: Record<string, any>): Promise<unknown> {
@@ -444,6 +510,7 @@ export class Project extends DurableObject<BraidEnv> {
 		const row = this.rows("SELECT * FROM attempts WHERE token = ?", token)[0];
 		if (!row) throw new BraidError("unknown agent token", 401);
 		const me = this.toAttempt(row);
+		this.addEvents(me.id, [{ kind: "braid", tool, text: describeCall(tool, args ?? {}) }]);
 		const result = await this.runTool(me, tool, args ?? {});
 		const pending = this.rows<any>("SELECT * FROM signals WHERE to_attempt = ? AND seen = 0 ORDER BY id", me.id);
 		this.sql.exec("UPDATE signals SET seen = 1 WHERE to_attempt = ? AND seen = 0", me.id);
@@ -641,6 +708,13 @@ export class Project extends DurableObject<BraidEnv> {
 			this.setMeta("head", result.sha);
 			this.note("land", by, `Landed I${intent.id} (${a.agent}, attempt ${a.id}) on trunk as ${short(result.sha)}${result.reconciled.length ? `, reconciled ${result.reconciled.join(", ")}` : ""}`, intent.id, a.id);
 
+			try {
+				await this.saveContext(this.intent(intent.id), a, result.sha);
+			} catch (e) {
+				// The landing already happened; losing the context copy must not undo or fail it.
+				this.note("context", "braid", `Could not save context for attempt ${a.id}: ${splitError(e).message}`, intent.id, a.id);
+			}
+
 			const landedWhy = this.describe(a);
 			for (const other of this.attempts()) {
 				if (other.id === a.id || !LIVE.has(other.status)) continue;
@@ -780,6 +854,21 @@ export class Project extends DurableObject<BraidEnv> {
 		const row = this.rows("SELECT * FROM attempts WHERE token = ?", agentToken)[0];
 		if (!row) throw new BraidError("unknown agent token", 401);
 		return { remote: row.remote as string, gitToken: await this.host.token(row.repo, "write", 86400) };
+	}
+}
+
+/** One line saying what a Braid tool call was about, for the session record. */
+function describeCall(tool: string, args: Record<string, any>): string {
+	const clip = (s: unknown) => String(s ?? "").replace(/\s+/g, " ").slice(0, 300);
+	switch (tool) {
+		case "claim": return `claim ${(args.paths ?? []).join(", ")}${args.reason ? `: ${clip(args.reason)}` : ""}`;
+		case "record": return `record ${args.kind ?? "decision"}: ${clip(args.title)}`;
+		case "checkpoint": case "ready": return `${tool}${args.summary ? `: ${clip(args.summary)}` : ""}`;
+		case "peek": return `peek at attempt ${args.attempt}${args.path ? ` (${args.path})` : ""}`;
+		case "message": return `message to ${args.to ?? "all"}: ${clip(args.body)}`;
+		case "check": return `check "${clip(args.name)}": ${args.status}`;
+		case "resolve": return `resolve: ${clip(args.rationale)}`;
+		default: return tool;
 	}
 }
 
