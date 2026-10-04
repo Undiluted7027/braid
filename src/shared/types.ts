@@ -166,5 +166,7 @@ export type LandOutcome =
 export type Hosted = "starting" | "running" | "finished" | "failed" | "stopped";
 export interface JoinResult { attemptId: string; intentId: number; branch: string; remote: string; gitToken: string; agentToken: string; trunkRemote: string; trunkToken: string; mcpUrl: string; brief: string }
 export interface DiffFile { path: string; status: FileChange["status"]; base: string | null; head: string | null; binary: boolean }
+/** One commit on trunk. `intentId` is set when Braid knows which intent it belongs to: a landing, a revert, or a commit made in an attempt that landed. */
+export interface TrunkCommit { sha: string; subject: string; author: string; at: number; kind: "landing" | "revert" | "attempt" | "outside" | "start"; intentId: number | null; attemptId: string | null }
 export interface BlameLine { text: string; sha: string | null }
 export interface FileView { path: string; content: string | null; binary: boolean; blame: BlameLine[]; trail: Landing[] }

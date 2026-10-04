@@ -193,6 +193,7 @@ async function reads(p: Project, rest: string[], q: URLSearchParams): Promise<Re
 	if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
 	if (rest[0] === "reconciliations" && rest[2] === "marked") return Response.json(await p.marked(Number(rest[1]), q.get("path") ?? ""));
 	if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
+	if (rest[0] === "history") return Response.json(await p.history(Number(q.get("limit") ?? 200), q.get("inside") === "1"));
 	if (rest[0] === "file") return Response.json(await p.file(q.get("path") ?? ""));
 	return null;
 }

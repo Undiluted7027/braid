@@ -329,3 +329,9 @@ pre, .cmd { max-width: 100%; }
 }
 p .mono, .intent-head .mono { overflow-wrap: anywhere; }
 .why li > div { min-width: 0; overflow-wrap: anywhere; }
+.tree details > summary { cursor: pointer; padding: 4px 8px; border-radius: 4px; color: var(--muted); }
+.tree details > summary:hover { background: var(--sunk); }
+.tree details { display: grid; gap: 2px; }
+.tree details button { display: block; width: calc(100% - 12px); }
+.history li.attempt, .history li.outside { padding-left: 10px; border-left: 2px solid var(--line); }
+.history li.outside > span:first-child { color: var(--muted); }

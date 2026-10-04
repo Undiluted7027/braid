@@ -12,7 +12,7 @@ import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Intent, JoinResult, Landing, LandOutcome, Overlap, QueuedLanding, Reconciliation, Run, SessionEvent, State,
+	Intent, JoinResult, Landing, LandOutcome, Overlap, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
@@ -1479,6 +1479,34 @@ export class Project extends DurableObject<BraidEnv> {
 		const { repo } = this.where(ref);
 		const head = (await this.host.log(repo, this.branch, 1))[0];
 		return head ? listTree(this.host, repo, head.treeHash) : [];
+	}
+
+	/**
+	 * Trunk's commits, newest first, each tied to its intent where Braid can tell: the landing commit
+	 * itself, a revert, and the commits an agent made in the attempt that landing brought in.
+	 * What is left was pushed to trunk from outside Braid.
+	 */
+	async history(limit = 200, inside = false): Promise<TrunkCommit[]> {
+		this.requireProject();
+		// The log follows trunk's own line: one commit per landing, plus anything pushed straight to trunk.
+		const line = await this.host.log(this.trunk, this.branch, 300), log = line.slice(0, Math.min(Math.max(limit, 1), 300));
+		const landings = new Map(this.landings().map((l) => [l.sha, l]));
+		const trunkLine = new Set(line.map((c) => c.hash));
+		const row = (c: CommitMeta, kind: TrunkCommit["kind"], l?: Landing): TrunkCommit => ({
+			sha: c.hash, subject: c.message.split("\n")[0].slice(0, 200), author: c.author.name, at: c.authoredAt < 1e12 ? c.authoredAt * 1000 : c.authoredAt,
+			kind, intentId: l?.intentId ?? null, attemptId: l?.attemptId ?? null,
+		});
+		const out: TrunkCommit[] = [];
+		for (const c of log) {
+			const l = landings.get(c.hash);
+			out.push(row(c, l ? (l.revertOf ? "revert" : "landing") : c.parents.length ? "outside" : "start", l));
+			// The commits the agent made: back from the attempt's head (the landing's second parent) to where it left trunk.
+			if (inside && l && !l.revertOf && c.parents[1]) {
+				const made = await this.host.log(this.trunk, c.parents[1], 50).catch(() => []);
+				for (const m of made) { if (trunkLine.has(m.hash)) break; out.push(row(m, "attempt", l)); }
+			}
+		}
+		return out;
 	}
 
 	/** A file for the preview of `ref`: from the build Braid made of its current commit if there is one, otherwise straight from the repository. */

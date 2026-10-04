@@ -1,9 +1,39 @@
 // The code, annotated with why: every line on trunk traces to the intent that landed it.
 import { useEffect, useState } from "react";
-import type { FileView, State } from "../shared/types";
+import type { FileView, State, TrunkCommit } from "../shared/types";
 import { api, ago, intentColor, navigate, short, useAsync } from "./api";
 import { Link, useTitle } from "./App";
 import { Why } from "./Intent";
+
+/** Paths as a tree of folders. */
+type Node = { folders: Map<string, Node>; files: { name: string; path: string }[] };
+function nest(paths: string[]): Node {
+	const root: Node = { folders: new Map(), files: [] };
+	for (const path of paths) {
+		const parts = path.split("/");
+		let at = root;
+		for (const part of parts.slice(0, -1)) {
+			if (!at.folders.has(part)) at.folders.set(part, { folders: new Map(), files: [] });
+			at = at.folders.get(part)!;
+		}
+		at.files.push({ name: parts[parts.length - 1], path });
+	}
+	return root;
+}
+/** Folders first, each one closed until opened, except those on the way to the file being shown. */
+function Folder({ node, path, open, depth, prefix = "" }: { node: Node; path: string; open: (p: string) => void; depth: number; prefix?: string }) {
+	return (
+		<>
+			{[...node.folders].sort(([a], [b]) => a.localeCompare(b)).map(([name, child]) => (
+				<details key={name} open={path.startsWith(`${prefix}${name}/`) || undefined} style={{ paddingLeft: depth ? 12 : 0 }}>
+					<summary className="mono">{name}/</summary>
+					<Folder node={child} path={path} open={open} depth={depth + 1} prefix={`${prefix}${name}/`} />
+				</details>
+			))}
+			{node.files.map((f) => <button key={f.path} className={`mono ${f.path === path ? "on" : ""}`} style={{ marginLeft: depth ? 12 : 0 }} onClick={() => open(f.path)} title={f.path}>{f.name}</button>)}
+		</>
+	);
+}
 
 export function WhyPage({ state }: { state: State }) {
 	const slug = state.project.slug;
@@ -17,7 +47,9 @@ export function WhyPage({ state }: { state: State }) {
 	const [filter, setFilter] = useState("");
 	useTitle(`${path || "Why"} · ${state.project.name}`);
 	const files = tree?.filter((p) => p.toLowerCase().includes(filter.toLowerCase())) ?? [];
-	const history = [...state.landings].reverse();
+	const [allCommits, setAllCommits] = useState(false);
+	const { data: history } = useAsync(() => api<TrunkCommit[]>("GET", `/p/${slug}/history${allCommits ? "?inside=1" : ""}`), [slug, state.project.head, allCommits]);
+	const commits = history ?? [];
 	const landing = (sha: string | null) => state.landings.find((l) => l.sha === sha);
 	const shown = landing(picked) ?? (file?.trail.length ? file.trail[file.trail.length - 1] : undefined);
 	const intent = shown && state.intents.find((i) => i.id === shown.intentId);
@@ -31,18 +63,22 @@ export function WhyPage({ state }: { state: State }) {
 			<nav className="tree" aria-label="Files on trunk">
 				<input type="search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={`Find among ${tree?.length ?? 0} files`} aria-label="Filter files" />
 				<div className="tree-files">
-					{files.map((p) => <button key={p} className={`mono ${p === path ? "on" : ""}`} onClick={() => open(p)} title={p}>{p}</button>)}
+					{filter ? files.map((p) => <button key={p} className={`mono ${p === path ? "on" : ""}`} onClick={() => open(p)} title={p}>{p}</button>)
+						: <Folder node={nest(tree ?? [])} path={path} open={open} depth={0} />}
 					{tree && files.length === 0 && <p className="dim small">No file matches.</p>}
 				</div>
 				<h3>Trunk history</h3>
+				<label className="check small"><input type="checkbox" checked={allCommits} onChange={(e) => setAllCommits(e.target.checked)} /> show the commits inside each attempt</label>
 				<ol className="history">
-					{history.map((l) => (
-						<li key={l.sha}>
-							<Link to={`/p/${slug}/i/${l.intentId}`}><span className="mono" style={{ color: intentColor(l.intentId) }}>I{l.intentId}</span> {l.revertOf ? l.title : state.intents.find((i) => i.id === l.intentId)?.title ?? l.title}</Link>
-							<span className="dim small"><span className="mono">{short(l.sha)}</span> · {l.agent} · {ago(l.at)}{l.reconciled ? " · ⚯ reconciled" : ""}{l.revertedBy ? " · reverted" : ""}</span>
+					{commits.map((c) => (
+						<li key={c.sha} className={c.kind}>
+							{c.intentId
+								? <Link to={`/p/${slug}/i/${c.intentId}`}><span className="mono" style={{ color: intentColor(c.intentId) }}>I{c.intentId}</span> {c.kind === "landing" ? state.intents.find((i) => i.id === c.intentId)?.title ?? c.subject : c.subject}</Link>
+								: <span>{c.subject}</span>}
+							<span className="dim small"><span className="mono">{short(c.sha)}</span> · {c.author} · {ago(c.at)} · {c.kind === "landing" ? "landed" : c.kind === "revert" ? "revert" : c.kind === "attempt" ? `in attempt ${c.attemptId}` : c.kind === "start" ? "where trunk started" : "pushed outside Braid"}</span>
 						</li>
 					))}
-					{history.length === 0 && <li className="dim small">Nothing has landed yet.</li>}
+					{history && commits.length === 0 && <li className="dim small">No commits yet.</li>}
 				</ol>
 			</nav>
 			<section className="code">

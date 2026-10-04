@@ -38,7 +38,7 @@ Local dev uses the real Artifacts service through the binding; repos are created
 pnpm sim --pause
 ```
 
-A scripted run with deterministic "agents". Everything else is real: Artifacts forks, git pushes, MCP calls, overlap prediction, the starter app's tests run in a sandbox for every commit and every merge, landing, and both ways of reconciling. Open the printed URL and press Enter to step through. Variants: `pnpm sim` (run straight through and clean up), `pnpm sim --until=conflict` (leave the project at the open reconciliation), `pnpm sim --keep`.
+A scripted run with deterministic "agents". Everything else is real: Artifacts forks, git pushes, MCP calls, overlap prediction, the starter app's tests run in a sandbox for every commit and every merge, landing, and both ways of reconciling. Open the printed URL and press Enter to step through. Variants: `pnpm sim` (run straight through and clean up), `pnpm sim --until=conflict` (leave the project at the open reconciliation), `pnpm sim --until=ready`, `pnpm sim --keep`. `BRAID_PROJECT=<name>` names the project.
 
 ### Put real agents on it
 

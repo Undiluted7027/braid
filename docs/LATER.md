@@ -91,10 +91,11 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Done: the starter app has a test suite (`node --test`, no dependencies), so `pnpm sim` and every starter project show real verification and go through the landing queue.
    - Done: nothing is wider than the screen at 390 px on the home, project, intent and Why pages.
    - Done: "Needs you" at the top of a project: a failing trunk, conflicts to resolve, unanswered questions, failed checks, failed agents and attempts ready to review, each linking to where it is handled. Activity links to its intent and shows 30 at a time.
-   - Done: the Why page has a file filter and a trunk history list, and blame lines can be reached and opened from the keyboard. Chips are 12 px.
+   - Done: the Why page has a file filter, and blame lines can be reached and opened from the keyboard. Chips are 12 px.
    - Open: the `braid` project on the deployed instance is still private. Making it public is the owner's call: it shows the agent sessions to anyone with the link. The README has no live URL or screenshot until then.
-   - Open: the local `demo-*` projects were made before verification existed and still show "not run yet". Run `pnpm sim --keep` for a current one.
-   - Open: the file list is still flat (filtered, not a tree), and trunk history lists landings, not every commit.
+   - Done: the Why page lists files as folders that open and close (a flat list while filtering), and trunk history shows every commit on trunk tied to its intent: landings, reverts, pushes from outside Braid, and on request the commits each agent made inside its attempt.
+   - Done: the local `demo-ready`, `demo-conflict` and `demo-done` projects were recreated with the current starter app (`BRAID_PROJECT=<name> pnpm sim --until=ready`, `--until=conflict`, `--keep`), so every attempt in them shows a real test run.
+   - Open: trunk history reads at most 300 commits of trunk's own line and 50 per attempt.
    - Open: sessions from `pnpm sim` hold only the scripted agents' Braid calls.
 5. **Why by line.**
    - Clicking a line shows every decision the attempt recorded for that file. Link a line to the decision and the moment in the session that produced it.
