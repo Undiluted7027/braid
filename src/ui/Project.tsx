@@ -3,6 +3,7 @@ import type { Attempt, Intent, State } from "../shared/types";
 import { api, ago, intentColor, short } from "./api";
 import { Link, useAction } from "./App";
 import { Braid } from "./Braid";
+import { DeleteProject } from "./DeleteProject";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
@@ -104,6 +105,7 @@ export function ProjectPage({ state }: { state: State }) {
 					{open.map((i) => <IntentCard key={i.id} intent={i} state={state} />)}
 					{done.length > 0 && <h3 className="dim">Closed</h3>}
 					{done.map((i) => <IntentCard key={i.id} intent={i} state={state} />)}
+					<DeleteProject state={state} />
 				</div>
 				<aside className="col-side">
 					<h2>Activity</h2>
