@@ -7,6 +7,10 @@ test("showsOutput: only commands whose output is about the work", () => {
 	for (const c of ["cat .env", "env", "git status && cat ~/.aws/credentials", "printenv | grep KEY", "echo $(cat .env)", "git log > /tmp/x; cat /tmp/x", "node -e 'console.log(process.env)'", "git diff .env", "git status | tail -f /etc/passwd", "pnpm test 2>&1 > out.txt", "git show HEAD:config/secrets.json", "git log -p -- deploy.pem", "git diff ~/.aws/credentials", ""]) assert.equal(showsOutput(c), false, c);
 });
 
+test("showsOutput: refuses Wrangler and Braid credential paths", () => {
+	for (const c of ["git diff -- .dev.vars", "git show HEAD:.mcp.json", "git log -p -- .braid/history/checkpoint.json"]) assert.equal(showsOutput(c), false, c);
+});
+
 test("resultEvent: output is reduced to a status line unless the command is shown", () => {
 	const hidden = resultEvent({ output: "API_KEY=abc\nDB=xyz\n", failed: false, command: "cat .env" });
 	assert.equal(hidden.text, "ok · 2 lines · 18 B");
