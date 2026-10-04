@@ -2,7 +2,7 @@
 FROM node:24-trixie-slim
 
 RUN apt-get update \
-	&& apt-get install --yes --no-install-recommends bash ca-certificates git ripgrep \
+	&& apt-get install --yes --no-install-recommends bash ca-certificates git python3 ripgrep \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Pinned: the flags and event formats of the agent CLIs change between releases.

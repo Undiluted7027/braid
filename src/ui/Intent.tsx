@@ -77,6 +77,9 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	const [rationale, setRationale] = useState("");
 	const act = useAction();
 	const base = `/p/${state.project.slug}/reconciliations/${r.id}`;
+	const owner = attempt as Attempt | undefined;
+	const agentBusy = owner?.hosted === "starting" || owner?.hosted === "running";
+	const canBringBack = !!owner && state.project.hosting[owner.kind === "codex" ? "codex" : "claude"];
 
 	if (r.status === "resolved") {
 		return (
@@ -101,12 +104,24 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 			{act.error && <p className="error">{act.error}</p>}
 			<div className="row">
 				<button className="primary" disabled={act.busy || r.status === "resolving"}
-					onClick={() => act.run(() => api("POST", `${base}/resolve`, { by: "human", rationale, resolutions: r.conflicts.map((c) => ({ path: c.path, content: text[c.path] })) }))}>
+					onClick={() => act.run(async () => {
+						const body = { by: "human", rationale, resolutions: r.conflicts.map((c) => ({ path: c.path, content: text[c.path] })) };
+						try { await api("POST", `${base}/resolve`, body); } catch (e) {
+							// Keeping one side whole drops the other intent's change; that needs a deliberate yes.
+							if (!/keeps only one side/.test((e as Error).message) || !window.confirm(`${(e as Error).message.split(". Write")[0]}.\n\nLand it anyway?`)) throw e;
+							await api("POST", `${base}/resolve`, { ...body, oneSided: true });
+						}
+					})}>
 					Land this resolution
 				</button>
 				{state.project.llm && (
 					<button disabled={act.busy || r.status === "resolving"} onClick={() => act.run(() => api("POST", `${base}/auto`))}>
 						{act.busy || r.status === "resolving" ? "Reconciling…" : `Reconcile with ${state.project.llm}`}
+					</button>
+				)}
+				{canBringBack && (
+					<button disabled={act.busy || agentBusy} onClick={() => act.run(() => api("POST", `/p/${state.project.slug}/attempts/${r.attemptId}/rehost`, { task: "reconcile" }))}>
+						{agentBusy ? `${owner!.agent} is reconciling…` : `Have ${owner!.agent} reconcile`}
 					</button>
 				)}
 				<span className="dim small">The agent on attempt {r.attemptId} can also answer through its <code>reconciliation</code> and <code>resolve</code> tools, or by merging trunk with git.</span>
@@ -154,6 +169,9 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			</div>
 			{(land.error || drop.error || halt.error) && <p className="error">{land.error ?? drop.error ?? halt.error}</p>}
 			{a.hosted === "failed" && <p className="warn small">The hosted agent failed: {a.hostedDetail}</p>}
+			{LIVE.has(a.status) && run?.status === "fail" && run.sha === a.headSha && a.hosted !== "starting" && a.hosted !== "running" && state.project.hosting[a.kind === "codex" ? "codex" : "claude"] && (
+				<p className="row"><button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/rehost`, { task: "fix" }))}>Have {a.agent} fix the failed checks</button></p>
+			)}
 			<p className="small dim mono">base {short(a.baseSha)} → head {short(a.headSha)} · updated {ago(a.updatedAt)}{a.behind > 0 && LIVE.has(a.status) ? ` · ${a.behind} landing${a.behind === 1 ? "" : "s"} behind trunk` : ""}</p>
 			{a.summary && <p>{a.summary}</p>}
 

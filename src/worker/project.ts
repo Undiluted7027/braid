@@ -528,11 +528,30 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("UPDATE attempts SET hosted = 'starting' WHERE id = ?", joined.attemptId);
 		const job: HostJob = {
 			slug: this.meta("slug"), attemptId: joined.attemptId, kind, agent, repo: row.repo, remote: joined.remote, trunkRepo: this.trunk,
-			trunkRemote: joined.trunkRemote, branch: this.branch, agentToken: joined.agentToken, brief: joined.brief,
+			trunkRemote: joined.trunkRemote, branch: this.branch, agentToken: joined.agentToken, brief: joined.brief, task: "work",
 		};
 		await this.agentHost(joined.attemptId)!.start(job);
 		this.note("attempt", "braid", `Started ${agent} for attempt ${joined.attemptId} in a Cloudflare sandbox`, intentId, joined.attemptId);
 		return { attemptId: joined.attemptId };
+	}
+
+	/** Bring an agent back to an attempt it left, to reconcile a conflicted landing or to fix a failed verification. */
+	async rehost(attemptId: string, task: "reconcile" | "fix") {
+		this.requireProject();
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", attemptId)[0];
+		if (!row) throw new BraidError(`attempt ${attemptId} not found`, 404);
+		const a = this.toAttempt(row);
+		if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
+		const kind: HostedKind = a.kind === "codex" ? "codex" : "claude";
+		if (!hosting(this.env)[kind]) throw new BraidError(`this Braid instance cannot run ${kind} itself`);
+		const job: HostJob = {
+			slug: this.meta("slug"), attemptId: a.id, kind, agent: a.agent, repo: a.repo, remote: a.remote, trunkRepo: this.trunk,
+			trunkRemote: this.meta("remote"), branch: this.branch, agentToken: row.token, brief: this.briefText(a), task,
+		};
+		await this.agentHost(a.id)!.start(job);
+		this.sql.exec("UPDATE attempts SET hosted = 'starting', hosted_detail = '' WHERE id = ?", a.id);
+		this.note("attempt", "braid", `Brought ${a.agent} back to attempt ${a.id} in a Cloudflare sandbox to ${task === "reconcile" ? "reconcile with trunk" : "fix failed verification"}`, a.intentId, a.id);
+		return { attemptId: a.id };
 	}
 
 	async stopHosted(attemptId: string) {
@@ -775,7 +794,7 @@ export class Project extends DurableObject<BraidEnv> {
 			case "resolve": {
 				const r = this.openRecon(me.id);
 				if (!r) throw new BraidError("no open reconciliation for this attempt");
-				return this.submitResolution(r.id, args.resolutions ?? [], String(args.rationale ?? ""), me.agent);
+				return this.submitResolution(r.id, args.resolutions ?? [], String(args.rationale ?? ""), me.agent, args.one_sided === true);
 			}
 			case "sync":
 				// No token here: this answer lands in the agent's transcript. The read credential for trunk is
@@ -937,7 +956,7 @@ export class Project extends DurableObject<BraidEnv> {
 		});
 	}
 
-	private async submitResolution(reconId: number, resolutions: { path: string; content: string }[], rationale: string, by: string) {
+	private async submitResolution(reconId: number, resolutions: { path: string; content: string }[], rationale: string, by: string, oneSided = false) {
 		const row = this.rows("SELECT * FROM reconciliations WHERE id = ?", reconId)[0];
 		if (!row) throw new BraidError(`reconciliation ${reconId} not found`, 404);
 		const r = this.toRecon(row);
@@ -950,6 +969,12 @@ export class Project extends DurableObject<BraidEnv> {
 		if (!rationale.trim()) throw new BraidError("a resolution needs a rationale: say how both intents are preserved");
 		const marked = [...given].filter(([, content]) => /^(<<<<<<<|>>>>>>>) /m.test(content)).map(([path]) => path);
 		if (marked.length) throw new BraidError(`conflict markers left in: ${marked.join(", ")}`);
+		// A file handed back exactly as one side had it drops the other intent's change, whatever the rationale says.
+		// It has happened: an agent's edit failed, it submitted its file untouched, and trunk's change was lost.
+		const same = (a: string | null, b: string) => a !== null && a.trimEnd() === b.trimEnd();
+		const dropped = r.conflicts.flatMap((c) => same(c.attempt, given.get(c.path)!) ? [`${c.path} is identical to the attempt's version, so trunk's change is lost`]
+			: same(c.trunk, given.get(c.path)!) ? [`${c.path} is identical to trunk's version, so the attempt's change is lost`] : []);
+		if (dropped.length && !oneSided) throw new BraidError(`this resolution keeps only one side: ${dropped.join("; ")}. Write a version that carries both changes. If dropping one side really is the right answer, submit again with one_sided set to true and say why in the rationale.`);
 		this.sql.exec("UPDATE reconciliations SET status = 'resolved', resolutions = ?, rationale = ?, resolved_by = ? WHERE id = ?",
 			json(r.conflicts.map((c) => ({ path: c.path, content: given.get(c.path)! }))), rationale.trim(), by, reconId);
 		this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, ?)",
@@ -961,8 +986,8 @@ export class Project extends DurableObject<BraidEnv> {
 		return { resolved: true, ...landed };
 	}
 
-	resolve(reconId: number, resolutions: { path: string; content: string }[], rationale: string, by = "human") {
-		return this.submitResolution(reconId, resolutions, rationale, by);
+	resolve(reconId: number, resolutions: { path: string; content: string }[], rationale: string, by = "human", oneSided = false) {
+		return this.submitResolution(reconId, resolutions, rationale, by, oneSided);
 	}
 
 	/** Ask the configured model to reconcile, giving it both intents and both decision trails. */

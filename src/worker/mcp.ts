@@ -23,8 +23,8 @@ export const TOOLS = [
 		{ name: str, status: { type: "string", enum: ["pass", "fail"] }, detail: str }, ["name", "status"]),
 	tool("ready", "Mark the attempt ready to land once the goal is met and your commits are pushed.", { summary: str }, ["summary"]),
 	tool("reconciliation", "If landing conflicted: both versions of each conflicting file, their common base, and why trunk's side exists (the other intent and its decisions)."),
-	tool("resolve", "Answer a reconciliation with full merged file contents that satisfy both intents, plus a rationale. Braid then lands the attempt.",
-		{ resolutions: { type: "array", items: { type: "object", properties: { path: str, content: str }, required: ["path", "content"] } }, rationale: str }, ["resolutions", "rationale"]),
+	tool("resolve", "Answer a reconciliation with full merged file contents that satisfy both intents, plus a rationale. Braid then lands the attempt at once, so check the contents before you call this. A file identical to one side is refused unless one_sided is true.",
+		{ resolutions: { type: "array", items: { type: "object", properties: { path: str, content: str }, required: ["path", "content"] } }, rationale: str, one_sided: { type: "boolean" } }, ["resolutions", "rationale"]),
 	tool("sync", "How to merge the current trunk into your attempt with git."),
 ];
 

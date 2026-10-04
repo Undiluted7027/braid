@@ -14,8 +14,10 @@ const Resolution = z.object({
 const WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /** Which model will reconcile, or null when none is configured. */
+const viaGateway = (env: BraidEnv) => !!(env.AI_GATEWAY_TOKEN && env.AI_GATEWAY_ID && env.AI_GATEWAY_ACCOUNT_ID);
+
 export function llmName(env: BraidEnv): string | null {
-	if (env.ANTHROPIC_API_KEY) return env.BRAID_MODEL ?? "claude-opus-5-5";
+	if (env.ANTHROPIC_API_KEY || viaGateway(env)) return env.BRAID_MODEL ?? "claude-opus-5-5";
 	return env.AI ? WORKERS_AI_MODEL : null;
 }
 
@@ -45,11 +47,18 @@ function prompt(input: { intent: Intent; agent: string; decisions: Decision[]; c
 
 export async function resolveConflicts(env: BraidEnv, input: { intent: Intent; agent: string; decisions: Decision[]; conflicts: Conflict[] }) {
 	const model = llmName(env);
-	if (!model) throw new BraidError("no model configured: set ANTHROPIC_API_KEY (wrangler secret put ANTHROPIC_API_KEY) or bind Workers AI", 501);
+	if (!model) throw new BraidError("no model configured: set up AI Gateway, set ANTHROPIC_API_KEY, or bind Workers AI", 501);
 	const user = prompt(input);
 
-	if (env.ANTHROPIC_API_KEY) {
-		const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+	if (env.ANTHROPIC_API_KEY || viaGateway(env)) {
+		// Through AI Gateway the provider key lives in the gateway: send the gateway token and no key of our own.
+		const client = viaGateway(env)
+			? new Anthropic({
+				apiKey: "held-by-the-gateway",
+				baseURL: `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/anthropic`,
+				defaultHeaders: { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}`, "x-api-key": null },
+			})
+			: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 		const response = await client.messages.parse({
 			model,
 			max_tokens: 16000,

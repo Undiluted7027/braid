@@ -52,6 +52,6 @@
   },
   // Hosted agents reach their model through AI Gateway when AI_GATEWAY_ID and the AI_GATEWAY_TOKEN secret are set
   // (otherwise through ANTHROPIC_API_KEY / OPENAI_API_KEY secrets). The keys stay in the Worker either way.
-  "vars": { "AI_GATEWAY_ACCOUNT_ID": "88473415e3dee2618de0a585523e71f9", "AI_GATEWAY_ID": "" },
+  "vars": { "AI_GATEWAY_ACCOUNT_ID": "88473415e3dee2618de0a585523e71f9", "AI_GATEWAY_ID": "braid" },
   "observability": { "enabled": true }
 }

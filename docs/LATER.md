@@ -31,7 +31,10 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
    - Open: previews of other apps that need a backend. Only Node projects. A run that dies mid-way stays "running" until someone runs it again. 
 4. **Agents hosted on Cloudflare.** Start agents from the UI in Sandbox, so opening an intent is enough to get attempts.
    - Done: "Run Claude Code" and "Run Codex" on an intent start the agent in a sandbox with a fresh attempt, Braid's tools and its session streamed in. The sandbox holds no credentials; one Worker entrypoint decides everything it can reach. Checked locally with a self-test agent that stands in for the model (tools, commit, push, trunk fetch, refusals), with each CLI's own doctor, and by starting both CLIs headless with the exact flags.
-   - Open: no real model run yet, because the instance has no model credentials. A hosted agent runs once; nothing restarts it when verification fails after it exits. Not yet deployed.
+   - Done: real runs through an AI Gateway named `braid` (Unified Billing, provider keys held in the gateway). Hosted Claude Code and Codex each completed an intent, concurrently, waiting for verification before marking ready. An agent can be brought back to an attempt to reconcile a conflicted landing or to fix failed checks. Claude reconciliation also goes through the gateway.
+   - Done, the acceptance test: three hosted agents changed the same tag. The second landing conflicted and Codex was brought back and resolved it through the tools; the third conflicted and was resolved by the model, on Workers AI and, on a further conflict, by Claude.
+   - Found by that test: Codex's first resolution was its own file unchanged (its edit command had failed), Braid landed it, and trunk lost the other intent's change while the rationale claimed both survived. A resolution identical to one side is now refused unless `one_sided` is set, and the image has Python. The deeper gap remains: a resolution is not run before it lands (step 5's landing queue).
+   - Open: bringing an agent back to fix failed checks is not tested with a real failure. Nothing brings an agent back automatically. Not yet deployed.
    - Acceptance test, which also closes the two unverified items below: start two hosted agents on intents that edit the same lines, land one, then land the other so it conflicts. The agent reconciles the first conflict with the `reconciliation` and `resolve` tools. A second conflict is resolved with "Reconcile with a model", first on Workers AI (no key needed), then on Claude once `ANTHROPIC_API_KEY` is set, which hosted Claude Code agents need anyway.
 5. **Agents that coordinate.** A planner that splits a goal into intents, a reviewer agent that judges attempts against acceptance, and a landing queue that re-verifies after each landing.
 6. **Semantic collisions.** After each landing, re-run the other attempts' checks against the new trunk, so cross-file breakage is caught by execution.
@@ -60,10 +63,10 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 
 ## Not verified yet
 
-Both are covered by the acceptance test for step 4 of the build plan.
+- **Bringing an agent back to fix failed checks**, with a real failing commit.
+- **Anything from step 4 on the deployed instance**: hosted agents, bringing an agent back, the one-sided resolution guard, and Claude reconciliation through the gateway have only run locally.
 
-- **Model-backed reconciliation.** Written for Claude and Workers AI; never called.
-- **A real-agent conflict through reconciliation.** Only the scripted run has done it.
+Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.
 
 Checked on October 4, 2026:
 

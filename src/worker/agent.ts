@@ -14,6 +14,8 @@ export interface HostJob {
 	slug: string; attemptId: string; kind: HostedKind; agent: string;
 	repo: string; remote: string; trunkRepo: string; trunkRemote: string; branch: string;
 	agentToken: string; brief: string;
+	/** Why the agent is being started: a new attempt, or brought back to an attempt that needs something. */
+	task: "work" | "reconcile" | "fix";
 }
 interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string }
 
@@ -92,6 +94,15 @@ const PROMPT = `You are working on a Braid attempt, in a sandbox on Cloudflare. 
 The braid MCP server is connected: call its tools directly (brief, claim, record, checkpoint, ready, ...).
 Do the work the intent asks for, commit, push with the command given in BRAID.md, checkpoint after every push, record your decisions as you make them, wait for Braid's verification of your last commit, and finish by marking the attempt ready.`;
 
+const TASKS = {
+	work: PROMPT,
+	reconcile: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
+Landing this attempt conflicted with trunk: another intent changed the same lines. Call the braid \`reconciliation\` tool to get both versions, their base, and the intent and decisions behind the trunk side.
+Write a version of each conflicted file that satisfies BOTH intents, then call \`resolve\` with the resolutions and a rationale that says concretely how each side's intent survives. Record the decision. Do not start other work.`,
+	fix: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
+Braid ran your last commit in a clean sandbox and it failed. Call \`checkpoint\` to see which steps failed and their output, fix the cause, commit, push, checkpoint again, wait for verification to pass, then mark the attempt ready. Record what you changed and why.`,
+};
+
 // Stands in for an agent when checking the plumbing: it speaks, uses Braid's tools, commits, pushes and probes what it can reach.
 const SELFTEST = `
 import { execSync } from "node:child_process";
@@ -136,7 +147,7 @@ export class AgentHost extends DurableObject<BraidEnv> {
 
 	/** Queue the agent and return; the alarm sets up the sandbox and then follows the agent until it exits. */
 	async start(job: HostJob) {
-		if (this.kv.get("phase") === "running" || this.kv.get("phase") === "new") throw new Error("an agent is already running for this attempt");
+		if (this.kv.get("phase") === "running" || this.kv.get("phase") === "new") throw new Error("[409] an agent is already running for this attempt");
 		this.kv.put("job", job);
 		this.kv.put("phase", "new");
 		this.kv.put("offset", 0);
@@ -245,14 +256,16 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 			argv = ["codex", "exec", "--json", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox", "--model", model,
 				"--config", 'model_provider="braid"', "--config", `model_providers.braid={ name = "Braid", base_url = ${JSON.stringify(base)}, wire_api = "responses" }`,
 				"--config", "analytics.enabled=false", "--config", "check_for_update_on_startup=false", "--config", "features.plugins=false",
-				"--config", `mcp_servers.braid.url=${JSON.stringify(mcp)}`, "--config", `mcp_servers.braid.default_tools_approval_mode="approve"`, "--", PROMPT];
+				"--config", `mcp_servers.braid.url=${JSON.stringify(mcp)}`, "--config", `mcp_servers.braid.default_tools_approval_mode="approve"`, "--", TASKS[job.task]];
 		} else {
-			argv = ["claude", "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--no-session-persistence", "--model", model, "--mcp-config", ".mcp.json", "--strict-mcp-config", "--", PROMPT];
+			argv = ["claude", "--print", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--no-session-persistence", "--model", model, "--mcp-config", ".mcp.json", "--strict-mcp-config",
+				// Who did the work is recorded by Braid in the landing commit; the agent adds no trailer of its own.
+				"--settings", JSON.stringify({ includeCoAuthoredBy: false }), "--", TASKS[job.task]];
 			agentEnv = { ANTHROPIC_API_KEY: "provided-by-worker", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", IS_SANDBOX: "1", ...(useGateway(env) ? { ANTHROPIC_BASE_URL: `https://${GATEWAY_HOST}${gatewayPath(env)}/anthropic` } : {}) };
 		}
 		// Not awaited to completion: the script outlives this call and the alarm follows it through its files.
 		await container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", TASK, ...argv], { cwd: REPO, env: { HOME: "/root", CI: "true", ...TRUST, ...agentEnv }, stdout: "ignore", stderr: "ignore" });
-		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}` }], "running");
+		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : ", to fix failed verification"}` }], "running");
 	}
 
 	/** Read what the agent has printed since last time and pass it on as session events. */

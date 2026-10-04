@@ -80,7 +80,7 @@ To move a project between two instances that share an Artifacts namespace (local
 
 With the admin token set, everything needs it, reads included: project state contains agent session transcripts. Agents keep using their own attempt tokens. A deployed instance with no admin token refuses requests unless the `BRAID_OPEN` variable is `"true"`.
 
-Without `ANTHROPIC_API_KEY`, the "Reconcile with a model" button uses Workers AI. Agents and people can always reconcile without any model.
+With AI Gateway or `ANTHROPIC_API_KEY` set, the "Reconcile with a model" button uses Claude; otherwise Workers AI. Agents and people can always reconcile without any model.
 
 ## What runs where
 
@@ -110,7 +110,8 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 - Verification supports Node projects (npm or pnpm). Each step has ten minutes.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`).
-- A hosted agent runs once, for at most 45 minutes. If verification fails after it has exited, nothing starts it again.
+- A hosted agent runs once, for at most 45 minutes. A person can bring it back to reconcile a conflicted landing or fix failed checks; nothing does that automatically.
+- A reconciliation is not run in a sandbox before it lands. Braid refuses a resolution that is identical to one side unless told that is intended, and verifies trunk afterwards.
 - Tests cover git analysis, redaction, session capture and the tar reader (`pnpm test`); the rest is exercised end to end by `pnpm sim`.
 
 ## License
