@@ -100,6 +100,16 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		}
 	}
 
+	// Take in a project exported from another instance on the same Artifacts namespace.
+	if (seg[0] === "projects" && seg[1] === "import" && method === "POST") {
+		const b = await body();
+		const slug = String(b.dump?.meta?.find?.((m: any) => m.k === "slug")?.v ?? "");
+		if (!SLUG.test(slug)) return Response.json({ error: "this is not a Braid project export" }, { status: 400 });
+		const moved = await project(env, slug).importState(b.dump);
+		await registry.registerProject(moved.slug, moved.name, moved.description);
+		return Response.json({ slug }, { status: 201 });
+	}
+
 	if (seg[0] !== "p" || !seg[1]) return Response.json({ error: "not found" }, { status: 404 });
 	const slug = seg[1], p = project(env, slug), rest = seg.slice(2), q = url.searchParams;
 
@@ -111,11 +121,12 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 			if (token) state.previewKeys = Object.fromEntries(await Promise.all(["trunk", ...state.attempts.map((a) => a.id)].map(async (ref) => [ref, await previewKey(token, slug, ref)])));
 			return Response.json(state);
 		}
+		if (rest[0] === "export") return Response.json(await p.exportState());
 		const read = await reads(p, rest, q);
 		if (read) return read;
 	}
 	if (method === "DELETE" && rest.length === 0) {
-		await p.destroy();
+		await p.destroy(q.get("repos") === "keep");
 		await registry.unregisterProject(slug);
 		return Response.json({ deleted: true });
 	}
@@ -172,10 +183,11 @@ async function previewApi(request: Request, env: BraidEnv, slug: string, path: s
 /**
  * Put in front of a built page. The page is served under /preview/<project>/<ref>/ but was built to
  * live at the root of a site, so requests it makes to "/..." are sent under the preview path, and its
- * router is shown the path it expects.
+ * router is shown the path it expects. The base element keeps the page's relative links pointing at
+ * the preview once the address has been rewritten.
  */
-const shim = (base: string) => `<script>(function(){var B=${JSON.stringify(base)};
-function fix(u){try{var x=new URL(u,location.href);if(x.host===location.host&&x.pathname!==B&&x.pathname.indexOf(B+"/")!==0)x.pathname=B+x.pathname;return x.href}catch(e){return u}}
+const shim = (base: string) => `<base href="${base}/"><script>(function(){var B=${JSON.stringify(base)};
+function fix(u){try{var x=new URL(u,document.baseURI);if(x.host===location.host&&x.pathname!==B&&x.pathname.indexOf(B+"/")!==0)x.pathname=B+x.pathname;return x.href}catch(e){return u}}
 var p=location.pathname;if(p===B||p.indexOf(B+"/")===0){try{history.replaceState(history.state,"",(p.slice(B.length)||"/")+location.search+location.hash)}catch(e){}}
 var f=window.fetch;window.fetch=function(i,o){if(typeof i==="string"||i instanceof URL)i=fix(String(i));else if(i instanceof Request)i=new Request(fix(i.url),i);return f.call(this,i,o)};
 var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=fix(u);return xo.apply(this,arguments)};

@@ -23,6 +23,7 @@ const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
 const MAX_RESULT_TEXT = 800;
 const MAX_EVENTS = 20_000;
+const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity"];
 const now = () => Date.now();
 const short = (sha: string) => sha.slice(0, 7);
 const json = (v: unknown) => JSON.stringify(v);
@@ -49,6 +50,11 @@ export class Project extends DurableObject<BraidEnv> {
 
 	constructor(ctx: DurableObjectState, env: BraidEnv) {
 		super(ctx, env);
+		this.schema();
+	}
+
+	/** Also run after the project is deleted: deleteAll drops the tables while this object lives on. */
+	private schema() {
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 			CREATE TABLE IF NOT EXISTS registry (slug TEXT PRIMARY KEY, name TEXT, description TEXT, created_at INTEGER);
@@ -226,15 +232,41 @@ export class Project extends DurableObject<BraidEnv> {
 		return { remote, branch: "main", gitToken: await this.host.token(`${this.meta("slug")}--context`, "read", 3600) };
 	}
 
-	async destroy() {
+	/**
+	 * Everything this project knows, for moving it to another Braid instance that uses the same
+	 * Artifacts namespace. The repositories stay where they are; only the record of the work moves.
+	 * Sandbox runs are left out: their previews live in this instance and are made again on the other.
+	 */
+	async exportState() {
 		this.requireProject();
-		for (const repo of [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
+		return Object.fromEntries(MOVED_TABLES.map((t) => [t, this.rows(`SELECT * FROM ${t}`)]));
+	}
+
+	async importState(dump: Record<string, Record<string, unknown>[]>) {
+		if (this.trunk) throw new BraidError("a project with this name already exists here", 409);
+		for (const table of MOVED_TABLES) {
+			for (const row of dump[table] ?? []) {
+				const cols = Object.keys(row).filter((c) => /^\w+$/.test(c));
+				this.sql.exec(`INSERT OR REPLACE INTO ${table} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`, ...cols.map((c) => row[c] as any));
+			}
+		}
+		this.requireProject();
+		this.note("project", "braid", "Project moved to this Braid instance");
+		await this.serial(() => this.recompute());
+		return { slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description") };
+	}
+
+	/** Delete the project. With `keepRepos`, forget it here and leave its repositories, for a project that has moved. */
+	async destroy(keepRepos = false) {
+		this.requireProject();
+		for (const repo of keepRepos ? [] : [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
 			try { await this.host.remove(repo); } catch {}
 		}
 		for (const { ref } of this.rows<{ ref: string }>("SELECT DISTINCT ref FROM runs")) {
 			try { await this.runner(ref)?.clear(); } catch {}
 		}
 		await this.ctx.storage.deleteAll();
+		this.schema();
 	}
 
 	async state(): Promise<State> {

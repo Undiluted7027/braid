@@ -75,6 +75,8 @@ npx wrangler secret put ANTHROPIC_API_KEY     # optional: model-backed reconcili
 pnpm run deploy
 ```
 
+To move a project between two instances that share an Artifacts namespace (local to deployed, say): `GET /api/p/<project>/export` on the old one, `POST /api/projects/import` with `{ "dump": <that> }` on the new one, then `DELETE /api/p/<project>?repos=keep` on the old one so it forgets the project without deleting its repositories.
+
 With the admin token set, everything needs it, reads included: project state contains agent session transcripts. Agents keep using their own attempt tokens. A deployed instance with no admin token refuses requests unless the `BRAID_OPEN` variable is `"true"`.
 
 Without `ANTHROPIC_API_KEY`, the "Reconcile with a model" button uses Workers AI. Agents and people can always reconcile without any model.
