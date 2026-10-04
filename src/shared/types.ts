@@ -113,6 +113,8 @@ export interface Activity { id: number; at: number; kind: string; actor: string;
 export interface ProjectInfo { slug: string; name: string; description: string; repo: string; remote: string; branch: string; head: string; contextRemote: string | null; llm: string | null
 	/** Which agents this instance can run itself. */
 	hosting: { available: boolean; claude: boolean; codex: boolean; via: string };
+	/** Anyone with the link may read this project without signing in. */
+	public: boolean;
 }
 /** One command run in the sandbox for a commit. `tail` is the end of its output. */
 export interface RunStep { name: string; command: string; status: "running" | "pass" | "fail"; exitCode: number | null; ms: number; tail: string }
@@ -125,6 +127,8 @@ export interface Run {
 	previewApi: boolean; nothingToRun: boolean; error: string | null; startedAt: number; finishedAt: number | null;
 }
 export interface State {
+	/** Set for someone who has not signed in and is reading a public project: they can look, not change. */
+	viewer?: boolean;
 	/** Set when the instance has an admin token: the key that lets a sandboxed preview frame load each ref. */
 	previewKeys?: Record<string, string>;
 	project: ProjectInfo;

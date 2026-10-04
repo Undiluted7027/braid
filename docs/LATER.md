@@ -83,14 +83,19 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Open: a rename still shows as delete plus edit and cannot be reconciled in the UI.
    - Open: an open reconciliation shows on the project page only as a chip and one activity line (the "needs you" view in item 4).
    - Open: the state sent to the UI still carries full file contents for every open reconciliation; settled ones now carry only trunk's version and the result.
-4. **First ten minutes.**
-   - The UI copies `npx braid join ...`, which fails: the package is private and unpublished. The brief written into `BRAID.md` hard-codes the local path to `cli/braid.mjs`. "Clone trunk" gives a URL with no way to authenticate. The empty-project form points at `braid init`, which creates the project again.
-   - The home page does not say what Braid is. Rows of same-named projects look identical because the slug is not shown. The braid graph has no caption and no links. The page title is always "Braid".
-   - A public read-only view of the `braid` project, and the live URL and a screenshot at the top of the README before the prerequisites.
-   - Demo data with real verification and sessions: the `pnpm sim` projects show "not run yet" and "No session recorded" everywhere, because the starter app has no checks.
-   - Phone width: project, intent and Why pages are 820 to 1,330 px wide at 390 px.
-   - A "needs you" view: ready, conflicted and failed attempts in one place. Activity has no links and no paging.
-   - CLI: no descriptions in usage, `braid peek` outside an attempt says "attempt undefined not found". Sign-in is a browser prompt. Blame lines cannot be reached by keyboard. No `h1` on project or Why pages; chips are 11 px. The file tree is a flat list with no search, and there is no commit history view.
+4. **First ten minutes.** Done locally on October 4, 2026; not yet deployed.
+   - Done: the launcher is built into one file and served by the instance at `/braid.mjs`. "Add an agent" shows `curl` plus `node braid.mjs join ...`, which was copied from the UI and run as written. `braid init` now pushes into a project that was created empty instead of failing, and the CLI's help describes each command.
+   - Done: "Clone trunk" makes a clone command with a read token that lasts an hour; an empty project gets a push command the same way.
+   - Done: the home page says what Braid is in four steps, rows show the slug and path, every page has its own title and an `h1`, and the graph has a caption and can be used from the keyboard.
+   - Done: a project can be made public by its owner. A visitor can read it live (state, sessions, diffs, files, previews) and nothing else; every write, export and credential request is refused, and other projects stay private. The UI shows a read-only banner, hides the controls, and has a sign-in dialog in place of the browser prompt. Checked on a token-protected local instance.
+   - Done: the starter app has a test suite (`node --test`, no dependencies), so `pnpm sim` and every starter project show real verification and go through the landing queue.
+   - Done: nothing is wider than the screen at 390 px on the home, project, intent and Why pages.
+   - Done: "Needs you" at the top of a project: a failing trunk, conflicts to resolve, unanswered questions, failed checks, failed agents and attempts ready to review, each linking to where it is handled. Activity links to its intent and shows 30 at a time.
+   - Done: the Why page has a file filter and a trunk history list, and blame lines can be reached and opened from the keyboard. Chips are 12 px.
+   - Open: the `braid` project on the deployed instance is still private. Making it public is the owner's call: it shows the agent sessions to anyone with the link. The README has no live URL or screenshot until then.
+   - Open: the local `demo-*` projects were made before verification existed and still show "not run yet". Run `pnpm sim --keep` for a current one.
+   - Open: the file list is still flat (filtered, not a tree), and trunk history lists landings, not every commit.
+   - Open: sessions from `pnpm sim` hold only the scripted agents' Braid calls.
 5. **Why by line.**
    - Clicking a line shows every decision the attempt recorded for that file. Link a line to the decision and the moment in the session that produced it.
    - The Why view replays recorded landings only, so a change pushed to trunk outside Braid is shown with stale attribution. Attribute outside changes.
@@ -129,6 +134,7 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 ## Not verified yet
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
+- **Item 4 on the deployed instance.** The public view, the sign-in dialog, the served launcher and the phone layout have only run locally.
 - **A landing interrupted between the push and its record.** Handled in code, never forced to happen. (An interrupted run did happen, during a deploy on October 4: it was reported as "could not run" and ran again when asked.)
 - **The region editor on the deployed instance.** It was used in Chrome locally; on the deployed instance resolutions went through the API, the model and a hosted agent.
 - **On the deployed instance: landing refused while a hosted agent is still working.** It ran locally; on the deployed instance my request arrived before the agent had pushed anything, so it was refused for having no commits instead.

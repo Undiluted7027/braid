@@ -94,6 +94,7 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN attempt_sha TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN reverted_by TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN revert_of TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE registry ADD COLUMN public INTEGER DEFAULT 0"); } catch {}
 	}
 
 	// ── storage helpers ──────────────────────────────────────────────────────
@@ -192,7 +193,10 @@ export class Project extends DurableObject<BraidEnv> {
 
 	// ── registry (the instance named "~registry" lists projects) ─────────────
 
-	async listProjects() { return this.rows("SELECT slug, name, description, created_at AS createdAt FROM registry ORDER BY created_at DESC"); }
+	async listProjects(publicOnly = false) {
+		return this.rows<any>(`SELECT slug, name, description, created_at AS createdAt, public FROM registry ${publicOnly ? "WHERE public = 1" : ""} ORDER BY created_at DESC`).map((p) => ({ ...p, public: !!p.public }));
+	}
+	async markPublic(slug: string, on: boolean) { this.sql.exec("UPDATE registry SET public = ? WHERE slug = ?", on ? 1 : 0, slug); }
 	async registerProject(slug: string, name: string, description: string) {
 		if (this.rows("SELECT 1 FROM registry WHERE slug = ?", slug).length) throw new BraidError(`project "${slug}" already exists`, 409);
 		this.sql.exec("INSERT INTO registry (slug, name, description, created_at) VALUES (?, ?, ?, ?)", slug, name, description, now());
@@ -246,6 +250,24 @@ export class Project extends DurableObject<BraidEnv> {
 		this.setMeta("branch", branch);
 		this.setMeta("head", head);
 		this.note("project", "braid", head ? `Project created with trunk ${repo} at ${short(head)}` : `Project created with an empty trunk ${repo}; waiting for a first push`);
+	}
+
+	/**
+	 * Let anyone read this project without signing in: its intents, attempts, decisions, sessions,
+	 * diffs and previews. Nothing can be changed without the admin token. Off unless someone turns it on.
+	 */
+	async setPublic(on: boolean, by = "human") {
+		this.requireProject();
+		this.setMeta("public", on ? "1" : "");
+		this.note("project", by, on ? "Project made readable by anyone with the link" : "Project made private again");
+		return { public: on };
+	}
+	async isPublic() { return this.meta("public") === "1"; }
+
+	/** A read credential for trunk that lasts an hour, for cloning it. */
+	async cloneCredentials() {
+		this.requireProject();
+		return { remote: this.meta("remote"), branch: this.branch, gitToken: await this.host.token(this.trunk, "read", 3600) };
 	}
 
 	/** A short-lived write credential for trunk, for pushing a first commit into an empty project. */
@@ -306,7 +328,7 @@ export class Project extends DurableObject<BraidEnv> {
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
-				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env),
+				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env), public: this.meta("public") === "1",
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
 			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note })),
@@ -914,6 +936,7 @@ export class Project extends DurableObject<BraidEnv> {
 				};
 			}
 			case "peek": {
+				if (!args.attempt) throw new BraidError('peek needs the id of another attempt, e.g. {"attempt":"1.2"}; `brief` lists them');
 				const other = this.attempt(String(args.attempt));
 				const out: any = { ...this.describe(other), claims: other.claims, changed: other.files.map((f) => `${f.status} ${f.path}`), decisions: this.decisionsFor(other.id) };
 				if (args.path) {

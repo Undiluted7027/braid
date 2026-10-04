@@ -30,6 +30,8 @@ export function Braid({ state }: { state: State }) {
 
 	return (
 		<div className="braid">
+			<p className="braid-caption small dim">Trunk runs along the top. Each strand is one agent's attempt at an intent: it leaves trunk where it forked and rejoins where it landed. A vertical tie marks two attempts touching the same file. Select a strand to open its intent.</p>
+			<div className="braid-scroll" tabIndex={0} role="group" aria-label="Attempts over time, scrollable">
 			<svg width={width} height={height} role="img" aria-label="Attempts braiding into trunk">
 				<line x1={GUTTER} y1={TRUNK_Y} x2={width - PAD} y2={TRUNK_Y} className="trunk" />
 				<text x={12} y={TRUNK_Y + 4} className="lane-name">trunk</text>
@@ -44,7 +46,9 @@ export function Braid({ state }: { state: State }) {
 					const back = landed ? ` L ${x1 - CURVE} ${y} C ${x1} ${y}, ${x1 - CURVE} ${TRUNK_Y}, ${x1} ${TRUNK_Y}` : ` L ${x1} ${y}`;
 					const faded = a.status === "superseded";
 					return (
-						<g key={a.id} className={`strand ${a.status}`} onClick={() => navigate(`/p/${state.project.slug}/i/${a.intentId}`)}>
+						<g key={a.id} className={`strand ${a.status}`} role="link" tabIndex={0} aria-label={`I${a.intentId}, attempt ${a.id} by ${a.agent}: ${a.status}`}
+							onClick={() => navigate(`/p/${state.project.slug}/i/${a.intentId}`)} onKeyDown={(e) => { if (e.key === "Enter") navigate(`/p/${state.project.slug}/i/${a.intentId}`); }}>
+							<title>{`Open I${a.intentId}: attempt ${a.id} by ${a.agent} (${a.status})`}</title>
 							<text x={12} y={y + 4} className="lane-name">
 								<tspan fill={color} fontWeight={600}>I{a.intentId}</tspan>
 								<tspan dx={6}>{a.agent}</tspan>
@@ -76,6 +80,7 @@ export function Braid({ state }: { state: State }) {
 				})}
 				{strands.length === 0 && <text x={GUTTER + PAD + 30} y={TRUNK_Y + 48} className="lane-name">No attempts yet. Open an intent and add an agent.</text>}
 			</svg>
+			</div>
 			<div className="legend">
 				<span><i className="key conflict" /> will conflict</span>
 				<span><i className="key touch" /> same file, mergeable</span>

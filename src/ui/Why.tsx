@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import type { FileView, State } from "../shared/types";
 import { api, ago, intentColor, navigate, short, useAsync } from "./api";
-import { Link } from "./App";
+import { Link, useTitle } from "./App";
 import { Why } from "./Intent";
 
 export function WhyPage({ state }: { state: State }) {
@@ -14,6 +14,10 @@ export function WhyPage({ state }: { state: State }) {
 	useEffect(() => { if (!path && tree?.length) setPath(tree.find((p) => p.endsWith(".js")) ?? tree[0]); }, [tree, path]);
 	const open = (p: string) => { setPath(p); setPicked(null); navigate(`/p/${slug}/why?path=${encodeURIComponent(p)}`); };
 
+	const [filter, setFilter] = useState("");
+	useTitle(`${path || "Why"} · ${state.project.name}`);
+	const files = tree?.filter((p) => p.toLowerCase().includes(filter.toLowerCase())) ?? [];
+	const history = [...state.landings].reverse();
 	const landing = (sha: string | null) => state.landings.find((l) => l.sha === sha);
 	const shown = landing(picked) ?? (file?.trail.length ? file.trail[file.trail.length - 1] : undefined);
 	const intent = shown && state.intents.find((i) => i.id === shown.intentId);
@@ -23,8 +27,23 @@ export function WhyPage({ state }: { state: State }) {
 
 	return (
 		<main className="page why-page">
+			<h1 className="sr-only">{state.project.name}: why each line on trunk exists</h1>
 			<nav className="tree" aria-label="Files on trunk">
-				{tree?.map((p) => <button key={p} className={`mono ${p === path ? "on" : ""}`} onClick={() => open(p)}>{p}</button>)}
+				<input type="search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={`Find among ${tree?.length ?? 0} files`} aria-label="Filter files" />
+				<div className="tree-files">
+					{files.map((p) => <button key={p} className={`mono ${p === path ? "on" : ""}`} onClick={() => open(p)} title={p}>{p}</button>)}
+					{tree && files.length === 0 && <p className="dim small">No file matches.</p>}
+				</div>
+				<h3>Trunk history</h3>
+				<ol className="history">
+					{history.map((l) => (
+						<li key={l.sha}>
+							<Link to={`/p/${slug}/i/${l.intentId}`}><span className="mono" style={{ color: intentColor(l.intentId) }}>I{l.intentId}</span> {l.revertOf ? l.title : state.intents.find((i) => i.id === l.intentId)?.title ?? l.title}</Link>
+							<span className="dim small"><span className="mono">{short(l.sha)}</span> · {l.agent} · {ago(l.at)}{l.reconciled ? " · ⚯ reconciled" : ""}{l.revertedBy ? " · reverted" : ""}</span>
+						</li>
+					))}
+					{history.length === 0 && <li className="dim small">Nothing has landed yet.</li>}
+				</ol>
 			</nav>
 			<section className="code">
 				<div className="row"><h2 className="mono">{path}</h2><span className="spacer" />
@@ -36,6 +55,7 @@ export function WhyPage({ state }: { state: State }) {
 						const l = landing(line.sha);
 						return (
 							<div key={i} className={`bl ${line.sha && line.sha === shown?.sha ? "on" : ""}`} onClick={() => line.sha && setPicked(line.sha)}
+								{...(l ? { role: "button", tabIndex: 0, "aria-label": `Line ${i + 1}, from I${l.intentId}: show why`, onKeyDown: (e: { key: string }) => { if (e.key === "Enter" || e.key === " ") setPicked(line.sha); } } : {})}
 								style={l ? { borderLeftColor: intentColor(l.intentId), cursor: "pointer" } : undefined}>
 								<span className="who" style={l ? { color: intentColor(l.intentId) } : undefined}>{l ? `I${l.intentId}` : ""}</span>
 								<span className="ln">{i + 1}</span>

@@ -4,21 +4,34 @@ import type { SessionEvent, State } from "../shared/types";
 // A protected instance answers 401 until the browser has signed in; ask for the admin token once,
 // however many requests were refused at the same moment. The server keeps the session in a cookie.
 let signingIn: Promise<boolean> | null = null;
-function signIn() {
-	signingIn ??= (async () => {
-		const token = window.prompt("This Braid instance needs its admin token:") ?? "";
-		if (!token) return false;
-		const res = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
-		if (!res.ok) window.alert("That is not this instance's admin token.");
-		return res.ok;
-	})().finally(() => { signingIn = null; });
+/** Ask for the admin token in the sign-in dialog (see SignIn in App.tsx). Resolves true once the server has accepted it. */
+export function signIn(): Promise<boolean> {
+	signingIn ??= new Promise<boolean>((done) => window.dispatchEvent(new CustomEvent("braid:signin", { detail: done }))).finally(() => { signingIn = null; });
 	return signingIn;
+}
+export async function tryToken(token: string) {
+	const res = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token }) });
+	if (res.ok) window.dispatchEvent(new Event("braid:signed-in"));
+	return res.ok;
+}
+
+/** Whether this browser is signed in. On an instance with no admin token everyone is. */
+export function useSignedIn() {
+	const [me, setMe] = useState<{ signedIn: boolean; protected: boolean } | null>(null);
+	useEffect(() => {
+		const load = () => fetch("/api/me").then((r) => r.json()).then((m) => setMe(m as { signedIn: boolean; protected: boolean }), () => {});
+		load();
+		window.addEventListener("braid:signed-in", load);
+		return () => window.removeEventListener("braid:signed-in", load);
+	}, []);
+	return me;
 }
 
 export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
 	const send = () => fetch(`/api${path}`, { method, body: body ? JSON.stringify(body) : undefined, headers: { "content-type": "application/json" } });
 	let res = await send();
 	if (res.status === 401 && await signIn()) res = await send();
+	if (res.status === 401) throw new Error("Sign in with this instance's admin token to do that.");
 	const data = await res.json().catch(() => ({}));
 	if (!res.ok) throw new Error((data as any).error ?? `${res.status} ${res.statusText}`);
 	return data as T;
@@ -62,7 +75,9 @@ export function useProject(slug: string) {
 		};
 		reload();
 		connect();
-		return () => { closed = true; clearTimeout(retry); ws?.close(); };
+		// Signing in turns a read-only view into the full one.
+		window.addEventListener("braid:signed-in", reload);
+		return () => { closed = true; clearTimeout(retry); ws?.close(); window.removeEventListener("braid:signed-in", reload); };
 	}, [slug, reload]);
 
 	return { state, error, live, reload };

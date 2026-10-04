@@ -79,7 +79,9 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 	// Launchers and agents sign these two with their attempt token, which the project checks.
 	const byAttemptToken = request.method === "POST" && seg[0] === "p" && (seg[2] === "credentials" || seg[2] === "session") && seg.length === 3;
 	const allowed = byAttemptToken ? "ok" : await access(request, env, url);
+	if (allowed === "denied" && request.method === "GET") return visitor(request, env, url, seg);
 	if (allowed !== "ok") return refuse(allowed);
+	if (seg[0] === "me") return Response.json({ signedIn: true, protected: !!env.BRAID_ADMIN_TOKEN });
 	const body = async () => ((await request.json().catch(() => ({}))) ?? {}) as Record<string, any>;
 	const { method } = request;
 	const registry = project(env, REGISTRY);
@@ -153,10 +155,36 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		// Session events from an agent's launcher, authenticated by the attempt token.
 		if (rest[0] === "session") return Response.json(await p.ingest((request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), b.events));
 		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
+		if (rest[0] === "clone-credentials") return Response.json(await p.cloneCredentials());
+		if (rest[0] === "public") {
+			const made = await p.setPublic(b.public === true, b.by);
+			await registry.markPublic(slug, made.public);
+			return Response.json(made);
+		}
 		if (rest[0] === "context-credentials") return Response.json(await p.contextCredentials());
 		if (rest[0] === "credentials") return Response.json(await p.credentials(String(b.agentToken ?? "")));
 	}
 	return Response.json({ error: "not found" }, { status: 404 });
+}
+
+/**
+ * Someone who has not signed in. They can read the projects whose owner made them public, live, and
+ * nothing else: no writes, no export, no credentials, no other project.
+ */
+async function visitor(request: Request, env: BraidEnv, url: URL, seg: string[]): Promise<Response> {
+	if (seg[0] === "me") return Response.json({ signedIn: false, protected: true });
+	if (seg[0] === "projects" && seg.length === 1) return Response.json(await project(env, REGISTRY).listProjects(true));
+	if (seg[0] !== "p" || !seg[1]) return refuse("denied");
+	const slug = seg[1], p = project(env, slug), rest = seg.slice(2);
+	if (!SLUG.test(slug) || !(await p.isPublic())) return refuse("denied");
+	if (rest[0] === "ws" && rest.length === 1) return p.fetch(request);
+	if (rest.length === 0) {
+		const state = await p.state(), token = env.BRAID_ADMIN_TOKEN!;
+		state.viewer = true;
+		state.previewKeys = Object.fromEntries(await Promise.all(["trunk", ...state.attempts.map((a) => a.id)].map(async (ref) => [ref, await previewKey(token, slug, ref)])));
+		return Response.json(state);
+	}
+	return (await reads(p, rest, url.searchParams)) ?? refuse("denied");
 }
 
 /** The read-only views of one project, shared by the API and by previews that are allowed to read it. */

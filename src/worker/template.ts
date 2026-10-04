@@ -1,13 +1,14 @@
 // Starter repo for a new project: a small no-build web app, so every attempt can be
-// previewed straight from its Artifacts repo.
+// previewed straight from its Artifacts repo, with a test Braid runs on every commit.
 export const DEMO_FILES: Record<string, string> = {
 	"README.md": `# Tally
 
-A tiny counter board. No build step: open \`index.html\`.
+A tiny counter board. No build step: open \`index.html\`. \`npm test\` runs the tests (Node, no dependencies).
 
 - \`index.html\` — markup
 - \`styles.css\` — all styling, colors are CSS variables on \`:root\`
 - \`app.js\` — state, rendering, and event handling
+- \`test/app.test.js\` — runs \`app.js\` against a stand-in for the page
 `,
 	"AGENTS.md": `# Working in this repo
 
@@ -15,6 +16,66 @@ A tiny counter board. No build step: open \`index.html\`.
 - All state lives in the \`state\` object in \`app.js\`; \`render()\` redraws from it.
 - Colors must come from the CSS variables in \`styles.css\`.
 - Keep \`index.html\` loadable by opening the file directly.
+- Run \`npm test\` before you push, and add a test for what you change.
+`,
+	"package.json": `{
+	"name": "tally",
+	"private": true,
+	"scripts": {
+		"test": "node --test"
+	}
+}
+`,
+	"test/app.test.js": `const { test } = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+
+// A stand-in for the page: just enough of the DOM for app.js to run in Node.
+function page() {
+	const made = new Map();
+	const element = (id) => ({
+		id, innerHTML: "", textContent: "", className: "", value: "", dataset: {}, style: {}, children: [], listeners: {},
+		classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+		addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
+		appendChild(child) { this.children.push(child); return child; },
+		setAttribute() {}, querySelector: () => null, querySelectorAll: () => [],
+		click() { for (const fn of this.listeners.click || []) fn({ target: this, preventDefault() {} }); },
+	});
+	const byId = (id) => { if (!made.has(id)) made.set(id, element(id)); return made.get(id); };
+	const stored = new Map();
+	const context = vm.createContext({
+		console,
+		document: { getElementById: byId, createElement: () => element(""), documentElement: element("html"), body: element("body"), addEventListener() {}, querySelector: () => null, querySelectorAll: () => [] },
+		localStorage: { getItem: (k) => (stored.has(k) ? stored.get(k) : null), setItem: (k, v) => stored.set(k, String(v)), removeItem: (k) => stored.delete(k) },
+		matchMedia: () => ({ matches: false, addEventListener() {} }),
+		confirm: () => true,
+	});
+	context.window = context;
+	vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8") + "\\n;globalThis.state = state;", context);
+	return { context, byId, state: context.state };
+}
+
+test("starts with two counters and shows their total", () => {
+	const { byId, state } = page();
+	assert.equal(state.counters.length, 2);
+	assert.match(byId("total").textContent, /3/);
+});
+
+test("Add counter adds one that starts at zero", () => {
+	const { byId, state } = page();
+	byId("add").click();
+	assert.equal(state.counters.length, 3);
+	assert.equal(state.counters[2].count, 0);
+	assert.match(byId("total").textContent, /3/);
+});
+
+test("a count never goes below zero", () => {
+	const { context, state } = page();
+	context.bump(state.counters[0].id, -10);
+	assert.equal(state.counters[0].count, 0);
+});
 `,
 	"index.html": `<!doctype html>
 <html lang="en">

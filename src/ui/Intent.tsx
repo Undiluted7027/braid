@@ -2,7 +2,7 @@ import { runFor, Verification } from "./Verify";
 import { useEffect, useState } from "react";
 import type { Attempt, Conflict, Decision, DiffFile, Intent, Reconciliation, State } from "../shared/types";
 import { api, ago, intentColor, short, useAsync } from "./api";
-import { Link, useAction } from "./App";
+import { Link, useAction, useTitle } from "./App";
 import { FileDiff } from "./Diff";
 import { HostedChip, JoinCommand } from "./Project";
 import { Session } from "./Session";
@@ -260,8 +260,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				<span className={`chip ${a.status}`}>{a.status}</span>
 				<HostedChip a={a} />
 				<span className="spacer" />
-				{(a.hosted === "starting" || a.hosted === "running") && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}>Stop agent</button>}
-				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => { if (window.confirm(`Abandon attempt ${a.id}?${a.hosted === "starting" || a.hosted === "running" ? ` ${a.agent} is running and will be stopped.` : ""} You can reopen it while the intent is open.`)) drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {})); }}>Abandon</button>}
+				{!state.viewer && (a.hosted === "starting" || a.hosted === "running") && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}>Stop agent</button>}
+				{!state.viewer && LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => { if (window.confirm(`Abandon attempt ${a.id}?${a.hosted === "starting" || a.hosted === "running" ? ` ${a.agent} is running and will be stopped.` : ""} You can reopen it while the intent is open.`)) drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {})); }}>Abandon</button>}
 				{a.status === "abandoned" && canLand && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/restore`, {}))}>Reopen</button>}
 				{canLand && a.status === "conflicted" && <span className="small dim">resolve the reconciliation above to land</span>}
 				{canLand && LIVE.has(a.status) && a.status !== "conflicted" && (
@@ -345,6 +345,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 export function IntentPage({ state, intentId }: { state: State; intentId: number }) {
 	const intent = state.intents.find((i) => i.id === intentId);
 	const [joining, setJoining] = useState(false);
+	useTitle(intent ? `I${intent.id} ${intent.title} · ${state.project.name}` : state.project.name);
+	const edits = !state.viewer;
 	if (!intent) return <main className="page narrow"><p className="error">No intent I{intentId} in this project.</p></main>;
 	const attempts = state.attempts.filter((a) => a.intentId === intentId);
 	const recons = state.reconciliations.filter((r) => r.intentId === intentId);
@@ -364,10 +366,10 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 					<h1><span className="mono" style={{ color: intentColor(intent.id) }}>I{intent.id}</span> {intent.title}</h1>
 					<span className={`chip ${intent.status}`}>{intent.status}</span>
 					<span className="spacer" />
-					{intent.status === "open" && <button onClick={() => setEditing(!editing)}>{editing ? "Close" : "Edit"}</button>}
-					{intent.status === "open" && <button disabled={act.busy} onClick={abandon}>Abandon</button>}
-					{intent.status === "open" && <button onClick={() => setJoining(!joining)}>{joining ? "Close" : "Add an agent"}</button>}
-					{landing && <button disabled={act.busy} onClick={revert}>{act.busy ? "Reverting…" : "Revert landing"}</button>}
+					{edits && intent.status === "open" && <button onClick={() => setEditing(!editing)}>{editing ? "Close" : "Edit"}</button>}
+					{edits && intent.status === "open" && <button disabled={act.busy} onClick={abandon}>Abandon</button>}
+					{edits && intent.status === "open" && <button onClick={() => setJoining(!joining)}>{joining ? "Close" : "Add an agent"}</button>}
+					{edits && landing && <button disabled={act.busy} onClick={revert}>{act.busy ? "Reverting…" : "Revert landing"}</button>}
 				</div>
 				{act.error && <p className="error">{act.error}</p>}
 				{editing ? <EditIntent intent={intent} slug={state.project.slug} done={() => setEditing(false)} /> : <>
@@ -382,7 +384,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 			{recons.filter((r) => r.status !== "resolved").map((r) => <ReconPanel key={r.id} r={r} state={state} />)}
 			{attempts.length === 0 && <p className="dim">No attempts yet. Add an agent to start one; add several to compare approaches.</p>}
 			<div className="compare" style={{ gridTemplateColumns: `repeat(${Math.min(Math.max(attempts.length, 1), 3)}, minmax(0, 1fr))` }}>
-				{attempts.map((a) => <AttemptColumn key={a.id} a={a} state={state} canLand={intent.status === "open"} />)}
+				{attempts.map((a) => <AttemptColumn key={a.id} a={a} state={state} canLand={edits && intent.status === "open"} />)}
 			</div>
 			{recons.filter((r) => r.status === "resolved").map((r) => <ReconPanel key={r.id} r={r} state={state} />)}
 		</main>

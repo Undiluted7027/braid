@@ -9,9 +9,9 @@
     "braid": "cli/braid.mjs"
   },
   "scripts": {
-    "dev": "vite build && wrangler dev --port 8787",
-    "build": "vite build",
-    "deploy": "vite build && wrangler deploy",
+    "dev": "pnpm run build && wrangler dev --port 8787",
+    "build": "vite build && vite build --config vite.cli.config.ts",
+    "deploy": "pnpm run build && wrangler deploy",
     "typecheck": "wrangler types && tsc --noEmit",
     "test": "node --test test/*.test.mjs",
     "sim": "node scripts/sim.mjs"

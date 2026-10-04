@@ -38,7 +38,7 @@ Local dev uses the real Artifacts service through the binding; repos are created
 pnpm sim --pause
 ```
 
-A scripted run with deterministic "agents". Everything else is real: Artifacts forks, git pushes, MCP calls, overlap prediction, landing, and both ways of reconciling. Open the printed URL and press Enter to step through. Variants: `pnpm sim` (run straight through and clean up), `pnpm sim --until=conflict` (leave the project at the open reconciliation), `pnpm sim --keep`.
+A scripted run with deterministic "agents". Everything else is real: Artifacts forks, git pushes, MCP calls, overlap prediction, the starter app's tests run in a sandbox for every commit and every merge, landing, and both ways of reconciling. Open the printed URL and press Enter to step through. Variants: `pnpm sim` (run straight through and clean up), `pnpm sim --until=conflict` (leave the project at the open reconciliation), `pnpm sim --keep`.
 
 ### Put real agents on it
 
@@ -56,6 +56,15 @@ node cli/braid.mjs join http://localhost:8787/p/<project> --intent 2 --agent cod
 ```
 
 `join` forks trunk into a new Artifacts repo, clones it, writes the MCP config and a `BRAID.md` brief, and (with `--run`) starts Claude Code or Codex headless in that directory. Without `--run` it prints the directory so you can start the agent yourself. Join the same intent twice to get competing attempts.
+
+On a machine without this repository, the instance serves the launcher as one file, and "Add an agent" on an intent shows the exact command:
+
+```sh
+curl -fsSLO https://<your-instance>/braid.mjs
+node braid.mjs join https://<your-instance>/p/<project> --intent 1 --agent claude-code --run
+```
+
+On an instance with an admin token, set `BRAID_ADMIN_TOKEN` in the environment first.
 
 What a headless agent gets and what Braid keeps of its session:
 
@@ -80,6 +89,8 @@ pnpm run deploy
 To move a project between two instances that share an Artifacts namespace (local to deployed, say): `GET /api/p/<project>/export` on the old one, `POST /api/projects/import` with `{ "dump": <that> }` on the new one, then `DELETE /api/p/<project>?repos=keep` on the old one so it forgets the project without deleting its repositories.
 
 With the admin token set, everything needs it, reads included: project state contains agent session transcripts. Agents keep using their own attempt tokens. A deployed instance with no admin token refuses requests unless the `BRAID_OPEN` variable is `"true"`.
+
+A project's owner can make it public from its page ("Who can read this"). Anyone with the link can then read it live without signing in: intents, code, decisions, agent sessions and previews. They cannot change anything, and other projects stay private.
 
 With AI Gateway or `ANTHROPIC_API_KEY` set, the "Reconcile with a model" button uses Claude; otherwise Workers AI. Agents and people can always reconcile without any model.
 

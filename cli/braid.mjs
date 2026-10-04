@@ -200,7 +200,13 @@ async function initCommand() {
 		return data;
 	};
 	const head = execFileSync("git", ["-C", from, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-	await post("/projects", { slug, name: slug, description: String(flag("description", "")), source: "empty" });
+	// A project made empty in the UI is waiting for exactly this push; anything else with that name is someone's work.
+	const headers = { "content-type": "application/json", ...(admin ? { authorization: `Bearer ${admin}` } : {}) };
+	const made = await fetch(`${url.origin}/api/projects`, { method: "POST", headers, body: JSON.stringify({ slug, name: slug, description: String(flag("description", "")), source: "empty" }) });
+	if (!made.ok) {
+		const existing = made.status === 409 ? await fetch(`${url.origin}/api/p/${slug}`, { headers }).then((r) => (r.ok ? r.json() : null)) : null;
+		if (!existing || existing.project.head) fail((await made.json().catch(() => ({}))).error ?? `could not create ${slug} (${made.status})`);
+	}
 	const cred = await post(`/p/${slug}/trunk-credentials`, {});
 	execFileSync("git", ["-C", from, "push", "-q", cred.remote, `HEAD:refs/heads/${cred.branch}`], { stdio: "inherit", env: withHeader(cred.gitToken) });
 	await post(`/p/${slug}/push`, { repo: `${slug}--trunk` });
@@ -223,6 +229,21 @@ else if (command === "auth") {
 	if (process.argv[3]) { try { args = JSON.parse(process.argv[3]); } catch { fail("tool arguments must be one JSON object"); } }
 	console.log(await callTool(findAttempt(), command, args));
 } else {
-	console.log(`braid init <braid-url> --name <slug> [--from <dir>]\nbraid join <project-url> --intent <n> [--agent <name>] [--dir <path>] [--run] [--pass-env NAME,NAME] [--token <admin token>]\nbraid <${TOOLS.join("|")}> ['<json args>']\nbraid auth`);
+	console.log(`braid: put a coding agent to work on an intent.
+
+  braid join <project-url> --intent <n> [--agent claude-code|codex|<name>] [--run]
+      Start an attempt: fork trunk, clone it here, and connect the agent to Braid.
+      --run starts Claude Code or Codex headless in it. --dir <path> chooses the directory.
+      --pass-env NAME,NAME lets more of your environment through to the agent.
+  braid init <braid-url> --name <project> [--from <dir>] [--description <text>]
+      Make a local git repository the trunk of a project (creates the project if needed).
+  braid <tool> ['<json args>']
+      Call a Braid tool from inside an attempt directory, for agents without MCP:
+      ${TOOLS.join(", ")}
+      e.g.  braid brief   |   braid peek '{"attempt":"1.2"}'   |   braid checkpoint '{"summary":"toggle works"}'
+  braid auth
+      Refresh an attempt's git credentials.
+
+An instance with an admin token needs it for join and init: --token <token>, or BRAID_ADMIN_TOKEN in the environment.`);
 	process.exit(command && command !== "help" && command !== "--help" ? 1 : 0);
 }
