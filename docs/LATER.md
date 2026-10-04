@@ -63,14 +63,19 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 
 ## Not verified yet
 
-- **Bringing an agent back to fix failed checks**, with a real failing commit.
-- **Anything from step 4 on the deployed instance**: hosted agents, bringing an agent back, the one-sided resolution guard, and Claude reconciliation through the gateway have only run locally.
+- **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
+- **The landing fix for same-named files on the deployed instance.** Conflicted files are now identified by full path (checked locally with `a/index.txt` and `b/index.txt`); the deployed instance gets it at the next deploy.
 
 Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.
 
 Checked on October 4, 2026:
 
 - Locally: the admin token guard (every route class, cookie sign-in, keyed previews, the socket), the context repo's contents read back from a clone, and capture and redaction with real Claude Code and Codex sessions that ran `env`, `cat .mcp.json` and `git config --list`.
+- Step 4 on the deployed instance, in a separate project (`dep-step4`):
+  - Claude Code and Codex each ran in a sandbox through AI Gateway, pushed, waited for verification and marked their attempts ready. No `Co-Authored-By` trailer on the hosted Claude Code commit.
+  - Landing the second attempt conflicted. Braid refused a resolution identical to either side. Codex, brought back, wrote a version with both buttons and it landed.
+  - A commit with a failing test was pushed to a third attempt. Claude Code, brought back to fix it, found the cause, pushed, waited for verification to pass and marked the attempt ready.
+  - A second conflict was reconciled with Claude through the gateway, and trunk verification passed afterwards.
 - Deployed at https://braid.undiluted7027.workers.dev: the push-event Workflow (a push with no `checkpoint` updated the attempt), sandbox runs and their isolation on Cloudflare's microVM, sign-in, the live socket, both kinds of preview, `ready` refused on a failed commit, and the forced-landing confirmation.
 
 The `braid` project now lives on the deployed instance. It was moved there with its intents, decisions, landings and sessions; the local instance has forgotten it.

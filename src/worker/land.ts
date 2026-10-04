@@ -43,6 +43,14 @@ export async function land(input: LandInput): Promise<LandResult> {
 	}
 	await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: trunkSha, force: true });
 
+	// isomorphic-git gives the merge driver a file's name without its folder, so a file is identified
+	// by its name together with both sides' contents, and its full path is looked up from those.
+	const text = async (oid: string, filepath: string) => {
+		try { return new TextDecoder().decode((await git.readBlob({ fs, dir, oid, filepath })).blob); } catch { return null; }
+	};
+	const name = (path: string) => path.slice(path.lastIndexOf("/") + 1);
+	const sides = async (path: string) => ({ path, trunk: await text(trunkSha, path), attempt: await text(attemptSha, path) });
+	const resolved = await Promise.all([...input.resolutions.keys()].map(sides));
 	const conflicts: MergeConflict[] = [];
 	const reconciled: string[] = [];
 	try {
@@ -52,10 +60,10 @@ export async function land(input: LandInput): Promise<LandResult> {
 			message: input.message, author: input.author, committer: input.author,
 			mergeDriver: ({ contents, path }) => {
 				const [base, trunk, attempt] = contents;
-				const resolved = input.resolutions.get(path);
-				if (resolved !== undefined) {
-					reconciled.push(path);
-					return { cleanMerge: true, mergedText: resolved };
+				const hit = resolved.find((r) => name(r.path) === path && r.trunk === trunk && r.attempt === attempt);
+				if (hit) {
+					reconciled.push(hit.path);
+					return { cleanMerge: true, mergedText: input.resolutions.get(hit.path)! };
 				}
 				const r = merge3(base, trunk, attempt);
 				if (!r.clean) conflicts.push({ path, kind: "content", base, trunk, attempt, regions: r.regions });
@@ -68,6 +76,10 @@ export async function land(input: LandInput): Promise<LandResult> {
 		return { ok: true, sha, parentSha: trunkSha, reconciled };
 	} catch (e: any) {
 		if (e?.code !== "MergeConflictError") throw e;
+		for (const full of await Promise.all(((e.data?.bothModified ?? []) as string[]).map(sides))) {
+			const c = conflicts.find((c) => c.path === name(full.path) && c.trunk === full.trunk && c.attempt === full.attempt);
+			if (c) c.path = full.path;
+		}
 		// One side deleted a file the other edited: there is no text to merge.
 		for (const path of [...(e.data?.deleteByUs ?? []), ...(e.data?.deleteByTheirs ?? [])]) {
 			conflicts.push({ path, kind: "delete", base: null, trunk: null, attempt: null, regions: [] });
