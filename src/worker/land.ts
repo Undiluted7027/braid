@@ -92,3 +92,21 @@ export async function seed(remote: string, token: string, files: Record<string, 
 	if (!push.ok) throw new Error(`seed push rejected: ${JSON.stringify(push.refs)}`);
 	return sha;
 }
+
+/** Add or replace files in a repo as one commit on `branch`, creating the branch if the repo is empty. */
+export async function commitFiles(remote: string, token: string, branch: string, files: Record<string, string>, message: string, author: Author, empty: boolean): Promise<string> {
+	const fs = new MemoryFS();
+	await fs.promises.mkdir(dir);
+	if (empty) await git.init({ fs, dir, defaultBranch: branch });
+	else await git.clone({ fs, http, dir, url: remote, ref: branch, singleBranch: true, depth: 1, onAuth: gitAuth(token) });
+	for (const [path, content] of Object.entries(files)) {
+		const full = `${dir}/${path}`;
+		await fs.promises.mkdir(full.slice(0, full.lastIndexOf("/")), { recursive: true });
+		await fs.promises.writeFile(full, content);
+		await git.add({ fs, dir, filepath: path });
+	}
+	const sha = await git.commit({ fs, dir, message, author });
+	const push = await git.push({ fs, http, dir, url: remote, ref: branch, onAuth: gitAuth(token) });
+	if (!push.ok) throw new Error(`push rejected: ${JSON.stringify(push.refs)}`);
+	return sha;
+}

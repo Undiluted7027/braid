@@ -224,3 +224,21 @@ button.danger.solid { background: var(--bad); border-color: var(--bad); color: v
 .reason h2 { font-size: 17px; margin: 2px 0; }
 .recon-note { margin-top: 12px; padding: 10px 12px; background: var(--sunk); border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0; }
 .recon-note p { color: var(--muted); margin-top: 4px; }
+
+/* session */
+.session { list-style: none; margin: 6px 0 0; padding: 8px 0; max-height: 420px; overflow-y: auto; background: var(--sunk); border-radius: 6px; font-size: 12.5px; }
+.ev { display: grid; grid-template-columns: 62px 16px minmax(0, 1fr); gap: 6px; padding: 2px 10px; align-items: baseline; }
+.ev-time { font: 10.5px var(--mono); color: var(--muted); }
+.ev-mark { color: var(--muted); text-align: center; }
+.ev-body { min-width: 0; }
+.ev-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ev-tool { font: 10.5px var(--mono); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-right: 6px; }
+.ev-say .ev-mark { color: var(--ink); }
+.ev.ev-tool .ev-mark, .ev-braid .ev-mark { color: var(--accent); }
+.ev-result .ev-text { color: var(--muted); }
+.ev-result.ev-error .ev-text, .ev-result.ev-error .ev-mark { color: var(--bad); }
+.ev.decision-mark { background: var(--surface); border-left: 3px solid var(--accent); margin: 4px 0; padding-top: 5px; padding-bottom: 5px; }
+.ev.decision-mark .ev-mark { color: var(--accent); }
+.ev-more { border: 0; background: none; padding: 0 0 0 6px; color: var(--accent); font-size: 11.5px; }
+.ev .pulse { animation: pulse 1.6s ease-in-out infinite; color: var(--good); }
+.now { flex-basis: 100%; margin: 0 0 2px 0; padding-left: 34px; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

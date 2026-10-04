@@ -4,6 +4,7 @@ import { api, ago, intentColor, short, useAsync } from "./api";
 import { Link, useAction } from "./App";
 import { FileDiff } from "./Diff";
 import { JoinCommand } from "./Project";
+import { Session } from "./Session";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 const touches = (d: Decision, path: string) => d.files.some((f) => f === path || path.startsWith(f.replace(/\/?\*?$/, "") + "/"));
@@ -118,6 +119,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const { data: diff } = useAsync(() => api<DiffFile[]>("GET", `/p/${slug}/attempts/${a.id}/diff`), [a.id, a.headSha, a.baseSha]);
 	const decisions = state.decisions.filter((d) => d.attemptId === a.id);
 	const [preview, setPreview] = useState(false);
+	const [showSession, setShowSession] = useState(true);
 	const [frame, setFrame] = useState(0);
 	useEffect(() => setFrame((f) => f + 1), [a.headSha]);
 	const land = useAction(), drop = useAction();
@@ -146,6 +148,12 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 
 			<h3>Why</h3>
 			<Why decisions={decisions} empty="This agent has not recorded any decisions yet." />
+
+			<div className="row section-head">
+				<h3>Session</h3><span className="spacer" />
+				<button onClick={() => setShowSession(!showSession)}>{showSession ? "Hide" : "Show"}</button>
+			</div>
+			{showSession && <Session slug={slug} attemptId={a.id} decisions={decisions} live={a.status === "working"} />}
 
 			{collisions.length > 0 && <>
 				<h3>Collisions with other intents</h3>
@@ -196,6 +204,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 				</div>
 				<p className="goal">{intent.goal}</p>
 				{intent.acceptance && <p className="small"><strong>Acceptance:</strong> {intent.acceptance}</p>}
+				{landing && state.project.contextRemote && <p className="small dim">Its decisions and session transcript are committed to the context repo: <span className="mono">{state.project.contextRemote}</span> under <span className="mono">intents/{intent.id}/</span></p>}
 				{landing && <p className="small">Landed on trunk as <span className="mono">{short(landing.sha)}</span> from attempt {landing.attemptId} ({landing.agent}), {ago(landing.at)}. <Link to={`/p/${state.project.slug}/why?path=${encodeURIComponent(landing.files[0] ?? "")}`}>See it in the code</Link></p>}
 				{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} />}
 			</div>
