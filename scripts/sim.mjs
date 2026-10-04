@@ -198,7 +198,7 @@ const conflicted = await land(claude);
 stopAt("conflict");
 if (!conflicted.landed) {
 	// The agent whose landing conflicted reads both sides and why, then writes a version that keeps both intents.
-	const { reconciliation } = await claude.call("reconciliation");
+	const { reconciliation } = await claude.call("reconciliation", { full: true });
 	for (const c of reconciliation.conflicts) {
 		say(claude.name, `reading conflict in ${c.path}: ${c.regions.length} region(s); trunk side is ${c.trunkWhy.map((w) => `I${w.intentId} "${w.title}" (${w.decisions.length} decisions)`).join(", ")}`);
 	}

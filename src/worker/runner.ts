@@ -9,7 +9,9 @@ import type { BraidEnv, Project } from "./project";
 
 /** What to run, as trunk defines it: its braid.json, and the check scripts its package.json has. An attempt cannot drop a check by editing these. */
 export interface RunPolicy { config: any | null; scripts: string[] }
-export interface RunJob { slug: string; ref: string; repo: string; remote: string; branch: string; sha: string; runId: number; policy?: RunPolicy }
+export interface RunJob { slug: string; ref: string; repo: string; remote: string; branch: string; sha: string; runId: number; policy?: RunPolicy;
+	/** Instead of verifying: bring these lockfiles up to date with the commit's package.json and hand them back. */
+	regenerate?: string[] }
 
 const CA = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 const WORK = "/workspace";
@@ -125,6 +127,22 @@ export class Runner extends DurableObject<BraidEnv> {
 		const cloned = await step("clone", `git fetch ${job.sha.slice(0, 7)}`, ["sh", "-c",
 			`git init -q ${WORK} && cd ${WORK} && git remote add origin "$0" && (git fetch -q --depth=1 origin "$1" || git fetch -q --depth=50 origin "$2") && git checkout -q "$1"`, job.remote, job.sha, job.branch]);
 		if (!cloned) return finish({ status: "error", error: "could not fetch the commit" });
+
+		if (job.regenerate) {
+			// Resolve only: the registry is asked what each dependency resolves to, and nothing from a package is run.
+			const files: Record<string, string> = {};
+			for (const path of job.regenerate) {
+				const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".", name = path.slice(path.lastIndexOf("/") + 1);
+				const command = name === "pnpm-lock.yaml" ? "pnpm install --lockfile-only --no-frozen-lockfile --ignore-scripts" : name === "package-lock.json" ? "npm install --package-lock-only --ignore-scripts --no-audit --no-fund" : null;
+				if (!command) return finish({ status: "error", error: `Braid cannot regenerate ${name}` });
+				if (!(await step(`lockfile ${path}`.slice(0, 40), command, ["sh", "-c", command], `${WORK}/${dir}`))) return finish({ status: "fail" });
+				const out = await exec(["cat", path], WORK);
+				if (out.code !== 0 || out.text.length > MAX_PREVIEW_FILE) return finish({ status: "error", error: `could not read ${path} back` });
+				files[path] = out.text;
+			}
+			await this.project(job).lockfiles(job.runId, files);
+			return finish({ status: "pass", nothingToRun: true });
+		}
 
 		const plan = await this.plan(exec, job.policy);
 		if (plan.install && !(await step("install", plan.install, ["sh", "-c", plan.install], WORK))) return finish({ status: "fail" });

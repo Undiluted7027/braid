@@ -69,11 +69,13 @@ export interface Overlap { a: string; b: string; path: string; severity: "claim"
 export interface ConflictContext { intentId: number; title: string; goal: string; agent: string; decisions: Decision[] }
 export interface Conflict {
 	path: string;
-	kind: "content" | "delete";
+	/** `lockfile`: both sides changed dependencies. Nobody merges it by hand: Braid regenerates it from the merged package.json. */
+	kind: "content" | "delete" | "lockfile";
 	base: string | null;
 	trunk: string | null;
 	attempt: string | null;
-	regions: { base: string; ours: string; theirs: string; oursLine: number }[];
+	/** Each place the two sides disagree, with a few agreed lines before and after it. `ours` is trunk, `theirs` the attempt. */
+	regions: { base: string; ours: string; theirs: string; oursLine: number; before?: string; after?: string }[];
 	/** Why trunk looks the way it does here: the intents that landed changes to this path. */
 	trunkWhy: ConflictContext[];
 }
@@ -148,7 +150,7 @@ export interface QueuedLanding {
 	attemptId: string; by: string; at: number;
 	/** The commit the person asked to land. If the attempt moves, the request is dropped. */
 	attemptSha: string;
-	state: "waiting" | "verifying" | "pushing";
+	state: "waiting" | "locking" | "verifying" | "pushing";
 	/** What it is waiting for, in words. */
 	note: string;
 }

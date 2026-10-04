@@ -72,11 +72,17 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Open: an agent started on someone's machine only hears a note if it is still running or is started again by hand; `braid join` has no "resume".
    - Open: a revert is pushed and then verified on trunk, not verified first. A reverted attempt cannot be landed again, because its commits are already in trunk's history; the intent needs a new attempt.
    - Open: acceptance is still prose. Nothing checks an attempt against it (the reviewer agent in item 6).
-3. **Reconciliation by region.**
-   - The model must return whole files, capped at 16,000 output tokens (8,000 on Workers AI). `project.ts` is 67 kB, so a conflict there cannot be resolved by the model, and that is the file the demo will collide on. Resolve each conflicted region and assemble the file on the server. Same for agents, which have to send the whole file in `resolve`.
-   - The editor is a 14-row text box pre-filled with trunk's file: no conflict markers, no base, no jump to the conflict. Show markers and the base, and show the merged diff after resolution.
-   - "Land this" stays the main button on a conflicted attempt under the open reconciliation. An open reconciliation shows only as a chip and one activity line.
-   - Lockfile conflicts go to a hand merge; regenerate the lockfile. A rename shows as delete plus edit and cannot be reconciled in the UI.
+3. **Reconciliation by region.** Done locally on October 4, 2026; not yet deployed.
+   - Done: a resolution is one replacement per conflict, and Braid puts them in place (`assemble` in `gitops.ts`). The model is shown the merged file with numbered conflict blocks and unchanged stretches left out, and answers per conflict. Checked on a 51 kB, 3,000-line file with two conflicts and separate clean changes from each side: Claude resolved both in 16 seconds and every other line was kept.
+   - Done: an agent's `reconciliation` tool returns the conflicts with a few lines around each (3 kB for that file) instead of three copies of the file; `full: true` adds the whole files. `resolve` takes `regions` or a whole `content`.
+   - Done: hosted Codex, brought back to a conflict, answered with one replacement for the one conflicting line and it landed with both attributes. Its sandbox is stopped the moment the attempt lands, so its session ends with "stopped: the attempt is over" instead of its own last words.
+   - Done: the one-sided guard also refuses an answer that takes the same side at every conflict.
+   - Done: the editor works one conflict at a time: both sides, their base, the lines around, starting points (trunk's, the attempt's, both in either order, neither), and a switch to the whole file with markers. A resolved reconciliation shows what it changed in trunk's version. A conflicted attempt no longer shows "Land this".
+   - Done: `package.json` is merged by key, so two attempts that each add a dependency do not conflict. A lockfile left in conflict is regenerated in a sandbox from the merged `package.json`, starting from trunk's lockfile, and the result is verified like any merge. Checked with npm: two attempts each added a dependency, the second landed with all of them locked and `npm ci` passing, and nobody touched the lockfile.
+   - Open: lockfile regeneration is checked for npm only; pnpm uses the same path with its own command and has not been run. yarn and bun are not handled.
+   - Open: a rename still shows as delete plus edit and cannot be reconciled in the UI.
+   - Open: an open reconciliation shows on the project page only as a chip and one activity line (the "needs you" view in item 4).
+   - Open: the state sent to the UI still carries full file contents for every open reconciliation; settled ones now carry only trunk's version and the result.
 4. **First ten minutes.**
    - The UI copies `npx braid join ...`, which fails: the package is private and unpublished. The brief written into `BRAID.md` hard-codes the local path to `cli/braid.mjs`. "Clone trunk" gives a URL with no way to authenticate. The empty-project form points at `braid init`, which creates the project again.
    - The home page does not say what Braid is. Rows of same-named projects look identical because the slug is not shown. The braid graph has no caption and no links. The page title is always "Braid".
@@ -124,6 +130,7 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
 - **Recovery paths in item 1.** A run interrupted mid-way, and a landing interrupted between the push and its record, are handled in code but were not forced to happen.
+- **Item 3 on the deployed instance.** Region resolutions, the model on a large file, the `package.json` merge and lockfile regeneration have only run locally.
 - **On the deployed instance: landing refused while a hosted agent is still working.** It ran locally; on the deployed instance my request arrived before the agent had pushed anything, so it was refused for having no commits instead.
 
 Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.

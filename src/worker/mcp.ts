@@ -22,9 +22,10 @@ export const TOOLS = [
 	tool("check", "Report the result of a check you ran (tests, lint, manual verification).",
 		{ name: str, status: { type: "string", enum: ["pass", "fail"] }, detail: str }, ["name", "status"]),
 	tool("ready", "Mark the attempt ready to land once the goal is met and your commits are pushed.", { summary: str }, ["summary"]),
-	tool("reconciliation", "If landing conflicted: both versions of each conflicting file, their common base, and why trunk's side exists (the other intent and its decisions)."),
-	tool("resolve", "Answer a reconciliation with full merged file contents that satisfy both intents, plus a rationale. Braid then lands the attempt at once, so check the contents before you call this. A file identical to one side is refused unless one_sided is true.",
-		{ resolutions: { type: "array", items: { type: "object", properties: { path: str, content: str }, required: ["path", "content"] } }, rationale: str, one_sided: { type: "boolean" } }, ["resolutions", "rationale"]),
+	tool("reconciliation", "If landing conflicted: each place trunk and your attempt changed the same lines (both versions, their base, a few lines around), and why trunk's side exists (the other intent and its decisions). `full` adds the whole base, trunk and attempt files.",
+		{ full: { type: "boolean" } }),
+	tool("resolve", "Answer a reconciliation: for each conflicting file, one replacement per conflict region (or the whole merged file), such that both intents are satisfied, plus a rationale. Braid puts the replacements in place, verifies the merge in a sandbox and lands it, so check what you send. An answer that just takes one side is refused unless one_sided is true.",
+		{ resolutions: { type: "array", items: { type: "object", properties: { path: str, regions: { type: "array", items: str, description: "One replacement per conflict region, in order" }, content: { type: "string", description: "The whole merged file, instead of regions" } }, required: ["path"] } }, rationale: str, one_sided: { type: "boolean" } }, ["resolutions", "rationale"]),
 	tool("sync", "How to merge the current trunk into your attempt with git."),
 ];
 

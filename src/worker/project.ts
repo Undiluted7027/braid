@@ -3,7 +3,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
-import { asText, diffTrees, listTree, mergeBase, predict } from "./gitops";
+import { asText, assemble, diffTrees, listTree, markedView, merge3, mergeBase, predict } from "./gitops";
 import { CANDIDATE, commitFiles, prepare, promote, revert, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
@@ -22,6 +22,8 @@ export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string;
 const LIVE = new Set(["working", "ready", "conflicted"]);
 /** How many agents Braid runs for one project at a time, unless HOSTED_MAX says otherwise. */
 const HOSTED_MAX = 6;
+/** Files a package manager writes. A conflict in one is not merged as text; it is regenerated. */
+const LOCKFILE = /(^|\/)(pnpm-lock\.yaml|package-lock\.json)$/;
 const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
 const MAX_TEXT = 400_000;
 const MAX_EVENT_TEXT = 4000;
@@ -313,7 +315,9 @@ export class Project extends DurableObject<BraidEnv> {
 			attempts: this.attempts().map((a) => ({ ...a, now: this.latestEvent(a.id) })),
 			decisions: this.rows("SELECT * FROM decisions ORDER BY id").map(this.toDecision),
 			overlaps: this.rows<Overlap>("SELECT a, b, path, severity, regions FROM overlaps"),
-			reconciliations: this.rows("SELECT * FROM reconciliations ORDER BY id").map(this.toRecon),
+			// A settled reconciliation is shown as its result against trunk; the other two copies of each file are not sent.
+			reconciliations: this.rows("SELECT * FROM reconciliations ORDER BY id").map(this.toRecon).map((r) =>
+				r.status === "resolved" || r.status === "stale" ? { ...r, conflicts: r.conflicts.map((c) => ({ ...c, base: null, attempt: null, regions: [] })) } : r),
 			landings: this.landings(),
 			activity: this.rows<any>("SELECT * FROM activity ORDER BY id DESC LIMIT 200").map((r): Activity => ({
 				id: r.id, at: r.at, kind: r.kind, actor: r.actor, text: r.text, intentId: r.intent_id, attemptId: r.attempt_id,
@@ -711,9 +715,9 @@ export class Project extends DurableObject<BraidEnv> {
 		return policy;
 	}
 
-	private async startRun(ref: string, target: { repo: string; remote: string; sha: string; branch: string }) {
+	private async startRun(ref: string, target: { repo: string; remote: string; sha: string; branch: string }, regenerate?: string[]) {
 		const runId = this.rows<{ id: number }>("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at) VALUES (?, ?, 'queued', '[]', 0, 0, NULL, ?) RETURNING id", ref, target.sha, now())[0].id;
-		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy: await this.policy() };
+		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy: await this.policy(), ...(regenerate ? { regenerate } : {}) };
 		await this.runner(ref)!.start(job);
 		this.broadcast();
 	}
@@ -741,8 +745,13 @@ export class Project extends DurableObject<BraidEnv> {
 			run.status, json(run.steps), run.preview ? 1 : 0, run.previewApi ? 1 : 0, run.nothingToRun ? 1 : 0, run.error ?? null, run.finishedAt ?? null, runId);
 		if (!patch.finishedAt || run.status === "superseded") return this.broadcast();
 
-		const merged = run.ref.startsWith("land:");
-		const a = run.ref === "trunk" ? null : this.attempt(merged ? run.ref.slice(5) : run.ref);
+		const merged = run.ref.includes(":"), locking = run.ref.startsWith("lock:");
+		const a = run.ref === "trunk" ? null : this.attempt(run.ref.slice(run.ref.indexOf(":") + 1));
+		if (a && locking) {
+			this.note("verify", "braid", run.status === "pass" ? `Regenerated the lockfile for attempt ${a.id} merged with trunk` : `Could not regenerate the lockfile for attempt ${a.id}: ${run.error ?? run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}`, a.intentId, a.id);
+			await this.serial(() => this.advance()).catch((e) => this.note("land", "braid", `The landing queue stopped: ${splitError(e).message}`));
+			return;
+		}
 		const what = !a ? "trunk" : merged ? `attempt ${a.id} (${a.agent}) merged with trunk` : `attempt ${a.id} (${a.agent})`;
 		const checks = run.steps.filter((s) => s.name !== "clone" && s.name !== "install");
 		const summary = run.status === "error" ? `could not run: ${run.error}`
@@ -758,6 +767,20 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		// A result can be what a landing was waiting for.
 		await this.serial(() => this.advance()).catch((e) => this.note("land", "braid", `The landing queue stopped: ${splitError(e).message}`));
+	}
+
+	/** Lockfiles a sandbox regenerated for a merge: kept as a resolution, for exactly the two commits it was made from. */
+	async lockfiles(runId: number, files: Record<string, string>) {
+		const run = this.rows<any>("SELECT * FROM runs WHERE id = ?", runId)[0];
+		const entry = run && this.rows<any>("SELECT * FROM queue WHERE attempt_id = ? AND state = 'locking' AND candidate_sha = ?", String(run.ref).slice(5), run.sha)[0];
+		if (!entry) return;
+		const a = this.attempt(entry.attempt_id);
+		const paths = Object.keys(files);
+		this.sql.exec("INSERT INTO reconciliations (attempt_id, intent_id, status, trunk_sha, attempt_sha, conflicts, resolutions, rationale, resolved_by, at) VALUES (?, ?, 'resolved', ?, ?, ?, ?, ?, 'braid', ?)",
+			a.id, a.intentId, entry.trunk_sha, entry.attempt_sha,
+			json(paths.map((path) => ({ path, kind: "lockfile", base: null, trunk: null, attempt: null, regions: [], trunkWhy: [] }))),
+			json(paths.map((path) => ({ path, content: files[path] }))),
+			`Both sides changed dependencies. ${paths.join(", ")} was regenerated from the merged package.json in a sandbox, starting from trunk's version.`, now());
 	}
 
 	/** What an agent is told about the verification of its current commit. */
@@ -929,7 +952,20 @@ export class Project extends DurableObject<BraidEnv> {
 			}
 			case "reconciliation": {
 				const r = this.openRecon(me.id);
-				return r ? { reconciliation: r, instructions: RECONCILE_HELP } : { reconciliation: null };
+				if (!r) return { reconciliation: null };
+				// The conflicts themselves, not three copies of every file: a large file would not fit in an agent's context.
+				return {
+					reconciliation: {
+						id: r.id, trunk: short(r.trunkSha),
+						conflicts: r.conflicts.map((c) => ({
+							path: c.path, kind: c.kind,
+							regions: c.regions.map((g, i) => ({ region: i + 1, trunk_line: g.oursLine, before: g.before ?? "", trunk: g.ours, base: g.base, attempt: g.theirs, after: g.after ?? "" })),
+							trunkWhy: c.trunkWhy,
+							...(args.full ? { base: c.base, trunk: c.trunk, attempt: c.attempt } : {}),
+						})),
+					},
+					instructions: RECONCILE_HELP,
+				};
 			}
 			case "resolve": {
 				const r = this.openRecon(me.id);
@@ -1114,6 +1150,15 @@ export class Project extends DurableObject<BraidEnv> {
 			if (own.status === "fail") return { kind: "refused", why: `attempt ${a.id} failed verification at ${short(a.headSha)} (${failed(own)}); land it anyway with force` };
 			if (own.status !== "pass") return { kind: "refused", why: `attempt ${a.id} could not be verified at ${short(a.headSha)}${own.error ? ` (${own.error})` : ""}; run the verification again, or land it anyway with force` };
 
+			// A lockfile being regenerated for this trunk and this commit: wait for it, then merge with what came back.
+			if (entry.state === "locking" && entry.trunk_sha === head && entry.candidate_sha) {
+				const run = this.latestRun(`lock:${a.id}`);
+				if (run && run.sha === entry.candidate_sha) {
+					if ((run.status === "queued" || run.status === "running") && now() - run.startedAt < 45 * 60_000) return { kind: "hold", why: "regenerating the lockfile from the merged package.json" };
+					if (run.status !== "pass") return { kind: "refused", why: `both sides changed dependencies and the lockfile could not be regenerated${run.error ? ` (${run.error})` : failed(run) ? ` (${failed(run)} failed)` : ""}. Merge trunk into the attempt with git and run the install there` };
+				}
+			}
+
 			// A merge already built for this trunk and this commit: its result decides.
 			if (entry.state === "verifying" && entry.trunk_sha === head && entry.candidate_sha) {
 				const run = this.latestRun(`land:${a.id}`);
@@ -1149,17 +1194,34 @@ export class Project extends DurableObject<BraidEnv> {
 		// Build the merge. A saved resolution is only for the two commits it was written against.
 		const trunkHead = this.meta("head");
 		this.sql.exec("UPDATE reconciliations SET status = 'stale' WHERE attempt_id = ? AND status = 'resolved' AND (trunk_sha != ? OR COALESCE(attempt_sha, ?) != ?)", a.id, trunkHead, a.headSha, a.headSha);
-		const resolvedRow = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id DESC LIMIT 1", a.id)[0];
-		const recon = resolvedRow ? this.toRecon(resolvedRow) : null;
-		const result = await prepare({
+		// Every resolution still standing for these two commits: what a person, an agent or a model wrote, and any lockfile Braid regenerated.
+		const resolved = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id", a.id).map(this.toRecon);
+		const recon = resolved.filter((r) => r.resolvedBy !== "braid").pop() ?? null;
+		const resolutions = new Map(resolved.flatMap((r) => r.resolutions.map((x) => [x.path, x.content] as [string, string])));
+		const build = async (extra: [string, string][] = []) => prepare({
 			branch: this.branch,
 			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
 			attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
 			message: this.landingMessage(intent, a, recon),
 			author: { name: a.agent, email: `${a.agent.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@agents.braid.dev` },
-			resolutions: new Map((recon?.resolutions ?? []).map((r) => [r.path, r.content])),
+			resolutions: new Map([...resolutions, ...extra]),
 			expect: { trunk: trunkHead, attempt: a.headSha },
 		});
+		let result = await build();
+		// Only lockfiles left in conflict: nobody should merge those by hand. Build the merge with trunk's
+		// lockfile, and have a sandbox bring it up to date with the merged package.json.
+		if (!result.ok && result.reason === "conflict" && verifies && result.conflicts.every((c) => LOCKFILE.test(c.path) && c.trunk !== null)) {
+			const locks = result.conflicts.map((c) => c.path);
+			const interim = await build(result.conflicts.map((c) => [c.path, c.trunk!]));
+			if (interim.ok) {
+				await interim.stage(await this.host.token(a.repo, "write", 600));
+				this.sql.exec("UPDATE queue SET state = 'locking', candidate_sha = ?, trunk_sha = ? WHERE attempt_id = ?", interim.sha, interim.parentSha, a.id);
+				await this.startRun(`lock:${a.id}`, { repo: a.repo, remote: a.remote, sha: interim.sha, branch: CANDIDATE }, locks);
+				this.note("land", by, `Both attempt ${a.id} and trunk changed ${locks.join(", ")}; regenerating it from the merged package.json`, a.intentId, a.id);
+				return { kind: "hold", why: "regenerating the lockfile from the merged package.json" };
+			}
+			result = interim;
+		}
 		if (!result.ok && result.reason === "moved") {
 			// Something was pushed since this object last looked. Look again; the next pass decides with what is there now.
 			await this.recompute();
@@ -1167,7 +1229,8 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		if (!result.ok && result.reason === "nothing-to-land") return { kind: "refused", why: `attempt ${a.id} has nothing that trunk does not already have` };
 		if (!result.ok) {
-			const conflicts: Conflict[] = result.conflicts.map((c) => ({ ...c, trunkWhy: this.trunkWhy(a.baseSha, c.path) }));
+			// A lockfile in conflict next to other files is left for Braid: once the rest is resolved, it is regenerated.
+			const conflicts: Conflict[] = result.conflicts.map((c) => ({ ...c, ...(LOCKFILE.test(c.path) && verifies ? { kind: "lockfile" as const, base: null, trunk: null, attempt: null, regions: [] } : {}), trunkWhy: this.trunkWhy(a.baseSha, c.path) }));
 			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
 			this.sql.exec("INSERT INTO reconciliations (attempt_id, intent_id, status, trunk_sha, attempt_sha, conflicts, resolutions, rationale, resolved_by, at) VALUES (?, ?, 'open', ?, ?, ?, '[]', '', '', ?)",
 				a.id, a.intentId, result.trunkSha, result.attemptSha, json(conflicts), now());
@@ -1294,27 +1357,40 @@ export class Project extends DurableObject<BraidEnv> {
 		});
 	}
 
-	private async submitResolution(reconId: number, resolutions: { path: string; content: string }[], rationale: string, by: string, oneSided = false) {
+	private async submitResolution(reconId: number, resolutions: { path: string; content?: string; regions?: string[] }[], rationale: string, by: string, oneSided = false) {
 		const row = this.rows("SELECT * FROM reconciliations WHERE id = ?", reconId)[0];
 		if (!row) throw new BraidError(`reconciliation ${reconId} not found`, 404);
 		const r = this.toRecon(row);
 		if (r.status === "resolved") throw new BraidError(`reconciliation R${reconId} is already resolved`);
-		const given = new Map(resolutions.map((x) => [String(x.path), String(x.content)]));
+		// A file is answered either whole, or as one replacement per conflict, which is put in place here.
+		const given = new Map<string, string>();
+		for (const x of Array.isArray(resolutions) ? resolutions : []) {
+			const c = r.conflicts.find((c) => c.path === String(x.path));
+			if (typeof x.content === "string") given.set(String(x.path), x.content);
+			else if (Array.isArray(x.regions) && c?.kind === "content") {
+				if (x.regions.length !== c.regions.length) throw new BraidError(`${c.path} has ${c.regions.length} conflict${c.regions.length === 1 ? "" : "s"} and ${x.regions.length} replacement${x.regions.length === 1 ? " was" : "s were"} given: send one for each, in order`);
+				given.set(c.path, assemble(c.base ?? "", c.trunk ?? "", c.attempt ?? "", x.regions.map(String)));
+			}
+		}
 		const blocked = r.conflicts.filter((c) => c.kind === "delete").map((c) => c.path);
 		if (blocked.length) throw new BraidError(`${blocked.join(", ")} was deleted on one side and edited on the other; merge trunk into the attempt instead (see the sync tool)`);
-		const missing = r.conflicts.filter((c) => !given.has(c.path)).map((c) => c.path);
+		const missing = r.conflicts.filter((c) => c.kind !== "lockfile" && !given.has(c.path)).map((c) => c.path);
 		if (missing.length) throw new BraidError(`missing resolutions for: ${missing.join(", ")}`);
 		if (!rationale.trim()) throw new BraidError("a resolution needs a rationale: say how both intents are preserved");
-		const marked = [...given].filter(([, content]) => /^(<<<<<<<|>>>>>>>) /m.test(content)).map(([path]) => path);
+		const marked = [...given].filter(([, content]) => /^(<<<<<<< |>>>>>>> |\|\|\|\|\|\|\| base$)/m.test(content)).map(([path]) => path);
 		if (marked.length) throw new BraidError(`conflict markers left in: ${marked.join(", ")}`);
 		// A file handed back exactly as one side had it drops the other intent's change, whatever the rationale says.
 		// It has happened: an agent's edit failed, it submitted its file untouched, and trunk's change was lost.
 		const same = (a: string | null, b: string) => a !== null && a.trimEnd() === b.trimEnd();
-		const dropped = r.conflicts.flatMap((c) => same(c.attempt, given.get(c.path)!) ? [`${c.path} is identical to the attempt's version, so trunk's change is lost`]
-			: same(c.trunk, given.get(c.path)!) ? [`${c.path} is identical to trunk's version, so the attempt's change is lost`] : []);
+		// The same goes for a file that takes one side at every conflict, even though the rest of it is merged.
+		const allOf = (c: Conflict, side: "ours" | "theirs") => assemble(c.base ?? "", c.trunk ?? "", c.attempt ?? "", c.regions.map((g) => g[side]));
+		const dropped = r.conflicts.filter((c) => c.kind === "content").flatMap((c) => same(c.attempt, given.get(c.path)!) ? [`${c.path} is identical to the attempt's version, so trunk's change is lost`]
+			: same(c.trunk, given.get(c.path)!) ? [`${c.path} is identical to trunk's version, so the attempt's change is lost`]
+			: c.regions.length && same(allOf(c, "theirs"), given.get(c.path)!) ? [`${c.path} takes the attempt's side at every conflict, so trunk's change there is lost`]
+			: c.regions.length && same(allOf(c, "ours"), given.get(c.path)!) ? [`${c.path} takes trunk's side at every conflict, so the attempt's change there is lost`] : []);
 		if (dropped.length && !oneSided) throw new BraidError(`this resolution keeps only one side: ${dropped.join("; ")}. Write a version that carries both changes. If dropping one side really is the right answer, submit again with one_sided set to true and say why in the rationale.`);
 		this.sql.exec("UPDATE reconciliations SET status = 'resolved', resolutions = ?, rationale = ?, resolved_by = ? WHERE id = ?",
-			json(r.conflicts.map((c) => ({ path: c.path, content: given.get(c.path)! }))), rationale.trim(), by, reconId);
+			json(r.conflicts.filter((c) => given.has(c.path)).map((c) => ({ path: c.path, content: given.get(c.path)! }))), rationale.trim(), by, reconId);
 		this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, ?)",
 			r.attemptId, r.intentId, by, `Reconciled with trunk (R${reconId})`, rationale.trim(), json(r.conflicts.map((c) => c.path)), r.trunkSha, now());
 		this.note("reconcile", by, `${by} resolved R${reconId}: ${rationale.trim()}`, r.intentId, r.attemptId);
@@ -1324,8 +1400,16 @@ export class Project extends DurableObject<BraidEnv> {
 		return { resolved: true, ...landed };
 	}
 
-	resolve(reconId: number, resolutions: { path: string; content: string }[], rationale: string, by = "human", oneSided = false) {
+	resolve(reconId: number, resolutions: { path: string; content?: string; regions?: string[] }[], rationale: string, by = "human", oneSided = false) {
 		return this.submitResolution(reconId, resolutions, rationale, by, oneSided);
+	}
+
+	/** A conflicted file as one text with the conflicts marked in place, for editing it whole. */
+	async marked(reconId: number, path: string) {
+		const row = this.rows("SELECT * FROM reconciliations WHERE id = ?", reconId)[0];
+		const c = row && this.toRecon(row).conflicts.find((c) => c.path === path && c.kind === "content");
+		if (!c) throw new BraidError("no such conflict", 404);
+		return { path, text: merge3(c.base ?? "", c.trunk ?? "", c.attempt ?? "").text };
 	}
 
 	/** Ask the configured model to reconcile, giving it both intents and both decision trails. */
@@ -1442,6 +1526,9 @@ function describeCall(tool: string, args: Record<string, any>): string {
 }
 
 const RECONCILE_HELP =
-	"Each conflict has the file as it is on trunk, as it is in your attempt, their common base, and `trunkWhy`: the intents that changed this file on trunk and the decisions behind them. " +
-	"Write a version of each file that satisfies BOTH intents, then call `resolve` with { resolutions: [{ path, content }], rationale }. " +
+	"Each conflicting file lists its `regions`: the places where trunk and your attempt changed the same lines. A region has trunk's text, your attempt's text, their common base, and a few unchanged lines `before` and `after` it. " +
+	"`trunkWhy` is the intents that changed this file on trunk and the decisions behind them. Everything outside the regions has already been merged from both sides. " +
+	"For each region, write the text that should stand there so that BOTH intents are satisfied, then call `resolve` with { resolutions: [{ path, regions: [text for region 1, text for region 2, ...] }], rationale }. " +
+	"A conflict of kind `lockfile` needs nothing from you: Braid regenerates that file once the others are resolved. " +
+	"If the fix needs changes outside the regions too, send the whole merged file as `content` instead of `regions` (call `reconciliation` with full: true for the complete base, trunk and attempt versions). " +
 	"The rationale is recorded in the landing commit, so say concretely how each side's intent survives.";

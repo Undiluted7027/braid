@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { merge3, predict, diffTrees, mergeBase } from "../src/worker/gitops.ts";
+import { merge3, predict, diffTrees, mergeBase, assemble, markedView, mergeJson } from "../src/worker/gitops.ts";
 
 test("merge3: non-overlapping edits merge cleanly", () => {
 	const r = merge3("a\nb\nc\nd\ne\n", "A\nb\nc\nd\ne\n", "a\nb\nc\nd\nE\n");
@@ -10,7 +10,8 @@ test("merge3: non-overlapping edits merge cleanly", () => {
 test("merge3: same-line edits conflict with structured regions", () => {
 	const r = merge3("a\nb\nc\n", "a\nB1\nc\n", "a\nB2\nc\n");
 	assert.equal(r.clean, false);
-	assert.deepEqual(r.regions, [{ base: "b\n", ours: "B1\n", theirs: "B2\n", oursLine: 2 }]);
+	assert.deepEqual(r.regions, [{ base: "b\n", ours: "B1\n", theirs: "B2\n", oursLine: 2, before: "a\n", after: "c\n" }]);
+	assert.equal(r.text, "a\n<<<<<<< trunk\nB1\n||||||| base\nb\n=======\nB2\n>>>>>>> attempt\nc\n");
 });
 test("merge3: identical edits are not a conflict", () => {
 	assert.equal(merge3("a\nb\n", "a\nX\n", "a\nX\n").clean, true);
@@ -42,4 +43,37 @@ test("mergeBase: finds the newest trunk commit an attempt has merged in", async 
 	const trunk = ["c2", "c1", "c0"];
 	assert.equal(await mergeBase(host, "r", "f1", trunk), "c0");
 	assert.equal(await mergeBase(host, "r", "f3", trunk), "c1");
+});
+
+test("assemble: replaces each conflict and keeps both sides' other changes", () => {
+	const base = "a\nb\nc\nd\ne\nf\ng\n", ours = "A\nb\nC1\nd\ne\nf\nG1\n", theirs = "a\nb\nC2\nd\nE\nf\nG2\n";
+	assert.equal(merge3(base, ours, theirs).regions.length, 2);
+	assert.equal(assemble(base, ours, theirs, ["C1 and C2\n", "G both"]), "A\nb\nC1 and C2\nd\nE\nf\nG both\n");
+	assert.equal(assemble(base, ours, theirs, ["", ""]), "A\nb\nd\nE\nf\n");
+});
+test("assemble: a conflict at the end of a file without a final newline stays without one", () => {
+	assert.equal(assemble("a\nb", "a\nB1", "a\nB2", ["B3"]), "a\nB3");
+});
+test("markedView: numbers the conflicts and leaves out the middle of long agreed stretches", () => {
+	const filler = Array.from({ length: 200 }, (_, i) => `line ${i}\n`).join("");
+	const base = `x\n${filler}y\n`, ours = `X1\n${filler}Y1\n`, theirs = `X2\n${filler}Y2\n`;
+	const view = markedView(base, ours, theirs, 5);
+	assert.match(view, /^<<<<<<< trunk \(conflict 1\)\nX1\n\|\|\|\|\|\|\| base\nx\n=======\nX2\n>>>>>>> attempt\nline 0\n/);
+	assert.match(view, /… \(190 lines the same on both sides\) …\nline 195\n/);
+	assert.match(view, /<<<<<<< trunk \(conflict 2\)\nY1\n/);
+	assert.ok(view.length < 600);
+});
+
+test("mergeJson: two sides each adding a dependency merge by key, sorted, in the file's own indentation", () => {
+	const pkg = (deps, extra = {}) => JSON.stringify({ name: "t", scripts: { test: "node --test" }, dependencies: deps, ...extra }, null, 2) + "\n";
+	const merged = mergeJson(pkg({ ms: "1" }), pkg({ ms: "1", zod: "4" }), pkg({ ms: "1", diff: "9" }, { license: "MIT" }));
+	assert.equal(merged, pkg({ diff: "9", ms: "1", zod: "4" }, { license: "MIT" }));
+	assert.equal(merge3(pkg({ ms: "1" }), pkg({ ms: "1", zod: "4" }), pkg({ ms: "1", diff: "9" })).clean, false);
+});
+test("mergeJson: the same key changed two ways, or removed against changed, is left as a conflict", () => {
+	const pkg = (deps) => JSON.stringify({ dependencies: deps });
+	assert.equal(mergeJson(pkg({ ms: "1" }), pkg({ ms: "2" }), pkg({ ms: "3" })), null);
+	assert.equal(mergeJson(pkg({ ms: "1" }), pkg({}), pkg({ ms: "3" })), null);
+	assert.deepEqual(JSON.parse(mergeJson(pkg({ ms: "1", a: "1" }), pkg({ a: "1" }), pkg({ ms: "1", a: "2" }))), { dependencies: { a: "2" } });
+	assert.equal(mergeJson("{", "{}", "{}"), null);
 });

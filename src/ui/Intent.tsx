@@ -75,11 +75,19 @@ function Respond({ a, state }: { a: Attempt; state: State }) {
 	);
 }
 
-function ConflictView({ c, value, onChange, attemptWhy, attempt }: { c: Conflict; value: string; onChange: (v: string) => void; attemptWhy: Decision[]; attempt: Attempt }) {
+/** How one conflicted file is being answered: a replacement for each conflict, or the whole file edited by hand. */
+type Answer = { whole: string | null; pieces: (string | undefined)[] };
+const complete = (c: Conflict, a: Answer | undefined) => c.kind !== "content" || (!!a && (a.whole !== null || a.pieces.length === c.regions.length && a.pieces.every((p) => p !== undefined)));
+
+function ConflictView({ c, answer, onChange, attemptWhy, attempt, markedUrl }: { c: Conflict; answer: Answer; onChange: (a: Answer) => void; attemptWhy: Decision[]; attempt: Attempt; markedUrl: string }) {
+	const act = useAction();
+	const set = (i: number, text: string) => onChange({ ...answer, pieces: c.regions.map((_, j) => (j === i ? text : answer.pieces[j])) });
+	const rows = (text: string) => Math.min(Math.max(text.split("\n").length, 3), 24);
 	return (
 		<div className="conflict-block">
-			<h3 className="mono">{c.path}</h3>
-			{c.kind === "delete" ? <p className="error">One side deleted this file and the other edited it. Merge trunk into the attempt with git instead (the agent's <code>sync</code> tool).</p> : <>
+			<h3 className="mono">{c.path} <span className="dim small">{c.kind === "content" ? `${c.regions.length} conflict${c.regions.length === 1 ? "" : "s"}; the rest of the file is merged from both sides` : ""}</span></h3>
+			{c.kind === "lockfile" ? <p className="dim">Both sides changed dependencies. Nothing to do here: once the other files are resolved, Braid regenerates this file from the merged <code>package.json</code> in a sandbox.</p>
+			: c.kind === "delete" ? <p className="error">One side deleted this file and the other edited it. Merge trunk into the attempt with git instead (the agent's <code>sync</code> tool).</p> : <>
 				<div className="sides">
 					<div className="side">
 						<h4>On trunk</h4>
@@ -100,18 +108,35 @@ function ConflictView({ c, value, onChange, attemptWhy, attempt }: { c: Conflict
 						</div>
 					</div>
 				</div>
-				{c.regions.map((r, i) => (
-					<div className="sides region" key={i}>
-						<pre className="mono"><span className="dim">trunk, line {r.oursLine}</span>{"\n"}{r.ours || "(nothing)"}</pre>
-						<pre className="mono"><span className="dim">attempt</span>{"\n"}{r.theirs || "(nothing)"}</pre>
+				{answer.whole === null ? c.regions.map((r, i) => (
+					<div className="region-block" key={i}>
+						<p className="small dim">Conflict {i + 1} of {c.regions.length}, at line {r.oursLine} on trunk</p>
+						{r.before && <pre className="mono ctx" aria-label="Unchanged lines before">{r.before}</pre>}
+						<div className="sides region">
+							<pre className="mono"><span className="dim">trunk</span>{"\n"}{r.ours || "(nothing here)"}</pre>
+							<pre className="mono"><span className="dim">attempt</span>{"\n"}{r.theirs || "(nothing here)"}</pre>
+						</div>
+						<details className="small"><summary>What both started from</summary><pre className="mono ctx">{r.base || "(nothing here)"}</pre></details>
+						<label className="editor">
+							<span className="row"><strong>What should stand here</strong><span className="spacer" />
+								<button type="button" onClick={() => set(i, r.ours)}>Trunk's</button>
+								<button type="button" onClick={() => set(i, r.theirs)}>The attempt's</button>
+								<button type="button" onClick={() => set(i, r.ours + r.theirs)}>Both, trunk first</button>
+								<button type="button" onClick={() => set(i, r.theirs + r.ours)}>Both, attempt first</button>
+								<button type="button" onClick={() => set(i, "")}>Neither</button></span>
+							<textarea className="mono" value={answer.pieces[i] ?? ""} placeholder="Pick a starting point, then edit it so both changes survive" onChange={(e) => set(i, e.target.value)} rows={rows(answer.pieces[i] ?? r.ours + r.theirs)} spellCheck={false} />
+							{answer.pieces[i] === "" && <span className="small dim">These lines will be removed.</span>}
+						</label>
+						{r.after && <pre className="mono ctx" aria-label="Unchanged lines after">{r.after}</pre>}
 					</div>
-				))}
-				<label className="editor">
-					<span className="row"><strong>Reconciled file</strong><span className="spacer" />
-						<button type="button" onClick={() => onChange(c.trunk ?? "")}>Start from trunk</button>
-						<button type="button" onClick={() => onChange(c.attempt ?? "")}>Start from attempt</button></span>
-					<textarea className="mono" value={value} onChange={(e) => onChange(e.target.value)} rows={14} spellCheck={false} />
-				</label>
+				)) : (
+					<label className="editor">
+						<span className="row"><strong>The whole file, conflicts marked</strong><span className="spacer" /><button type="button" onClick={() => onChange({ ...answer, whole: null })}>Back to one conflict at a time</button></span>
+						<span className="small dim">Replace each block from <code>{"<<<<<<<"}</code> to <code>{">>>>>>>"}</code> with what should stand there. Change other lines too if the fix needs it.</span>
+						<textarea className="mono" value={answer.whole} onChange={(e) => onChange({ ...answer, whole: e.target.value })} rows={28} spellCheck={false} />
+					</label>
+				)}
+				{answer.whole === null && <p className="row small"><button type="button" disabled={act.busy} onClick={() => act.run(async () => onChange({ ...answer, whole: (await api<{ text: string }>("GET", markedUrl)).text }))}>Edit the whole file instead</button><span className="dim">for a fix that needs changes outside the conflicts</span>{act.error && <span className="error">{act.error}</span>}</p>}
 			</>}
 		</div>
 	);
@@ -120,7 +145,8 @@ function ConflictView({ c, value, onChange, attemptWhy, attempt }: { c: Conflict
 function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	const attempt = state.attempts.find((a) => a.id === r.attemptId)!;
 	const mine = state.decisions.filter((d) => d.attemptId === r.attemptId);
-	const [text, setText] = useState<Record<string, string>>(() => Object.fromEntries(r.conflicts.map((c) => [c.path, c.trunk ?? ""])));
+	const [answers, setAnswers] = useState<Record<string, Answer>>({});
+	const answerOf = (c: Conflict): Answer => answers[c.path] ?? { whole: null, pieces: [] };
 	const [rationale, setRationale] = useState("");
 	const act = useAction();
 	const base = `/p/${state.project.slug}/reconciliations/${r.id}`;
@@ -134,16 +160,17 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 				<h2>⚯ Reconciliation R{r.id} <span className={`chip ${r.status === "stale" ? "quiet" : "landed"}`}>{r.status === "stale" ? "not used" : `resolved by ${r.resolvedBy}`}</span></h2>
 				{r.status === "stale" && <p className="warn small">Trunk or the attempt moved before this resolution landed, so it was set aside. It was written by {r.resolvedBy}.</p>}
 				<p>{r.rationale}</p>
-				<p className="mono dim small">{r.conflicts.map((c) => c.path).join("  ")}</p>
+				{r.resolvedBy !== "braid" && <p className="small dim">What the resolution changed in trunk's version of each file:</p>}
+				{r.resolvedBy !== "braid" && r.resolutions.map((x) => <FileDiff key={x.path} file={{ path: x.path, status: "modified", base: r.conflicts.find((c) => c.path === x.path)?.trunk ?? "", head: x.content, binary: false }} />)}
 			</section>
 		);
 	}
 	return (
 		<section className="card recon">
 			<h2>⚯ Reconciliation R{r.id}: attempt {r.attemptId} against trunk {short(r.trunkSha)}</h2>
-			<p className="lede">Git could not merge these lines. Each side is shown with the intent it served and the decisions behind it. The resolution has to keep both.</p>
+			<p className="lede">Git could not merge these lines. Each side is shown with the intent it served and the decisions behind it. The resolution has to keep both. The merged result is run in a sandbox before it lands.</p>
 			{r.conflicts.map((c) => (
-				<ConflictView key={c.path} c={c} attempt={attempt} value={text[c.path] ?? ""} onChange={(v) => setText({ ...text, [c.path]: v })}
+				<ConflictView key={c.path} c={c} attempt={attempt} answer={answerOf(c)} onChange={(v) => setAnswers({ ...answers, [c.path]: v })} markedUrl={`${base}/marked?path=${encodeURIComponent(c.path)}`}
 					attemptWhy={mine.filter((d) => touches(d, c.path)).length ? mine.filter((d) => touches(d, c.path)) : mine} />
 			))}
 			<label>How both intents survive (recorded in the landing commit)
@@ -151,9 +178,10 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 			</label>
 			{act.error && <p className="error">{act.error}</p>}
 			<div className="row">
-				<button className="primary" disabled={act.busy || r.status === "resolving"}
+				<button className="primary" disabled={act.busy || r.status === "resolving" || !rationale.trim() || !r.conflicts.every((c) => complete(c, answers[c.path]))}
+					title="Every conflict needs an answer, and the rationale says how both intents survive"
 					onClick={() => act.run(async () => {
-						const body = { by: "human", rationale, resolutions: r.conflicts.map((c) => ({ path: c.path, content: text[c.path] })) };
+						const body = { by: "human", rationale, resolutions: r.conflicts.filter((c) => c.kind === "content").map((c) => { const a = answerOf(c); return a.whole !== null ? { path: c.path, content: a.whole } : { path: c.path, regions: a.pieces }; }) };
 						try { await api("POST", `${base}/resolve`, body); } catch (e) {
 							// Keeping one side whole drops the other intent's change; that needs a deliberate yes.
 							if (!/keeps only one side/.test((e as Error).message) || !window.confirm(`${(e as Error).message.split(". Write")[0]}.\n\nLand it anyway?`)) throw e;
@@ -235,7 +263,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				{(a.hosted === "starting" || a.hosted === "running") && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}>Stop agent</button>}
 				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => { if (window.confirm(`Abandon attempt ${a.id}?${a.hosted === "starting" || a.hosted === "running" ? ` ${a.agent} is running and will be stopped.` : ""} You can reopen it while the intent is open.`)) drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {})); }}>Abandon</button>}
 				{a.status === "abandoned" && canLand && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/restore`, {}))}>Reopen</button>}
-				{canLand && LIVE.has(a.status) && (
+				{canLand && a.status === "conflicted" && <span className="small dim">resolve the reconciliation above to land</span>}
+				{canLand && LIVE.has(a.status) && a.status !== "conflicted" && (
 					<button className="primary" disabled={land.busy || !!queued || a.headSha === a.baseSha} onClick={landIt}>
 						{land.busy ? "Landing…" : queued ? "Waiting to land" : "Land this"}
 					</button>
@@ -245,7 +274,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			{a.hosted === "failed" && <p className="warn small">The hosted agent failed: {a.hostedDetail}</p>}
 			{queued && (
 				<div className="row landing-wait" role="status">
-					<span className="chip quiet">{queued.state === "verifying" ? "verifying the merge" : queued.state === "pushing" ? "landing" : "waiting to land"}</span>
+					<span className="chip quiet">{queued.state === "verifying" ? "verifying the merge" : queued.state === "locking" ? "regenerating the lockfile" : queued.state === "pushing" ? "landing" : "waiting to land"}</span>
 					<span className="small">Landing asked for by {queued.by}{queued.note ? `: ${queued.note}. It lands by itself when that is done.` : "."}</span>
 					<span className="spacer" />
 					{queued.state !== "pushing" && <button disabled={land.busy} onClick={skipQueue}>Land now</button>}
@@ -258,7 +287,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			<p className="small dim mono">base {short(a.baseSha)} → head {short(a.headSha)} · updated {ago(a.updatedAt)}{a.behind > 0 && LIVE.has(a.status) ? ` · ${a.behind} landing${a.behind === 1 ? "" : "s"} behind trunk` : ""}</p>
 			{a.summary && <p>{a.summary}</p>}
 
-			{LIVE.has(a.status) && a.trunkConflicts.length > 0 && <p className="warn">Landing now would conflict with trunk on <span className="mono">{a.trunkConflicts.join(", ")}</span>. Braid will open a reconciliation.</p>}
+			{LIVE.has(a.status) && a.status !== "conflicted" && a.trunkConflicts.length > 0 && <p className="warn">Landing now would conflict with trunk on <span className="mono">{a.trunkConflicts.join(", ")}</span>. Braid will open a reconciliation.</p>}
 			{a.headSha !== a.baseSha && <>
 				<h3>Verified by Braid</h3>
 				<Verification slug={slug} refName={a.id} run={run} head={a.headSha} />

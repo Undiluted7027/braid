@@ -163,6 +163,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 async function reads(p: Project, rest: string[], q: URLSearchParams): Promise<Response | null> {
 	if (rest[0] === "attempts" && rest[2] === "session") return Response.json(await p.session(rest[1], Number(q.get("after") ?? 0)));
 	if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
+	if (rest[0] === "reconciliations" && rest[2] === "marked") return Response.json(await p.marked(Number(rest[1]), q.get("path") ?? ""));
 	if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
 	if (rest[0] === "file") return Response.json(await p.file(q.get("path") ?? ""));
 	return null;

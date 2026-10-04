@@ -4,10 +4,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import type { Conflict, Decision, Intent } from "../shared/types";
+import { markedView } from "./gitops";
 import { BraidError, type BraidEnv } from "./project";
 
+// One replacement per conflict, not whole files: the answer stays small however large the file is,
+// and the model cannot disturb lines that were never in conflict.
 const Resolution = z.object({
-	resolutions: z.array(z.object({ path: z.string(), content: z.string() })),
+	resolutions: z.array(z.object({ path: z.string(), regions: z.array(z.string()) })),
 	rationale: z.string(),
 });
 
@@ -22,9 +25,10 @@ export function llmName(env: BraidEnv): string | null {
 }
 
 const SYSTEM = `You reconcile two concurrent code changes made by different agents for different intents.
-A textual merge failed. You are given, for each conflicting file: the common base, the version on trunk, the version in the attempt, the intent each side was serving, and the decisions each agent recorded.
-Produce the full final content of every conflicting file such that BOTH intents are satisfied. Do not pick a side unless the decisions show one change makes the other unnecessary.
-Honor recorded decisions and constraints from both sides. Keep everything unrelated to the conflict exactly as it is. No conflict markers.
+A textual merge failed. For each conflicting file you are given the merged file with the conflicts marked in place, the intent each side was serving, and the decisions each agent recorded.
+A conflict looks like this: "<<<<<<< trunk (conflict N)", trunk's lines, "||||||| base", the lines both started from, "=======", the attempt's lines, ">>>>>>> attempt". Everything outside those blocks is already merged from both sides; long unchanged stretches are left out and marked as such.
+For every conflict, in order, give the lines that should replace the whole block so that BOTH intents are satisfied. Give only replacement lines: no markers, and none of the surrounding lines. An empty string removes the block.
+Do not pick a side unless the decisions show one change makes the other unnecessary. Honor recorded decisions and constraints from both sides.
 The rationale must say concretely how each intent survives in the merged result; it is recorded permanently in the landing commit.`;
 
 const trail = (decisions: Decision[]) =>
@@ -37,10 +41,11 @@ function prompt(input: { intent: Intent; agent: string; decisions: Decision[]; c
 		input.intent.acceptance ? `Acceptance: ${input.intent.acceptance}` : "",
 		`Decisions:\n${trail(input.decisions)}`,
 	];
-	for (const c of input.conflicts) {
+	for (const c of input.conflicts.filter((c) => c.kind === "content")) {
 		parts.push(`\n## Conflicting file: ${c.path}`);
 		for (const w of c.trunkWhy) parts.push(`Trunk side: I${w.intentId} "${w.title}" by ${w.agent}\nGoal: ${w.goal}\nDecisions:\n${trail(w.decisions)}`);
-		parts.push(`<base>\n${c.base ?? ""}</base>`, `<trunk>\n${c.trunk ?? ""}</trunk>`, `<attempt>\n${c.attempt ?? ""}</attempt>`);
+		parts.push(`${c.regions.length} conflict${c.regions.length === 1 ? "" : "s"} in this file: answer with exactly ${c.regions.length} replacement${c.regions.length === 1 ? "" : "s"}.`,
+			`<merged path="${c.path}">\n${markedView(c.base ?? "", c.trunk ?? "", c.attempt ?? "")}</merged>`);
 	}
 	return parts.filter(Boolean).join("\n\n");
 }
@@ -74,7 +79,7 @@ export async function resolveConflicts(env: BraidEnv, input: { intent: Intent; a
 	const out: any = await env.AI.run(WORKERS_AI_MODEL as any, {
 		max_tokens: 8000,
 		messages: [
-			{ role: "system", content: `${SYSTEM}\nAnswer with only a JSON object: {"resolutions":[{"path":string,"content":string}],"rationale":string}` },
+			{ role: "system", content: `${SYSTEM}\nAnswer with only a JSON object: {"resolutions":[{"path":string,"regions":[string, ...]}],"rationale":string}` },
 			{ role: "user", content: user },
 		],
 	} as any);

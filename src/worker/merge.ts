@@ -1,6 +1,6 @@
 // Three-way merge of git trees, by full path. Kept free of Worker-only imports so the tests can run it under Node.
 import git from "isomorphic-git";
-import { merge3, type ConflictRegion } from "./gitops.ts";
+import { merge3, mergeJson, type ConflictRegion } from "./gitops.ts";
 
 export interface MergeConflict { path: string; kind: "content" | "delete"; base: string | null; trunk: string | null; attempt: string | null; regions: ConflictRegion[] }
 type Entry = { mode: string; path: string; oid: string; type: "blob" | "tree" | "commit" };
@@ -41,6 +41,7 @@ export async function mergeTrees(repo: Repo, base: string | null, trunk: string,
 				else {
 					const r = merge3(base, ours, theirs);
 					if (r.clean) merged = r.text;
+					else if (name === "package.json" && (merged = mergeJson(base, ours, theirs)) !== null) {}
 					else conflicts.push({ path, kind: "content", base, trunk: ours, attempt: theirs, regions: r.regions });
 				}
 				// The side that changed the mode (made it executable, say) keeps it.

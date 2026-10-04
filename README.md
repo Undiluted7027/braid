@@ -14,7 +14,7 @@ Git merges text. It has no idea what either side was trying to do, so when two a
 | Finding out at merge time | **Overlaps** | On every push, Braid diffs every live attempt against every other and predicts, per file, whether they will merge. Both agents are told on their next tool call, with the other side's reasoning. |
 | CI on a pull request | **Verification** | Every commit of every attempt is run in a fresh sandbox: install, typecheck, tests, build. Results sit next to the diff, go back to the agent, and gate landing. Trunk is verified after each landing. |
 | Review comments | **Response** | A person sends an attempt back with a note, or answers a question the agent recorded. The agent hears it on its next step (Braid starts a hosted agent again to act on it), and the note is kept with the attempt's decisions, so it is in the landing commit too. |
-| Merge conflict | **Reconciliation** | Both versions, their base, and the intent and decisions behind each side. Resolved by the agent, a model, or a person, with a rationale that is written into the landing commit. |
+| Merge conflict | **Reconciliation** | Each place the two sides disagree, with their base and the intent and decisions behind each side. Resolved one conflict at a time by the agent, a model, or a person, with a rationale that is written into the landing commit. Two added dependencies are not a conflict: `package.json` is merged by key and the lockfile is regenerated in a sandbox. |
 | Merge | **Landing** | One commit on trunk per intent (parents: trunk, attempt head). The commit message carries the goal and the why log. Trunk only takes what has been run: the attempt's commit must have passed, and if trunk has moved since, the merge of the two is verified first. |
 | `git blame` | **Why view** | Every line on trunk, colored by the intent that landed it. Click a line to read the decisions behind it. |
 
@@ -104,7 +104,7 @@ With AI Gateway or `ANTHROPIC_API_KEY` set, the "Reconcile with a model" button 
 - **Agent host, one per hosted attempt** (`src/worker/agent.ts`): "Run Claude Code" or "Run Codex" on an intent starts a sandbox, clones a fresh attempt into it, gives the agent its brief and Braid's tools, and starts it headless. The host reads what the agent prints every few seconds and adds it to the attempt's session, then removes the sandbox when the agent exits.
   - The sandbox has no Internet access and holds no credentials: no model key, no git token, not even its own Braid token. One Worker entrypoint sees every request it makes and allows only this project's Braid tools, fetch and push of its own attempt, fetch of trunk, its own provider's inference calls, and reads from the npm registry, adding the token for each outside the sandbox. Abandoning or superseding the attempt stops the agent.
   - Model access is through AI Gateway (`AI_GATEWAY_ID` and the `AI_GATEWAY_TOKEN` secret, with Unified Billing or stored provider keys), or through `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` secrets. `HOSTED_CLAUDE_MODEL` and `HOSTED_CODEX_MODEL` override the models.
-- **Model** (`src/worker/resolver.ts`): optional. Claude via the Anthropic SDK if a key is set, otherwise Workers AI.
+- **Model** (`src/worker/resolver.ts`): optional. Claude via AI Gateway or the Anthropic SDK if a key is set, otherwise Workers AI. It is shown the merged file with the conflicts marked in place (long unchanged stretches left out) and answers with one replacement per conflict, so the size of the file does not matter and it cannot touch lines that were never in conflict.
 
 ## Agent tools (MCP)
 
@@ -117,7 +117,8 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 - A built preview is static files. An app that needs its own backend loads but its API calls fail. Braid's own UI is the exception: it reads from the instance it is previewed on. Assets a build loads by root path from inside JavaScript or CSS (lazy chunks, `url(/...)`) are not redirected.
 - Verification supports Node projects (npm or pnpm). Each step has ten minutes.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
-- A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`).
+- A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`). A rename shows up as exactly that.
+- Lockfiles are regenerated for npm and pnpm only.
 - A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks; nothing does that automatically.
 - Reverting a landing adds one commit that undoes it and reopens the intent. It is refused if a later landing changed the same lines, and the revert itself is verified on trunk afterwards, not before.
 - Braid refuses a resolution that is identical to one side unless told that is intended.
