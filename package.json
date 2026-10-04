@@ -1,0 +1,37 @@
+{
+  "name": "braid",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Braid: intents, not branches. A git platform for concurrent agents on Cloudflare Workers + Artifacts.",
+  "bin": {
+    "braid": "cli/braid.mjs"
+  },
+  "scripts": {
+    "dev": "vite build && wrangler dev --port 8787",
+    "build": "vite build",
+    "deploy": "vite build && wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "sim": "node scripts/sim.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "diff": "^9.0.0",
+    "isomorphic-git": "^1.42.6",
+    "node-diff3": "^3.2.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2",
+    "wrangler": "^4.147.0"
+  }
+}

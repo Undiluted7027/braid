@@ -1,0 +1,102 @@
+// Shapes shared by the Worker and the UI.
+export type IntentStatus = "open" | "landed" | "abandoned";
+export type AttemptStatus = "working" | "ready" | "conflicted" | "landed" | "superseded" | "abandoned";
+export type DecisionKind = "decision" | "assumption" | "rejected" | "question" | "note";
+
+export interface Intent {
+	id: number;
+	title: string;
+	goal: string;
+	acceptance: string;
+	status: IntentStatus;
+	createdBy: string;
+	createdAt: number;
+	landedSha: string | null;
+	landedAttempt: string | null;
+}
+export interface FileChange { path: string; status: "added" | "modified" | "deleted"; base: string | null; head: string | null }
+export interface Check { name: string; status: "pass" | "fail"; detail: string; at: number }
+export interface Attempt {
+	id: string;
+	intentId: number;
+	agent: string;
+	kind: string;
+	repo: string;
+	remote: string;
+	baseSha: string;
+	headSha: string;
+	status: AttemptStatus;
+	summary: string;
+	files: FileChange[];
+	claims: string[];
+	/** Landings on trunk since this attempt's base. */
+	behind: number;
+	/** Paths that would conflict with trunk if this landed now. */
+	trunkConflicts: string[];
+	checks: Check[];
+	createdAt: number;
+	updatedAt: number;
+}
+export interface Decision {
+	id: number;
+	attemptId: string;
+	intentId: number;
+	agent: string;
+	kind: DecisionKind;
+	title: string;
+	body: string;
+	files: string[];
+	sha: string;
+	at: number;
+}
+export interface Overlap { a: string; b: string; path: string; severity: "claim" | "touch" | "conflict"; regions: number }
+export interface ConflictContext { intentId: number; title: string; goal: string; agent: string; decisions: Decision[] }
+export interface Conflict {
+	path: string;
+	kind: "content" | "delete";
+	base: string | null;
+	trunk: string | null;
+	attempt: string | null;
+	regions: { base: string; ours: string; theirs: string; oursLine: number }[];
+	/** Why trunk looks the way it does here: the intents that landed changes to this path. */
+	trunkWhy: ConflictContext[];
+}
+export interface Reconciliation {
+	id: number;
+	attemptId: string;
+	intentId: number;
+	status: "open" | "resolving" | "resolved";
+	trunkSha: string;
+	conflicts: Conflict[];
+	resolutions: { path: string; content: string }[];
+	rationale: string;
+	resolvedBy: string;
+	at: number;
+}
+export interface Landing {
+	sha: string;
+	parentSha: string;
+	intentId: number;
+	attemptId: string;
+	agent: string;
+	title: string;
+	files: string[];
+	reconciled: boolean;
+	at: number;
+}
+export interface Activity { id: number; at: number; kind: string; actor: string; text: string; intentId: number | null; attemptId: string | null }
+export interface ProjectInfo { slug: string; name: string; description: string; repo: string; remote: string; head: string; llm: string | null }
+export interface State {
+	project: ProjectInfo;
+	intents: Intent[];
+	attempts: Attempt[];
+	decisions: Decision[];
+	overlaps: Overlap[];
+	reconciliations: Reconciliation[];
+	landings: Landing[];
+	activity: Activity[];
+}
+export interface JoinResult { attemptId: string; intentId: number; remote: string; gitToken: string; agentToken: string; mcpUrl: string; brief: string }
+export interface DiffFile { path: string; status: FileChange["status"]; base: string | null; head: string | null; binary: boolean }
+export interface BlameLine { text: string; sha: string | null }
+export interface FileView { path: string; content: string | null; binary: boolean; blame: BlameLine[]; trail: Landing[] }

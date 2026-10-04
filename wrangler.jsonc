@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "braid",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist/client",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/mcp/*", "/preview/*"]
+  },
+  // Every project trunk and every agent attempt is a repo in this Artifacts namespace.
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "braid" }],
+  "ai": { "binding": "AI" },
+  "durable_objects": { "bindings": [{ "name": "PROJECT", "class_name": "Project" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Project"] }],
+  "workflows": [{ "name": "braid-push", "binding": "PUSH_WORKFLOW", "class_name": "PushWorkflow" }],
+  // Any push to any repo in the namespace starts PushWorkflow, which tells the owning
+  // project to re-read that attempt and recompute overlaps with everyone else.
+  "triggers": {
+    "events": [
+      {
+        "type": "cf.artifacts.repo.pushed",
+        "filter": { "namespace": "braid" },
+        "targets": [{ "type": "workflow", "workflow_name": "braid-push" }]
+      }
+    ]
+  },
+  "observability": { "enabled": true }
+}
