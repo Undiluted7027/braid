@@ -9,12 +9,15 @@ import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
 import type { RunJob, Runner } from "./runner";
+import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
 	Intent, JoinResult, Landing, Overlap, Reconciliation, Run, SessionEvent, State,
 } from "../shared/types";
 
-export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string };
+export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
+	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string;
+};
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
@@ -79,6 +82,8 @@ export class Project extends DurableObject<BraidEnv> {
 		`);
 		// Added after the first projects existed.
 		try { this.sql.exec("ALTER TABLE runs ADD COLUMN preview_api INTEGER DEFAULT 0"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted_detail TEXT"); } catch {}
 	}
 
 	// ── storage helpers ──────────────────────────────────────────────────────
@@ -106,6 +111,7 @@ export class Project extends DurableObject<BraidEnv> {
 		id: r.id, intentId: r.intent_id, agent: r.agent, kind: r.kind, repo: r.repo, remote: r.remote, baseSha: r.base_sha, headSha: r.head_sha,
 		status: r.status, summary: r.summary, files: JSON.parse(r.files), claims: JSON.parse(r.claims), behind: r.behind,
 		trunkConflicts: JSON.parse(r.trunk_conflicts), checks: JSON.parse(r.checks), createdAt: r.created_at, updatedAt: r.updated_at,
+		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "",
 	});
 	private toDecision = (r: any): Decision => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, agent: r.agent, kind: r.kind, title: r.title, body: r.body,
@@ -262,6 +268,9 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const repo of keepRepos ? [] : [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
 			try { await this.host.remove(repo); } catch {}
 		}
+		for (const { id } of this.rows<{ id: string }>("SELECT id FROM attempts WHERE hosted IS NOT NULL")) {
+			try { await this.agentHost(id)?.clear(); } catch {}
+		}
 		for (const { ref } of this.rows<{ ref: string }>("SELECT DISTINCT ref FROM runs")) {
 			try { await this.runner(ref)?.clear(); } catch {}
 		}
@@ -274,7 +283,7 @@ export class Project extends DurableObject<BraidEnv> {
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
-				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env),
+				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env),
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
 			intents: this.intents(),
@@ -498,6 +507,52 @@ export class Project extends DurableObject<BraidEnv> {
 				}
 			} else await this.recompute();
 		});
+	}
+
+	// ── hosted agents: Braid runs the agent itself, in a sandbox ─────────────
+
+	private agentHost(attemptId: string) {
+		const ns = this.env.AGENT;
+		return ns ? (ns.get(ns.idFromName(`${this.meta("slug")}/${attemptId}`)) as unknown as AgentHost) : null;
+	}
+
+	/** Start an attempt on an intent and run the agent for it here, instead of on someone's machine. */
+	async hostAgent(intentId: number, kind: HostedKind) {
+		this.requireProject();
+		const can = hosting(this.env);
+		if (!can.available) throw new BraidError("this Braid instance cannot run agents itself");
+		if (kind !== "selftest" && !can[kind]) throw new BraidError(`no model credentials for ${kind}: set up AI Gateway (AI_GATEWAY_ID and the AI_GATEWAY_TOKEN secret) or the provider's API key`);
+		const agent = kind === "claude" ? "claude-code" : kind;
+		const joined = await this.join({ intentId, agent, kind: kind === "selftest" ? "agent" : kind, origin: "" });
+		const row = this.rows<{ repo: string }>("SELECT repo FROM attempts WHERE id = ?", joined.attemptId)[0];
+		this.sql.exec("UPDATE attempts SET hosted = 'starting' WHERE id = ?", joined.attemptId);
+		const job: HostJob = {
+			slug: this.meta("slug"), attemptId: joined.attemptId, kind, agent, repo: row.repo, remote: joined.remote, trunkRepo: this.trunk,
+			trunkRemote: joined.trunkRemote, branch: this.branch, agentToken: joined.agentToken, brief: joined.brief,
+		};
+		await this.agentHost(joined.attemptId)!.start(job);
+		this.note("attempt", "braid", `Started ${agent} for attempt ${joined.attemptId} in a Cloudflare sandbox`, intentId, joined.attemptId);
+		return { attemptId: joined.attemptId };
+	}
+
+	async stopHosted(attemptId: string) {
+		this.attempt(attemptId);
+		await this.agentHost(attemptId)?.stop();
+		return { ok: true };
+	}
+
+	/** Session events from a hosted agent, read from its output by the host. */
+	async hostedEvents(attemptId: string, events: { kind: string; tool?: string | null; text: string }[], state?: "running") {
+		if (state) this.sql.exec("UPDATE attempts SET hosted = ? WHERE id = ? AND hosted = 'starting'", state, attemptId);
+		this.addEvents(attemptId, events);
+		if (state) this.broadcast();
+	}
+
+	async hostedDone(attemptId: string, state: "finished" | "failed" | "stopped", detail: string) {
+		const a = this.attempt(attemptId);
+		this.sql.exec("UPDATE attempts SET hosted = ?, hosted_detail = ? WHERE id = ?", state, detail, attemptId);
+		this.addEvents(attemptId, [{ kind: "system", text: state === "finished" ? "the agent finished and its sandbox was removed" : `the agent ${state}: ${detail}` }]);
+		this.note("attempt", "braid", state === "finished" ? `${a.agent} finished attempt ${a.id}; its sandbox was removed` : `${a.agent} on attempt ${a.id} ${state}: ${detail}`, a.intentId, a.id);
 	}
 
 	// ── verification: each commit of an attempt is run in a sandbox ──────────

@@ -71,7 +71,8 @@ This reduces what can leak; it does not sandbox the agent. A headless agent can 
 
 ```sh
 npx wrangler secret put BRAID_ADMIN_TOKEN     # required: the UI asks for it once, the CLI takes --token
-npx wrangler secret put ANTHROPIC_API_KEY     # optional: model-backed reconciliation with Claude
+npx wrangler secret put ANTHROPIC_API_KEY     # optional: model-backed reconciliation with Claude, and hosted Claude Code
+npx wrangler secret put AI_GATEWAY_TOKEN      # optional: hosted agents through AI Gateway (also set AI_GATEWAY_ID in wrangler.jsonc)
 pnpm run deploy
 ```
 
@@ -92,6 +93,9 @@ Without `ANTHROPIC_API_KEY`, the "Reconcile with a model" button uses Workers AI
   - What runs: `braid.json` at the repository root if present (`{ "install": "...", "checks": { "name": "command" }, "preview": { "dir": "dist", "api": "braid" } }`), otherwise the `typecheck`, `lint`, `test` and `build` scripts in `package.json`. A repository with neither is served as it is.
   - A built page is served under `/preview/<project>/<attempt>/` but was built to live at a site root, so Braid puts a small script in front of it that sends its `/...` requests under the preview path and shows its router the path it expects.
   - `"api": "braid"` is for a project whose backend is Braid itself (this repository): the preview's `/api/` calls are answered by the instance it runs on, reads only and only for that project, so an attempt's UI can be reviewed against real data. Such a preview may only talk to its own instance.
+- **Agent host, one per hosted attempt** (`src/worker/agent.ts`): "Run Claude Code" or "Run Codex" on an intent starts a sandbox, clones a fresh attempt into it, gives the agent its brief and Braid's tools, and starts it headless. The host reads what the agent prints every few seconds and adds it to the attempt's session, then removes the sandbox when the agent exits.
+  - The sandbox has no Internet access and holds no credentials: no model key, no git token, not even its own Braid token. One Worker entrypoint sees every request it makes and allows only this project's Braid tools, fetch and push of its own attempt, fetch of trunk, the model, and reads from the npm registry, adding the token for each outside the sandbox.
+  - Model access is through AI Gateway (`AI_GATEWAY_ID` and the `AI_GATEWAY_TOKEN` secret, with Unified Billing or stored provider keys), or through `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` secrets. `HOSTED_CLAUDE_MODEL` and `HOSTED_CODEX_MODEL` override the models.
 - **Model** (`src/worker/resolver.ts`): optional. Claude via the Anthropic SDK if a key is set, otherwise Workers AI.
 
 ## Agent tools (MCP)
@@ -106,7 +110,7 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 - Verification supports Node projects (npm or pnpm). Each step has ten minutes.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`).
-- Agents run wherever you start them. Braid verifies their commits in sandboxes but does not host the agents yet.
+- A hosted agent runs once, for at most 45 minutes. If verification fails after it has exited, nothing starts it again.
 - Tests cover git analysis, redaction, session capture and the tar reader (`pnpm test`); the rest is exercised end to end by `pnpm sim`.
 
 ## License

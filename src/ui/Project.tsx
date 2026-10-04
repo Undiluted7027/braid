@@ -8,12 +8,25 @@ import { DeleteProject } from "./DeleteProject";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
-export function JoinCommand({ slug, intentId }: { slug: string; intentId: number }) {
+export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentId: number; hosting: State["project"]["hosting"] }) {
 	const [agent, setAgent] = useState("claude-code");
+	const start = useAction();
+	const run = (kind: "claude" | "codex") => start.run(() => api("POST", `/p/${slug}/intents/${intentId}/host`, { kind }));
 	const cmd = `npx braid join ${location.origin}/p/${slug} --intent ${intentId} --agent ${agent}`;
 	const [copied, setCopied] = useState(false);
 	return (
 		<div className="join">
+			{hosting.available && <>
+				<p className="small">Run an agent here, in a sandbox on Cloudflare. It gets a fresh fork of trunk, Braid's tools, and network access to this project and its model only.</p>
+				<div className="row">
+					<button className="primary" disabled={start.busy || !hosting.claude} onClick={() => run("claude")}>Run Claude Code</button>
+					<button className="primary" disabled={start.busy || !hosting.codex} onClick={() => run("codex")}>Run Codex</button>
+					{start.busy && <span className="dim small">Starting…</span>}
+					{(!hosting.claude || !hosting.codex) && <span className="dim small">{!hosting.claude && !hosting.codex ? "No model credentials are set on this instance." : `No credentials for ${hosting.claude ? "Codex" : "Claude Code"}.`}</span>}
+				</div>
+				{start.error && <p className="error">{start.error}</p>}
+				<p className="small join-or">Or run one yourself:</p>
+			</>}
 			<p className="small">Run this where the agent should work. It forks trunk into a new Artifacts repo, clones it, and connects the agent to Braid over MCP.</p>
 			<div className="row">
 				<select value={agent} onChange={(e) => setAgent(e.target.value)} aria-label="Agent">
@@ -24,6 +37,13 @@ export function JoinCommand({ slug, intentId }: { slug: string; intentId: number
 			</div>
 		</div>
 	);
+}
+
+/** Where Braid itself is running the agent, and how that is going. */
+export function HostedChip({ a }: { a: Attempt }) {
+	if (!a.hosted) return null;
+	const going = a.hosted === "starting" || a.hosted === "running";
+	return <span className={`chip ${a.hosted === "failed" ? "conflict" : "quiet"}`} title={a.hostedDetail || "Braid runs this agent in a sandbox on Cloudflare"}>{going ? `sandbox ${a.hosted}` : `sandbox ${a.hosted}`}</span>;
 }
 
 function TrunkRemote({ remote }: { remote: string }) {
@@ -63,6 +83,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 			<span className="mono dim">{a.id}</span>
 			<strong>{a.agent}</strong>
 			<span className={`chip ${a.status}`}>{a.status}</span>
+			<HostedChip a={a} />
 			<span className="dim small">{a.files.length} file{a.files.length === 1 ? "" : "s"} · {decisions} decision{decisions === 1 ? "" : "s"}</span>
 			<span className="spacer" />
 			{LIVE.has(a.status) && <RunChip run={runFor(state, a.id)} head={a.headSha} />}
@@ -95,7 +116,7 @@ function IntentCard({ intent, state }: { intent: Intent; state: State }) {
 					{attempts.length > 0 && <Link to={`/p/${state.project.slug}/i/${intent.id}`} className="button">{attempts.length > 1 ? `Compare ${attempts.length} attempts` : "Review"}</Link>}
 				</div>
 			)}
-			{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} />}
+			{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} hosting={state.project.hosting} />}
 		</section>
 	);
 }

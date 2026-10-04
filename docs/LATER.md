@@ -13,7 +13,7 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
 - **The demo subject is a toy.** Everything has run on a 60-line counter app with no build, tests or dependencies.
 - **"Why" depends on agents volunteering it.** Decisions are whatever the agent chose to record. What it read, tried and abandoned is not captured.
 - **Conflict detection is textual.** It predicts line-level merge conflicts per file. Two changes that break each other across different files are invisible.
-- **Humans drive everything.** A person opens intents, starts agents in terminals, and clicks land.
+- **Humans drive everything.** A person opens intents, starts agents, and clicks land.
 - **It barely uses the platform.** Workers Builds and Previews, and Queues are untouched. (Containers are now used for verification.)
 
 ### What to build
@@ -28,8 +28,11 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
 3. **Evidence-based review.** Run each attempt's tests and build in Cloudflare Sandbox on every push, and give every attempt a real deployed preview. Compare then shows results side by side.
    - Done: every commit of an attempt, and trunk after each landing, is run in a fresh container (install, typecheck, lint, test, build, or `braid.json`). The sandbox has no Internet and no credentials; it reaches only its own repository (read) and the npm registry (read) through Worker gateways, checked from inside. Results show per step in the attempt view and on the board, reach the agent in `checkpoint` and `heads_up`, and block `ready` and landing on a failed commit unless forced. Build output is saved and served as the preview.
    - Done: Braid previews its own UI. `braid.json` sets `preview.api` to `braid`, and the preview reads the project it belongs to from the instance it runs on (read-only, that project only, and it cannot send what it reads to another host).
-   - Open: previews of other apps that need a backend. Only Node projects. A run that dies mid-way stays "running" until someone runs it again. Not yet run on a deployed Worker.
+   - Open: previews of other apps that need a backend. Only Node projects. A run that dies mid-way stays "running" until someone runs it again. 
 4. **Agents hosted on Cloudflare.** Start agents from the UI in Sandbox, so opening an intent is enough to get attempts.
+   - Done: "Run Claude Code" and "Run Codex" on an intent start the agent in a sandbox with a fresh attempt, Braid's tools and its session streamed in. The sandbox holds no credentials; one Worker entrypoint decides everything it can reach. Checked locally with a self-test agent that stands in for the model (tools, commit, push, trunk fetch, refusals), with each CLI's own doctor, and by starting both CLIs headless with the exact flags.
+   - Open: no real model run yet, because the instance has no model credentials. A hosted agent runs once; nothing restarts it when verification fails after it exits. Not yet deployed.
+   - Acceptance test, which also closes the two unverified items below: start two hosted agents on intents that edit the same lines, land one, then land the other so it conflicts. The agent reconciles the first conflict with the `reconciliation` and `resolve` tools. A second conflict is resolved with "Reconcile with a model", first on Workers AI (no key needed), then on Claude once `ANTHROPIC_API_KEY` is set, which hosted Claude Code agents need anyway.
 5. **Agents that coordinate.** A planner that splits a goal into intents, a reviewer agent that judges attempts against acceptance, and a landing queue that re-verifies after each landing.
 6. **Semantic collisions.** After each landing, re-run the other attempts' checks against the new trunk, so cross-file breakage is caught by execution.
 
@@ -37,14 +40,11 @@ Items 2 and 3 are the direct answers to the competition brief's questions about 
 
 ### Also needed for the submission
 
-- Deploy, which is the only way to verify the push-event Workflow.
-- A real-agent conflict driven through reconciliation; so far only the scripted run has done this.
 - The 5 to 10 minute demo video.
 - A public source repository and a pass over the run instructions once deployed.
 
 ## Not built yet
 
-- **Hosted agents.** Agents run wherever you start them. Running them in Cloudflare Sandbox, started from the UI, is not built.
 - **Previews for apps with a backend.** A built preview is static files; nothing runs the app's server.
 - **Reconciling delete-versus-edit in the UI.** Currently the agent has to merge trunk with git.
 - **Semantic overlap detection.** Prediction is per file, by three-way line merge. Two changes in different files that break each other are not caught.
@@ -60,7 +60,14 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 
 ## Not verified yet
 
-- **Push-event Workflow.** It only fires on a deployed Worker and has never run.
-- **Model-backed reconciliation.** Written for Claude and Workers AI; never called.
+Both are covered by the acceptance test for step 4 of the build plan.
 
-Checked locally on October 4, 2026: the admin token guard (every route class, cookie sign-in, keyed previews, the socket), the context repo's contents read back from a clone, and capture and redaction with real Claude Code and Codex sessions that ran `env`, `cat .mcp.json` and `git config --list`.
+- **Model-backed reconciliation.** Written for Claude and Workers AI; never called.
+- **A real-agent conflict through reconciliation.** Only the scripted run has done it.
+
+Checked on October 4, 2026:
+
+- Locally: the admin token guard (every route class, cookie sign-in, keyed previews, the socket), the context repo's contents read back from a clone, and capture and redaction with real Claude Code and Codex sessions that ran `env`, `cat .mcp.json` and `git config --list`.
+- Deployed at https://braid.undiluted7027.workers.dev: the push-event Workflow (a push with no `checkpoint` updated the attempt), sandbox runs and their isolation on Cloudflare's microVM, sign-in, the live socket, both kinds of preview, `ready` refused on a failed commit, and the forced-landing confirmation.
+
+The `braid` project now lives on the deployed instance. It was moved there with its intents, decisions, landings and sessions; the local instance has forgotten it.

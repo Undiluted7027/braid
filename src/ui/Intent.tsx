@@ -4,7 +4,7 @@ import type { Attempt, Conflict, Decision, DiffFile, Reconciliation, State } fro
 import { api, ago, intentColor, short, useAsync } from "./api";
 import { Link, useAction } from "./App";
 import { FileDiff } from "./Diff";
-import { JoinCommand } from "./Project";
+import { HostedChip, JoinCommand } from "./Project";
 import { Session } from "./Session";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
@@ -125,7 +125,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const [showSession, setShowSession] = useState(true);
 	const [frame, setFrame] = useState(0);
 	useEffect(() => setFrame((f) => f + 1), [a.headSha]);
-	const land = useAction(), drop = useAction();
+	const land = useAction(), drop = useAction(), halt = useAction();
 	const run = runFor(state, a.id);
 	const landIt = () => land.run(async () => {
 		try { await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human" }); } catch (e) {
@@ -142,7 +142,9 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			<div className="row">
 				<h2>{a.agent} <span className="mono dim">{a.id}</span></h2>
 				<span className={`chip ${a.status}`}>{a.status}</span>
+				<HostedChip a={a} />
 				<span className="spacer" />
+				{(a.hosted === "starting" || a.hosted === "running") && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}>Stop agent</button>}
 				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {}))}>Abandon</button>}
 				{canLand && LIVE.has(a.status) && (
 					<button className="primary" disabled={land.busy || a.headSha === a.baseSha} onClick={landIt}>
@@ -150,7 +152,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 					</button>
 				)}
 			</div>
-			{(land.error || drop.error) && <p className="error">{land.error ?? drop.error}</p>}
+			{(land.error || drop.error || halt.error) && <p className="error">{land.error ?? drop.error ?? halt.error}</p>}
+			{a.hosted === "failed" && <p className="warn small">The hosted agent failed: {a.hostedDetail}</p>}
 			<p className="small dim mono">base {short(a.baseSha)} → head {short(a.headSha)} · updated {ago(a.updatedAt)}{a.behind > 0 && LIVE.has(a.status) ? ` · ${a.behind} landing${a.behind === 1 ? "" : "s"} behind trunk` : ""}</p>
 			{a.summary && <p>{a.summary}</p>}
 
@@ -169,7 +172,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				<h3>Session</h3><span className="spacer" />
 				<button onClick={() => setShowSession(!showSession)}>{showSession ? "Hide" : "Show"}</button>
 			</div>
-			{showSession && <Session slug={slug} attemptId={a.id} decisions={decisions} live={a.status === "working"} />}
+			{showSession && <Session slug={slug} attemptId={a.id} decisions={decisions} live={a.hosted ? a.hosted === "starting" || a.hosted === "running" : a.status === "working"} />}
 
 			{collisions.length > 0 && <>
 				<h3>Collisions with other intents</h3>
@@ -223,7 +226,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 				{intent.acceptance && <p className="small"><strong>Acceptance:</strong> {intent.acceptance}</p>}
 				{landing && state.project.contextRemote && <p className="small dim">Its decisions and session transcript are committed to the context repo: <span className="mono">{state.project.contextRemote}</span> under <span className="mono">intents/{intent.id}/</span></p>}
 				{landing && <p className="small">Landed on trunk as <span className="mono">{short(landing.sha)}</span> from attempt {landing.attemptId} ({landing.agent}), {ago(landing.at)}. <Link to={`/p/${state.project.slug}/why?path=${encodeURIComponent(landing.files[0] ?? "")}`}>See it in the code</Link></p>}
-				{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} />}
+				{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} hosting={state.project.hosting} />}
 			</div>
 			{recons.filter((r) => r.status !== "resolved").map((r) => <ReconPanel key={r.id} r={r} state={state} />)}
 			{attempts.length === 0 && <p className="dim">No attempts yet. Add an agent to start one; add several to compare approaches.</p>}

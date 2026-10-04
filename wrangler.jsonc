@@ -15,12 +15,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "PROJECT", "class_name": "Project" },
-      { "name": "RUNNER", "class_name": "Runner" }
+      { "name": "RUNNER", "class_name": "Runner" },
+      { "name": "AGENT", "class_name": "AgentHost" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Project"] },
-    { "tag": "v2", "new_sqlite_classes": ["Runner"] }
+    { "tag": "v2", "new_sqlite_classes": ["Runner"] },
+    { "tag": "v3", "new_sqlite_classes": ["AgentHost"] }
   ],
   // Each attempt is verified in its own Linux sandbox, started on demand by the Runner object.
   "containers": [
@@ -28,6 +30,12 @@
       "class_name": "Runner",
       "scheduling_policy": "durable_object",
       "images": { "runner": { "dockerfile": "./Dockerfile" } }
+    },
+    // Hosted agents: Claude Code or Codex working on an attempt inside a sandbox.
+    {
+      "class_name": "AgentHost",
+      "scheduling_policy": "durable_object",
+      "images": { "agent": { "dockerfile": "./Dockerfile" } }
     }
   ],
   "workflows": [{ "name": "braid-push", "binding": "PUSH_WORKFLOW", "class_name": "PushWorkflow" }],
@@ -42,5 +50,8 @@
       }
     ]
   },
+  // Hosted agents reach their model through AI Gateway when AI_GATEWAY_ID and the AI_GATEWAY_TOKEN secret are set
+  // (otherwise through ANTHROPIC_API_KEY / OPENAI_API_KEY secrets). The keys stay in the Worker either way.
+  "vars": { "AI_GATEWAY_ACCOUNT_ID": "88473415e3dee2618de0a585523e71f9", "AI_GATEWAY_ID": "" },
   "observability": { "enabled": true }
 }

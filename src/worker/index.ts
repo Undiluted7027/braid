@@ -4,6 +4,7 @@ import { splitError, type BraidEnv, type Project } from "./project";
 
 export { Project } from "./project";
 export { GitGateway, RegistryGateway, Runner } from "./runner";
+export { AgentHost, AgentOutbound } from "./agent";
 
 const REGISTRY = "~registry";
 const SLUG = /^[a-z0-9](?:[a-z0-9]|-(?!-)){1,38}[a-z0-9]$/;
@@ -134,6 +135,8 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		const b = await body();
 		if (rest[0] === "intents" && rest.length === 1) return Response.json(await p.createIntent(b as any), { status: 201 });
 		if (rest[0] === "intents" && rest[2] === "join") return Response.json(await p.join({ intentId: Number(rest[1]), agent: b.agent, kind: b.kind, origin: url.origin }), { status: 201 });
+		if (rest[0] === "intents" && rest[2] === "host") return Response.json(await p.hostAgent(Number(rest[1]), b.kind === "codex" ? "codex" : b.kind === "selftest" ? "selftest" : "claude"), { status: 201 });
+		if (rest[0] === "attempts" && rest[2] === "stop") return Response.json(await p.stopHosted(rest[1]));
 		if (rest[0] === "intents" && rest[2] === "abandon") return Response.json((await p.abandonIntent(Number(rest[1]), b.by)) ?? { ok: true });
 		if (rest[0] === "attempts" && rest[2] === "land") return Response.json(await p.land(rest[1], b.by, !!b.force));
 		if (rest[0] === "runs") return Response.json(await p.verify(String(b.ref ?? "trunk"), true));
