@@ -1,7 +1,8 @@
 // Shapes shared by the Worker and the UI.
 export type IntentStatus = "open" | "landed" | "abandoned";
-export type AttemptStatus = "working" | "ready" | "conflicted" | "landed" | "superseded" | "abandoned";
-export type DecisionKind = "decision" | "assumption" | "rejected" | "question" | "note";
+export type AttemptStatus = "working" | "ready" | "conflicted" | "landed" | "superseded" | "abandoned" | "reverted";
+/** `feedback` and `answer` are written by people: a note an attempt was sent back with, and a reply to a question an agent recorded. */
+export type DecisionKind = "decision" | "assumption" | "rejected" | "question" | "note" | "feedback" | "answer";
 
 export interface Intent {
 	id: number;
@@ -92,6 +93,10 @@ export interface Reconciliation {
 	at: number;
 }
 export interface Landing {
+	/** Set on a landing that was taken back: the commit that reverted it. */
+	revertedBy: string | null;
+	/** Set on the commit that took a landing back: the landing it reverted. */
+	revertOf: string | null;
 	sha: string;
 	parentSha: string;
 	intentId: number;

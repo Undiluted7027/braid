@@ -9,7 +9,7 @@ const LIVE = new Set(["working", "ready", "conflicted"]);
 
 export function Braid({ state }: { state: State }) {
 	const strands = state.attempts.filter((a) => a.status !== "abandoned").sort((a, b) => a.intentId - b.intentId || a.createdAt - b.createdAt);
-	const landingOf = new Map(state.landings.map((l) => [l.attemptId, l]));
+	const landingOf = new Map(state.landings.filter((l) => !l.revertOf).map((l) => [l.attemptId, l]));
 	const end = (a: Attempt) => landingOf.get(a.id)?.at ?? a.updatedAt;
 
 	// Even spacing by order of events, so a burst of work and a long idle gap both stay readable.

@@ -46,7 +46,7 @@ Items 2 and 3 are the direct answers to the competition brief's questions about 
 
 Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra (code and product), a fresh Claude Opus session as competition judge and engineer, and a fresh Claude Opus session using the local instance in a browser as a first-time developer and designer. They agreed that landing cannot yet be trusted and that a person cannot answer an agent, and that both come before the planner and reviewer agent. This order replaces steps 5 and 6 above. Findings marked (unchecked) have not been confirmed against the code; the rest have.
 
-1. **Trustworthy landing.** Done locally on October 4, 2026; not yet deployed.
+1. **Trustworthy landing.** Done and deployed on October 4, 2026.
    - Done: a landing is for one commit. "Land this" sends the commit on screen; if the attempt has moved, or moves while the landing waits, it is refused. A saved resolution records the trunk and attempt commits it was written against and is marked stale when either moves.
    - Done: a pass is required. Not run, queued and running wait; failed and errored are refused; only "Land now" (force) skips it, and that is recorded on the landing. Checks come from trunk's `braid.json` and trunk's scripts, and so does the `preview.api` flag.
    - Done: the landing queue. The merged commit is built, parked on the attempt's repository (`braid-candidate`), run in a sandbox, and only then pushed to trunk. A reconciled merge goes through the same run. This is also step 6: an attempt that passed alone and broke when merged with a landed change in another file was refused, with the failing output sent to the agent.
@@ -62,11 +62,16 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Open: the queue does not bring an agent back by itself when a merge fails; a person presses "Have it fix the merge with trunk".
    - Open: no spending budget per agent beyond the 45-minute limit and the six-agent limit.
    - Open: an attempt can still change what a check script does (`"test": "true"`). It shows in the diff; nothing flags it.
-2. **A person can respond.**
-   - "Send back with a note" on an attempt: it reaches the agent (brought back if hosted), and is kept as why.
-   - Answer an agent's question; message an agent. Agents can message each other, people cannot.
-   - Confirmation or undo on land and abandon. Abandon or edit an intent from the UI (the route exists, no button). Revert a landing.
-   - Acceptance is shown as prose and nothing checks an attempt against it. Landing accepts an attempt that is still `working`.
+2. **A person can respond.** Done locally on October 4, 2026; not yet deployed.
+   - Done: "Send back for changes" on an attempt. The note is kept with the attempt's decisions (kind `feedback`), so it is in the why log, the brief and the landing commit. The attempt goes back to working, a landing that was asked for is dropped, and the agent hears it in `heads_up`. For Claude Code and Codex attempts Braid starts the agent again in a sandbox to act on it. Checked with a hosted Claude Code run: it made the change asked for, recorded how, and the note is in the landing commit message.
+   - Done: a reply box under each unanswered `question` an agent recorded; the answer is kept as a decision (kind `answer`). "Just tell it" sends a message without changing the attempt.
+   - Done: an open intent can be edited and abandoned from its page; agents working on it are told the new text.
+   - Done: Abandon asks first and can be undone ("Reopen"). Landing an attempt its agent has not marked ready asks first, and is refused while the agent is still running.
+   - Done: "Revert landing". Trunk gets one commit that undoes the landing, the intent is open again, the reason is kept with the attempt, and the attempt is marked reverted. Refused when a later landing changed the same lines.
+   - Open: a note is for the whole attempt. It cannot be attached to a line of the diff.
+   - Open: an agent started on someone's machine only hears a note if it is still running or is started again by hand; `braid join` has no "resume".
+   - Open: a revert is pushed and then verified on trunk, not verified first. A reverted attempt cannot be landed again, because its commits are already in trunk's history; the intent needs a new attempt.
+   - Open: acceptance is still prose. Nothing checks an attempt against it (the reviewer agent in item 6).
 3. **Reconciliation by region.**
    - The model must return whole files, capped at 16,000 output tokens (8,000 on Workers AI). `project.ts` is 67 kB, so a conflict there cannot be resolved by the model, and that is the file the demo will collide on. Resolve each conflicted region and assemble the file on the server. Same for agents, which have to send the whole file in `resolve`.
    - The editor is a 14-row text box pre-filled with trunk's file: no conflict markers, no base, no jump to the conflict. Show markers and the base, and show the merged diff after resolution.
@@ -118,9 +123,9 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 ## Not verified yet
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
-- **Trustworthy landing on the deployed instance.** The landing queue, trunk-controlled checks, the full-path merge and the rest of item 1 of the revised order have only run locally.
 - **Recovery paths in item 1.** A run interrupted mid-way, and a landing interrupted between the push and its record, are handled in code but were not forced to happen.
-- **A hosted agent brought back to fix a failed merge with trunk.** The button and the agent's instructions exist; only the failing merge itself was tested.
+- **Item 2 on the deployed instance.** Responding to an attempt, answering a question, editing an intent, reopening and reverting have only run locally.
+- **On the deployed instance, from item 1:** a conflict resolved and then verified as a merge, cancelling a landing, "Land now", and stopping a hosted agent by abandoning its attempt. These ran locally only.
 
 Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.
 
@@ -132,6 +137,7 @@ Checked on October 4, 2026:
   - Landing the second attempt conflicted. Braid refused a resolution identical to either side. Codex, brought back, wrote a version with both buttons and it landed.
   - A commit with a failing test was pushed to a third attempt. Claude Code, brought back to fix it, found the cause, pushed, waited for verification to pass and marked the attempt ready.
   - A second conflict was reconciled with Claude through the gateway, and trunk verification passed afterwards.
+- Item 1 on the deployed instance, in a separate project (`dep-item1`, since deleted): a landing asked for before verification finished waited and landed by itself; an attempt that passed alone and failed when merged with trunk was refused with trunk untouched, and Claude Code, brought back, merged trunk, fixed it and it landed; a landing was refused for the wrong commit and when the attempt moved after the request; an attempt that removed the test script and added its own `braid.json` still had the test run; on a failing trunk a bystander was refused and a fix landed; a landed attempt's tools were refused; creating a project named after an existing repository was refused. The existing `braid` project loaded after the schema change.
 - Deployed at https://braid.undiluted7027.workers.dev: the push-event Workflow (a push with no `checkpoint` updated the attempt), sandbox runs and their isolation on Cloudflare's microVM, sign-in, the live socket, both kinds of preview, `ready` refused on a failed commit, and the forced-landing confirmation.
 
 The `braid` project now lives on the deployed instance. It was moved there with its intents, decisions, landings and sessions; the local instance has forgotten it.

@@ -13,6 +13,7 @@ Git merges text. It has no idea what either side was trying to do, so when two a
 | Commit message | **Why log** | Decisions, rejected options, and assumptions the agent records as it works. Kept with the change forever. |
 | Finding out at merge time | **Overlaps** | On every push, Braid diffs every live attempt against every other and predicts, per file, whether they will merge. Both agents are told on their next tool call, with the other side's reasoning. |
 | CI on a pull request | **Verification** | Every commit of every attempt is run in a fresh sandbox: install, typecheck, tests, build. Results sit next to the diff, go back to the agent, and gate landing. Trunk is verified after each landing. |
+| Review comments | **Response** | A person sends an attempt back with a note, or answers a question the agent recorded. The agent hears it on its next step (Braid starts a hosted agent again to act on it), and the note is kept with the attempt's decisions, so it is in the landing commit too. |
 | Merge conflict | **Reconciliation** | Both versions, their base, and the intent and decisions behind each side. Resolved by the agent, a model, or a person, with a rationale that is written into the landing commit. |
 | Merge | **Landing** | One commit on trunk per intent (parents: trunk, attempt head). The commit message carries the goal and the why log. Trunk only takes what has been run: the attempt's commit must have passed, and if trunk has moved since, the merge of the two is verified first. |
 | `git blame` | **Why view** | Every line on trunk, colored by the intent that landed it. Click a line to read the decisions behind it. |
@@ -117,7 +118,8 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 - Verification supports Node projects (npm or pnpm). Each step has ten minutes.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`).
-- A hosted agent runs once, for at most 45 minutes. A person can bring it back to reconcile a conflicted landing or fix failed checks; nothing does that automatically.
+- A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks; nothing does that automatically.
+- Reverting a landing adds one commit that undoes it and reopens the intent. It is refused if a later landing changed the same lines, and the revert itself is verified on trunk afterwards, not before.
 - Braid refuses a resolution that is identical to one side unless told that is intended.
 - One merge is verified at a time, so landings queue behind each other; each takes as long as the project's checks.
 - A project runs at most six hosted agents at once (`HOSTED_MAX`).

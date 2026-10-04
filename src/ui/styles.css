@@ -258,3 +258,10 @@ button.danger.solid { background: var(--bad); border-color: var(--bad); color: v
 .join-or { margin-top: 12px; }
 
 .landing-wait { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; flex-wrap: wrap; }
+
+.respond, .answer, .edit-intent { display: grid; gap: 8px; margin: 10px 0; }
+.respond { padding: 10px; border: 1px solid var(--line); border-radius: 6px; }
+.respond textarea, .answer textarea, .edit-intent textarea, .edit-intent input { width: 100%; margin-top: 4px; }
+.respond .row, .answer .row { flex-wrap: wrap; }
+.check { display: inline-flex; align-items: center; gap: 6px; }
+.why li.from-person { border-left: 3px solid var(--accent); padding-left: 8px; }

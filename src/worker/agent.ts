@@ -15,7 +15,7 @@ export interface HostJob {
 	repo: string; remote: string; trunkRepo: string; trunkRemote: string; branch: string;
 	agentToken: string; brief: string;
 	/** Why the agent is being started: a new attempt, or brought back to an attempt that needs something. */
-	task: "work" | "reconcile" | "fix";
+	task: "work" | "reconcile" | "fix" | "respond";
 }
 interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string; kind: HostedKind }
 
@@ -110,6 +110,9 @@ Landing this attempt conflicted with trunk: another intent changed the same line
 Write a version of each conflicted file that satisfies BOTH intents, then call \`resolve\` with the resolutions and a rationale that says concretely how each side's intent survives. Record the decision. Do not start other work.`,
 	fix: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
 Braid ran your last commit in a clean sandbox and it failed, either on its own or once merged with trunk. Call \`checkpoint\` to see which steps failed and their output (\`verification\`, and \`merged_with_trunk\` inside it). If it is the merge that fails, merge trunk into your attempt first (see \`sync\`). Fix the cause, commit, push, checkpoint again, wait for verification to pass, then mark the attempt ready. Record what you changed and why.`,
+	respond: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
+A person reviewed the attempt and responded: their notes are at the end of BRAID.md, and arrive in \`heads_up\` on your first tool call. Call \`brief\`, then do what they ask. If a note answers a question you recorded, carry on from it.
+Record how you addressed each note, commit, push, checkpoint, wait for verification to pass, then mark the attempt ready again. Do not start other work.`,
 };
 
 // Stands in for an agent when checking the plumbing: it speaks, uses Braid's tools, commits, pushes and probes what it can reach.
@@ -274,7 +277,7 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 		}
 		// Not awaited to completion: the script outlives this call and the alarm follows it through its files.
 		await container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", TASK, ...argv], { cwd: REPO, env: { HOME: "/root", CI: "true", ...TRUST, ...agentEnv }, stdout: "ignore", stderr: "ignore" });
-		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : ", to fix failed verification"}` }], "running");
+		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : job.task === "respond" ? ", to act on a person's note" : ", to fix failed verification"}` }], "running");
 	}
 
 	/** Read what the agent has printed since last time and pass it on as session events. */

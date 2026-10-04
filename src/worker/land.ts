@@ -95,6 +95,30 @@ export async function promote(input: { branch: string; trunk: { remote: string; 
 	return { ok: true };
 }
 
+/**
+ * Take a landing back out of trunk: one new commit on top of trunk that undoes what the landing changed.
+ * Later landings stay. If one of them changed the same lines, there is nothing safe to do and the files are returned.
+ */
+export async function revert(input: { branch: string; trunk: { remote: string; token: string }; sha: string; parentSha: string; message: string; author: Author }): Promise<{ ok: true; sha: string; parentSha: string } | { ok: false; conflicts: string[] }> {
+	const { branch } = input;
+	const fs = new MemoryFS(), repo = { fs, dir };
+	await fs.promises.mkdir(dir);
+	await git.init({ fs, dir, defaultBranch: branch });
+	await git.addRemote({ fs, dir, remote: "trunk", url: input.trunk.remote });
+	await git.fetch({ fs, http, dir, remote: "trunk", ref: branch, singleBranch: true, onAuth: gitAuth(input.trunk.token) });
+	const head = await git.resolveRef({ fs, dir, ref: `refs/remotes/trunk/${branch}` });
+	const treeOf = async (oid: string) => (await git.readCommit({ fs, dir, oid })).commit.tree;
+	// Undoing a change is a merge where the change is the base and what came before it is the other side.
+	const merged = await mergeTrees(repo, await treeOf(input.sha), await treeOf(head), await treeOf(input.parentSha), new Map());
+	if (merged.conflicts.length) return { ok: false, conflicts: merged.conflicts.map((c) => c.path) };
+	const who = { ...input.author, timestamp: Math.floor(Date.now() / 1000), timezoneOffset: 0 };
+	const sha = await git.writeCommit({ fs, dir, commit: { message: `${input.message.trimEnd()}\n`, tree: merged.tree, parent: [head], author: who, committer: who } });
+	await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: sha, force: true });
+	const push = await git.push({ fs, http, dir, url: input.trunk.remote, ref: branch, onAuth: gitAuth(input.trunk.token) });
+	if (!push.ok) throw new Error(`push to trunk rejected: ${JSON.stringify(push.refs)}`);
+	return { ok: true, sha, parentSha: head };
+}
+
 /** Create the first commit of a new repo from a set of files. */
 export async function seed(remote: string, token: string, files: Record<string, string>, message: string, author: Author): Promise<string> {
 	const fs = new MemoryFS();

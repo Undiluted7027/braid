@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
 import { asText, diffTrees, listTree, mergeBase, predict } from "./gitops";
-import { CANDIDATE, commitFiles, prepare, promote, seed } from "./land";
+import { CANDIDATE, commitFiles, prepare, promote, revert, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
@@ -90,6 +90,8 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted_detail TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN attempt_sha TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE landings ADD COLUMN reverted_by TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE landings ADD COLUMN revert_of TEXT"); } catch {}
 	}
 
 	// ── storage helpers ──────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ export class Project extends DurableObject<BraidEnv> {
 	});
 	private toLanding = (r: any): Landing => ({
 		sha: r.sha, parentSha: r.parent_sha, intentId: r.intent_id, attemptId: r.attempt_id, agent: r.agent, title: r.title,
-		files: JSON.parse(r.files), reconciled: !!r.reconciled, at: r.at,
+		files: JSON.parse(r.files), reconciled: !!r.reconciled, at: r.at, revertedBy: r.reverted_by ?? null, revertOf: r.revert_of ?? null,
 	});
 
 	private intents() { return this.rows("SELECT * FROM intents ORDER BY id").map(this.toIntent); }
@@ -332,6 +334,21 @@ export class Project extends DurableObject<BraidEnv> {
 		return intent;
 	}
 
+	/** Change what an open intent asks for. Agents already working on it are told, with the new text. */
+	async editIntent(id: number, input: { title?: string; goal?: string; acceptance?: string; by?: string }) {
+		const intent = this.intent(id);
+		if (intent.status !== "open") throw new BraidError(`I${id} is ${intent.status}; only an open intent can be edited`);
+		const next = { title: (input.title ?? intent.title).trim(), goal: (input.goal ?? intent.goal).trim(), acceptance: (input.acceptance ?? intent.acceptance).trim() };
+		if (!next.title || !next.goal) throw new BraidError("an intent needs a title and a goal");
+		if (next.title === intent.title && next.goal === intent.goal && next.acceptance === intent.acceptance) return intent;
+		this.sql.exec("UPDATE intents SET title = ?, goal = ?, acceptance = ? WHERE id = ?", next.title, next.goal, next.acceptance, id);
+		for (const a of this.attempts()) {
+			if (a.intentId === id && LIVE.has(a.status)) this.signal(a.id, "intent-changed", { ...next, note: "A person edited the intent you are working on. Read it again and adjust your work to it." });
+		}
+		this.note("intent", input.by ?? "human", `Edited I${id}: ${next.title}`, id);
+		return this.intent(id);
+	}
+
 	async abandonIntent(id: number, by = "human") {
 		this.intent(id);
 		this.sql.exec("UPDATE intents SET status = 'abandoned' WHERE id = ? AND status = 'open'", id);
@@ -378,6 +395,57 @@ export class Project extends DurableObject<BraidEnv> {
 		this.note("attempt", by, `Attempt ${id} abandoned`, a.intentId, id);
 		await this.retire(id);
 		await this.serial(() => this.recompute());
+	}
+
+	/** Undo an abandon. */
+	async restoreAttempt(id: string, by = "human") {
+		const a = this.attempt(id);
+		if (a.status !== "abandoned") throw new BraidError(`attempt ${id} is ${a.status}, not abandoned`);
+		if (this.intent(a.intentId).status !== "open") throw new BraidError(`I${a.intentId} is ${this.intent(a.intentId).status}; reopen is only for attempts of an open intent`);
+		this.setStatus(id, "working");
+		this.note("attempt", by, `Attempt ${id} reopened`, a.intentId, id);
+		await this.serial(() => this.recompute());
+	}
+
+	/**
+	 * A person answers an agent. `feedback` sends the attempt back with a note, `answer` replies to a
+	 * question the agent recorded, `message` just tells it something. Feedback and answers are kept
+	 * with the attempt's decisions, so they are part of the why of whatever lands. The agent hears on
+	 * its next tool call; with `bringBack`, Braid starts it again in a sandbox to act on it now.
+	 */
+	async respond(attemptId: string, input: { kind?: string; body?: string; question?: number; by?: string; bringBack?: boolean }) {
+		this.requireProject();
+		const a = this.attempt(attemptId), by = String(input.by || "human").slice(0, 40), body = redact(String(input.body ?? "")).trim();
+		const kind = input.kind === "answer" ? "answer" : input.kind === "message" ? "message" : "feedback";
+		if (!body) throw new BraidError("write what the agent should hear");
+		if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
+		if (kind === "message") {
+			this.signal(a.id, "message", { from: { person: by }, body });
+			this.note("message", by, `${by} → ${a.agent}: ${body}`, a.intentId, a.id);
+		} else {
+			const q = kind === "answer" ? this.rows<any>("SELECT * FROM decisions WHERE id = ? AND attempt_id = ? AND kind = 'question'", Number(input.question), a.id)[0] : null;
+			if (kind === "answer" && !q) throw new BraidError("that question is not one this attempt recorded", 404);
+			const title = q ? `Answer: ${q.title}` : "Sent back for changes";
+			this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?)", a.id, a.intentId, by, kind, title, body, a.headSha, now());
+			if (kind === "feedback") {
+				// A landing that was asked for is off: the person wants something else first.
+				this.sql.exec("DELETE FROM queue WHERE attempt_id = ? AND state != 'pushing'", a.id);
+				if (a.status === "ready") this.setStatus(a.id, "working");
+				this.signal(a.id, "feedback", { from: by, body, note: "A person reviewed your attempt and sent it back. Do what the note asks, `record` how you addressed it, push, checkpoint, and mark the attempt ready again." });
+				this.note("feedback", by, `${by} sent attempt ${a.id} back: ${body}`, a.intentId, a.id);
+			} else {
+				this.signal(a.id, "answer", { from: by, question: q.title, body });
+				this.note("feedback", by, `${by} answered ${a.agent}'s question "${q.title}": ${body}`, a.intentId, a.id);
+			}
+		}
+		let broughtBack = false, couldNot = "";
+		const running = this.rows<{ hosted: string | null }>("SELECT hosted FROM attempts WHERE id = ?", a.id)[0]?.hosted;
+		if (input.bringBack && running !== "starting" && running !== "running") {
+			try { await this.rehost(a.id, "respond"); broughtBack = true; } catch (e) { couldNot = splitError(e).message; }
+		}
+		if (kind === "feedback") await this.serial(() => this.advance());
+		this.broadcast();
+		return { ok: true, broughtBack, ...(couldNot ? { couldNot } : {}) };
 	}
 
 	/** An attempt that is over takes no further part: its agent is stopped and any landing asked for it is dropped. */
@@ -570,7 +638,7 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	/** Bring an agent back to an attempt it left, to reconcile a conflicted landing or to fix a failed verification. */
-	async rehost(attemptId: string, task: "reconcile" | "fix") {
+	async rehost(attemptId: string, task: "reconcile" | "fix" | "respond") {
 		this.requireProject();
 		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", attemptId)[0];
 		if (!row) throw new BraidError(`attempt ${attemptId} not found`, 404);
@@ -585,7 +653,7 @@ export class Project extends DurableObject<BraidEnv> {
 		};
 		await this.agentHost(a.id)!.start(job);
 		this.sql.exec("UPDATE attempts SET hosted = 'starting', hosted_detail = '' WHERE id = ?", a.id);
-		this.note("attempt", "braid", `Brought ${a.agent} back to attempt ${a.id} in a Cloudflare sandbox to ${task === "reconcile" ? "reconcile with trunk" : "fix failed verification"}`, a.intentId, a.id);
+		this.note("attempt", "braid", `Brought ${a.agent} back to attempt ${a.id} in a Cloudflare sandbox to ${task === "reconcile" ? "reconcile with trunk" : task === "respond" ? "act on a person's note" : "fix failed verification"}`, a.intentId, a.id);
 		return { attemptId: a.id };
 	}
 
@@ -898,6 +966,7 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 	private briefText(a: Attempt) {
 		const intent = this.intent(a.intentId);
+		const said = this.decisionsFor(a.id).filter((d) => d.kind === "feedback" || d.kind === "answer");
 		return [
 			`# Braid brief: attempt ${a.id} on intent I${intent.id}`,
 			`**${intent.title}**`,
@@ -915,7 +984,10 @@ export class Project extends DurableObject<BraidEnv> {
 			"6. Read `heads_up` on every response. If another intent conflicts with yours, adapt, or `message` that agent.",
 			"7. `ready` with a summary when the goal is met. A human or reviewer lands it. Do not push after that unless you are asked to: a landing is for the commit that was reviewed.",
 			"8. If landing conflicts, `reconciliation` gives you both sides and why each exists; answer with `resolve`.",
-		].filter((l) => l !== "").join("\n");
+			"9. If you need a person to decide something, `record` it with kind `question`. The answer arrives in `heads_up`.",
+			...(said.length ? ["", "## What people have said about this attempt (newest last)", "Do what each note asks and `record` how you addressed it.",
+				...said.map((d) => `- ${d.agent}${d.kind === "answer" ? `, ${d.title.replace(/^Answer: /, "answering \"")}"` : ", sending it back"}: ${d.body}`)] : []),
+		].filter((l, i, all) => l !== "" || all[i + 1]?.startsWith("##")).join("\n");
 	}
 
 	// ── landing and reconciliation ───────────────────────────────────────────
@@ -958,6 +1030,8 @@ export class Project extends DurableObject<BraidEnv> {
 			if (intent.status !== "open") throw new BraidError(`I${intent.id} is already ${intent.status}`);
 			if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
 			if (a.headSha === a.baseSha) throw new BraidError(`attempt ${a.id} has no commits to land`);
+			const hosted = this.rows<{ hosted: string | null }>("SELECT hosted FROM attempts WHERE id = ?", a.id)[0]?.hosted;
+			if (!force && a.status === "working" && (hosted === "starting" || hosted === "running")) throw new BraidError(`${a.agent} is still working on attempt ${a.id} and has not marked it ready; wait, stop the agent, or land it anyway with force`, 409);
 			if (sha && sha !== a.headSha) throw new BraidError(`attempt ${a.id} has moved to ${short(a.headSha)} since you looked at ${short(sha)}; review it again before landing`, 409);
 			const before = this.rows<any>("SELECT * FROM queue WHERE attempt_id = ?", a.id)[0];
 			if (before && before.attempt_sha === a.headSha) this.sql.exec("UPDATE queue SET force = ?, by = ? WHERE attempt_id = ?", force || before.force ? 1 : 0, by, a.id);
@@ -1166,6 +1240,45 @@ export class Project extends DurableObject<BraidEnv> {
 				this.note("context", "braid", `Could not save context for attempt ${id}; it will be tried again at the next landing: ${splitError(e).message}`, intent.id, id);
 			}
 		}
+	}
+
+	/**
+	 * Take a landing back. Trunk gets one new commit that undoes it, the intent is open again, and
+	 * the reason is kept with the attempt. The attempt itself is finished: its commits are in trunk's
+	 * history, so the intent needs a new attempt.
+	 */
+	revertLanding(sha: string, by = "human", reason = "") {
+		return this.serial(async () => {
+			this.requireProject();
+			const row = this.rows("SELECT * FROM landings WHERE sha = ?", sha)[0];
+			if (!row) throw new BraidError(`no landing ${short(sha)}`, 404);
+			const l = this.toLanding(row), why = redact(reason).trim();
+			if (l.revertOf) throw new BraidError("that commit is itself a revert");
+			if (l.revertedBy) throw new BraidError(`that landing was already reverted by ${short(l.revertedBy)}`);
+			if (!why) throw new BraidError("say why the landing is being reverted: it is kept with the intent");
+			const intent = this.intent(l.intentId);
+			const result = await revert({
+				branch: this.branch, sha: l.sha, parentSha: l.parentSha,
+				trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
+				message: `Revert I${intent.id}: ${intent.title}\n\nReason: ${why}\n\nBraid-Reverts: ${l.sha}\nBraid-Intent: ${intent.id}`,
+				author: { name: by, email: `${by.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@people.braid.dev` },
+			});
+			if (!result.ok) throw new BraidError(`later landings changed the same lines in ${result.conflicts.join(", ")}, so this landing cannot be taken out on its own. Open an intent to undo it by hand.`, 409);
+			this.sql.exec("UPDATE landings SET reverted_by = ? WHERE sha = ?", result.sha, l.sha);
+			this.sql.exec("INSERT INTO landings (sha, parent_sha, intent_id, attempt_id, agent, title, files, reconciled, at, revert_of) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+				result.sha, result.parentSha, intent.id, l.attemptId, by, `Revert I${intent.id}: ${intent.title}`, json(l.files), now(), l.sha);
+			this.sql.exec("UPDATE intents SET status = 'open', landed_sha = NULL, landed_attempt = NULL WHERE id = ?", intent.id);
+			this.setStatus(l.attemptId, "reverted");
+			this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, 'feedback', 'Landing reverted', ?, ?, ?, ?)", l.attemptId, intent.id, by, why, json(l.files), result.sha, now());
+			this.setMeta("head", result.sha);
+			this.note("land", by, `Reverted the landing of I${intent.id} (${short(l.sha)}) on trunk as ${short(result.sha)}: ${why}. I${intent.id} is open again`, intent.id, l.attemptId);
+			for (const other of this.attempts()) {
+				if (LIVE.has(other.status)) this.signal(other.id, "trunk-moved", { reverted: `I${intent.id}: ${intent.title}`, reason: why, files: l.files, note: "A landing was taken back out of trunk. Call `checkpoint` to see whether this affects you." });
+			}
+			await this.recompute();
+			await this.advance();
+			return { reverted: true, sha: result.sha };
+		});
 	}
 
 	/** The intents that changed `path` on trunk after `baseSha`, with their reasoning. */

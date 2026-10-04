@@ -136,8 +136,12 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "intents" && rest.length === 1) return Response.json(await p.createIntent(b as any), { status: 201 });
 		if (rest[0] === "intents" && rest[2] === "join") return Response.json(await p.join({ intentId: Number(rest[1]), agent: b.agent, kind: b.kind, origin: url.origin }), { status: 201 });
 		if (rest[0] === "intents" && rest[2] === "host") return Response.json(await p.hostAgent(Number(rest[1]), b.kind === "codex" ? "codex" : b.kind === "selftest" ? "selftest" : "claude"), { status: 201 });
-		if (rest[0] === "attempts" && rest[2] === "rehost") return Response.json(await p.rehost(rest[1], b.task === "fix" ? "fix" : "reconcile"), { status: 201 });
+		if (rest[0] === "attempts" && rest[2] === "rehost") return Response.json(await p.rehost(rest[1], b.task === "fix" ? "fix" : b.task === "respond" ? "respond" : "reconcile"), { status: 201 });
 		if (rest[0] === "attempts" && rest[2] === "stop") return Response.json(await p.stopHosted(rest[1]));
+		if (rest[0] === "intents" && rest[2] === "edit") return Response.json(await p.editIntent(Number(rest[1]), b as any));
+		if (rest[0] === "attempts" && rest[2] === "respond") return Response.json(await p.respond(rest[1], b as any));
+		if (rest[0] === "attempts" && rest[2] === "restore") return Response.json((await p.restoreAttempt(rest[1], b.by)) ?? { ok: true });
+		if (rest[0] === "landings" && rest[2] === "revert") return Response.json(await p.revertLanding(rest[1], b.by, String(b.reason ?? "")));
 		if (rest[0] === "intents" && rest[2] === "abandon") return Response.json((await p.abandonIntent(Number(rest[1]), b.by)) ?? { ok: true });
 		if (rest[0] === "attempts" && rest[2] === "land") return Response.json(await p.land(rest[1], b.by, !!b.force, typeof b.sha === "string" ? b.sha : undefined));
 		if (rest[0] === "attempts" && rest[2] === "cancel-landing") return Response.json(await p.cancelLanding(rest[1], b.by));

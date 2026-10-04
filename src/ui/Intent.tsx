@@ -1,6 +1,6 @@
 import { runFor, Verification } from "./Verify";
 import { useEffect, useState } from "react";
-import type { Attempt, Conflict, Decision, DiffFile, Reconciliation, State } from "../shared/types";
+import type { Attempt, Conflict, Decision, DiffFile, Intent, Reconciliation, State } from "../shared/types";
 import { api, ago, intentColor, short, useAsync } from "./api";
 import { Link, useAction } from "./App";
 import { FileDiff } from "./Diff";
@@ -10,21 +10,68 @@ import { Session } from "./Session";
 const LIVE = new Set(["working", "ready", "conflicted"]);
 const touches = (d: Decision, path: string) => d.files.some((f) => f === path || path.startsWith(f.replace(/\/?\*?$/, "") + "/"));
 
-export function Why({ decisions, empty = "No decisions recorded." }: { decisions: Decision[]; empty?: string }) {
+/** `answer`, when given, puts a reply box under each question nobody has answered yet. */
+export function Why({ decisions, empty = "No decisions recorded.", answer }: { decisions: Decision[]; empty?: string; answer?: (question: Decision, body: string) => Promise<unknown> }) {
 	if (!decisions.length) return <p className="dim small">{empty}</p>;
+	const answered = new Set(decisions.filter((d) => d.kind === "answer").map((d) => d.title.replace(/^Answer: /, "")));
 	return (
 		<ul className="why">
 			{decisions.map((d) => (
-				<li key={d.id}>
+				<li key={d.id} className={d.kind === "feedback" || d.kind === "answer" ? "from-person" : undefined}>
 					<span className={`kind ${d.kind}`}>{d.kind}</span>
 					<div>
-						<strong>{d.title}</strong>
+						<strong>{d.title}</strong>{(d.kind === "feedback" || d.kind === "answer") && <span className="dim small"> · {d.agent}</span>}
 						{d.body && <p>{d.body}</p>}
 						{d.files.length > 0 && <p className="mono dim small">{d.files.join("  ")}</p>}
+						{answer && d.kind === "question" && !answered.has(d.title) && <AnswerBox send={(body) => answer(d, body)} />}
 					</div>
 				</li>
 			))}
 		</ul>
+	);
+}
+
+function AnswerBox({ send }: { send: (body: string) => Promise<unknown> }) {
+	const [body, setBody] = useState("");
+	const act = useAction();
+	return (
+		<form className="answer" onSubmit={(e) => { e.preventDefault(); act.run(() => send(body)); }}>
+			<label className="small">The agent is asking you. Your answer is kept with its decisions.
+				<textarea rows={2} value={body} onChange={(e) => setBody(e.target.value)} />
+			</label>
+			<div className="row"><button className="primary" disabled={act.busy || !body.trim()}>{act.busy ? "Sending…" : "Answer"}</button>{act.error && <span className="error">{act.error}</span>}</div>
+		</form>
+	);
+}
+
+/** Where a person talks back to an attempt: send it back with what to change, or just tell the agent something. */
+function Respond({ a, state }: { a: Attempt; state: State }) {
+	const slug = state.project.slug;
+	const [body, setBody] = useState("");
+	const [sent, setSent] = useState<string | null>(null);
+	const act = useAction();
+	const running = a.hosted === "starting" || a.hosted === "running";
+	const canStart = !running && (a.kind === "claude" || a.kind === "codex") && state.project.hosting[a.kind === "codex" ? "codex" : "claude"];
+	const [bringBack, setBringBack] = useState(true);
+	const send = (kind: "feedback" | "message") => act.run(async () => {
+		const r = await api<{ broughtBack: boolean; couldNot?: string }>("POST", `/p/${slug}/attempts/${a.id}/respond`, { kind, body, by: "human", bringBack: kind === "feedback" && canStart && bringBack });
+		setBody("");
+		setSent(r.broughtBack ? `Sent. ${a.agent} is starting again to act on it.` : r.couldNot ? `Sent, but ${a.agent} could not be started: ${r.couldNot}` : running ? `Sent. ${a.agent} sees it on its next step.` : `Sent. ${a.agent} sees it the next time it talks to Braid.`);
+	});
+	return (
+		<div className="respond">
+			<label className="small"><strong>Respond to {a.agent}</strong>
+				<textarea rows={3} value={body} placeholder="What should change, or what should it know?" onChange={(e) => { setBody(e.target.value); setSent(null); }} />
+			</label>
+			<div className="row">
+				<button className="primary" disabled={act.busy || !body.trim()} onClick={() => send("feedback")} title="The attempt goes back to working, and your note is kept with its decisions">Send back for changes</button>
+				<button disabled={act.busy || !body.trim()} onClick={() => send("message")} title="The agent is told; the attempt's status does not change">Just tell it</button>
+				{canStart && <label className="check small"><input type="checkbox" checked={bringBack} onChange={(e) => setBringBack(e.target.checked)} /> start {a.agent} again in a sandbox to act on it</label>}
+			</div>
+			{!canStart && !running && <p className="dim small">Braid is not running this agent, so it hears your note the next time it calls a Braid tool.</p>}
+			{act.error && <p className="error">{act.error}</p>}
+			{sent && <p className="small" role="status">{sent}</p>}
+		</div>
 	);
 }
 
@@ -131,6 +178,20 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	);
 }
 
+function EditIntent({ intent, slug, done }: { intent: Intent; slug: string; done: () => void }) {
+	const [title, setTitle] = useState(intent.title), [goal, setGoal] = useState(intent.goal), [acceptance, setAcceptance] = useState(intent.acceptance);
+	const act = useAction();
+	return (
+		<form className="edit-intent" onSubmit={async (e) => { e.preventDefault(); if (await act.run(() => api("POST", `/p/${slug}/intents/${intent.id}/edit`, { title, goal, acceptance, by: "human" }))) done(); }}>
+			<label>Title<input value={title} onChange={(e) => setTitle(e.target.value)} /></label>
+			<label>Goal<textarea rows={3} value={goal} onChange={(e) => setGoal(e.target.value)} /></label>
+			<label>Acceptance<textarea rows={2} value={acceptance} onChange={(e) => setAcceptance(e.target.value)} /></label>
+			<div className="row"><button className="primary" disabled={act.busy || !title.trim() || !goal.trim()}>{act.busy ? "Saving…" : "Save"}</button><span className="dim small">Agents working on this intent are told what changed.</span></div>
+			{act.error && <p className="error">{act.error}</p>}
+		</form>
+	);
+}
+
 function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLand: boolean }) {
 	const slug = state.project.slug;
 	const { data: diff } = useAsync(() => api<DiffFile[]>("GET", `/p/${slug}/attempts/${a.id}/diff`), [a.id, a.headSha, a.baseSha]);
@@ -145,6 +206,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const run = runFor(state, a.id);
 	// The commit on screen is the one that lands: if the attempt has moved since, Braid refuses.
 	const landIt = () => land.run(async () => {
+		if (a.status === "working" && !window.confirm(`${a.agent} has not marked attempt ${a.id} ready. Land it as it is?`)) return;
 		try { await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", sha: a.headSha }); } catch (e) {
 			// Landing something that did not pass needs a second, deliberate yes.
 			if (!/with force/.test((e as Error).message) || !window.confirm(`${(e as Error).message.replace(/[.;] [Ll]and it anyway with force$/, "")}.\n\nLand it anyway, without verification?`)) throw e;
@@ -171,7 +233,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				<HostedChip a={a} />
 				<span className="spacer" />
 				{(a.hosted === "starting" || a.hosted === "running") && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}>Stop agent</button>}
-				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {}))}>Abandon</button>}
+				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => { if (window.confirm(`Abandon attempt ${a.id}?${a.hosted === "starting" || a.hosted === "running" ? ` ${a.agent} is running and will be stopped.` : ""} You can reopen it while the intent is open.`)) drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {})); }}>Abandon</button>}
+				{a.status === "abandoned" && canLand && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/restore`, {}))}>Reopen</button>}
 				{canLand && LIVE.has(a.status) && (
 					<button className="primary" disabled={land.busy || !!queued || a.headSha === a.baseSha} onClick={landIt}>
 						{land.busy ? "Landing…" : queued ? "Waiting to land" : "Land this"}
@@ -208,7 +271,9 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			{a.checks.length > 0 && <ul className="checks">{a.checks.map((c) => <li key={c.name} className={c.status}><strong>{c.status === "pass" ? "✓" : "✕"}</strong> {c.name} <span className="dim">{c.detail}</span></li>)}</ul>}
 
 			<h3>Why</h3>
-			<Why decisions={decisions} empty="This agent has not recorded any decisions yet." />
+			<Why decisions={decisions} empty="This agent has not recorded any decisions yet."
+				answer={LIVE.has(a.status) ? (q, body) => api("POST", `/p/${slug}/attempts/${a.id}/respond`, { kind: "answer", question: q.id, body, by: "human", bringBack: !!a.hosted && a.hosted !== "starting" && a.hosted !== "running" }) : undefined} />
+			{LIVE.has(a.status) && canLand && <Respond a={a} state={state} />}
 
 			<div className="row section-head">
 				<h3>Session</h3><span className="spacer" />
@@ -254,7 +319,15 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 	if (!intent) return <main className="page narrow"><p className="error">No intent I{intentId} in this project.</p></main>;
 	const attempts = state.attempts.filter((a) => a.intentId === intentId);
 	const recons = state.reconciliations.filter((r) => r.intentId === intentId);
-	const landing = state.landings.find((l) => l.intentId === intentId);
+	const landing = state.landings.find((l) => l.intentId === intentId && !l.revertOf && !l.revertedBy);
+	const reverts = state.landings.filter((l) => l.intentId === intentId && l.revertOf);
+	const [editing, setEditing] = useState(false);
+	const act = useAction();
+	const abandon = () => { if (window.confirm(`Abandon I${intent.id}? Its ${attempts.filter((a) => LIVE.has(a.status)).length} live attempt(s) are abandoned too and their agents stopped.`)) act.run(() => api("POST", `/p/${state.project.slug}/intents/${intent.id}/abandon`, {})); };
+	const revert = () => {
+		const reason = window.prompt(`Take I${intent.id} back out of trunk? Trunk gets a new commit that undoes it, and the intent opens again.\n\nWhy? (kept with the intent)`);
+		if (reason?.trim()) act.run(() => api("POST", `/p/${state.project.slug}/landings/${landing!.sha}/revert`, { by: "human", reason }));
+	};
 	return (
 		<main className="page">
 			<div className="intent-head" style={{ borderLeftColor: intentColor(intent.id) }}>
@@ -262,10 +335,17 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 					<h1><span className="mono" style={{ color: intentColor(intent.id) }}>I{intent.id}</span> {intent.title}</h1>
 					<span className={`chip ${intent.status}`}>{intent.status}</span>
 					<span className="spacer" />
+					{intent.status === "open" && <button onClick={() => setEditing(!editing)}>{editing ? "Close" : "Edit"}</button>}
+					{intent.status === "open" && <button disabled={act.busy} onClick={abandon}>Abandon</button>}
 					{intent.status === "open" && <button onClick={() => setJoining(!joining)}>{joining ? "Close" : "Add an agent"}</button>}
+					{landing && <button disabled={act.busy} onClick={revert}>{act.busy ? "Reverting…" : "Revert landing"}</button>}
 				</div>
-				<p className="goal">{intent.goal}</p>
-				{intent.acceptance && <p className="small"><strong>Acceptance:</strong> {intent.acceptance}</p>}
+				{act.error && <p className="error">{act.error}</p>}
+				{editing ? <EditIntent intent={intent} slug={state.project.slug} done={() => setEditing(false)} /> : <>
+					<p className="goal">{intent.goal}</p>
+					{intent.acceptance && <p className="small"><strong>Acceptance:</strong> {intent.acceptance}</p>}
+				</>}
+				{reverts.map((r) => <p key={r.sha} className="warn small">A landing of this intent was taken back out of trunk as <span className="mono">{short(r.sha)}</span> by {r.agent}, {ago(r.at)}. The reason is in that attempt's decisions.</p>)}
 				{landing && state.project.contextRemote && <p className="small dim">Its decisions and session transcript are committed to the context repo: <span className="mono">{state.project.contextRemote}</span> under <span className="mono">intents/{intent.id}/</span></p>}
 				{landing && <p className="small">Landed on trunk as <span className="mono">{short(landing.sha)}</span> from attempt {landing.attemptId} ({landing.agent}), {ago(landing.at)}. <Link to={`/p/${state.project.slug}/why?path=${encodeURIComponent(landing.files[0] ?? "")}`}>See it in the code</Link></p>}
 				{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} hosting={state.project.hosting} />}
