@@ -34,12 +34,63 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
    - Done: real runs through an AI Gateway named `braid` (Unified Billing, provider keys held in the gateway). Hosted Claude Code and Codex each completed an intent, concurrently, waiting for verification before marking ready. An agent can be brought back to an attempt to reconcile a conflicted landing or to fix failed checks. Claude reconciliation also goes through the gateway.
    - Done, the acceptance test: three hosted agents changed the same tag. The second landing conflicted and Codex was brought back and resolved it through the tools; the third conflicted and was resolved by the model, on Workers AI and, on a further conflict, by Claude.
    - Found by that test: Codex's first resolution was its own file unchanged (its edit command had failed), Braid landed it, and trunk lost the other intent's change while the rationale claimed both survived. A resolution identical to one side is now refused unless `one_sided` is set, and the image has Python. The deeper gap remains: a resolution is not run before it lands (step 5's landing queue).
-   - Open: bringing an agent back to fix failed checks is not tested with a real failure. Nothing brings an agent back automatically. Not yet deployed.
+   - Done: deployed, and checked there on October 4, 2026, including bringing an agent back to fix a commit with a failing test.
+   - Open: nothing brings an agent back automatically.
    - Acceptance test, which also closes the two unverified items below: start two hosted agents on intents that edit the same lines, land one, then land the other so it conflicts. The agent reconciles the first conflict with the `reconciliation` and `resolve` tools. A second conflict is resolved with "Reconcile with a model", first on Workers AI (no key needed), then on Claude once `ANTHROPIC_API_KEY` is set, which hosted Claude Code agents need anyway.
 5. **Agents that coordinate.** A planner that splits a goal into intents, a reviewer agent that judges attempts against acceptance, and a landing queue that re-verifies after each landing.
 6. **Semantic collisions.** After each landing, re-run the other attempts' checks against the new trunk, so cross-file breakage is caught by execution.
 
 Items 2 and 3 are the direct answers to the competition brief's questions about tracking why a change was made and how to review everything agents produce.
+
+### Revised order after independent review (October 4, 2026)
+
+Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra (code and product), a fresh Claude Opus session as competition judge and engineer, and a fresh Claude Opus session using the local instance in a browser as a first-time developer and designer. They agreed that landing cannot yet be trusted and that a person cannot answer an agent, and that both come before the planner and reviewer agent. This order replaces steps 5 and 6 above. Findings marked (unchecked) have not been confirmed against the code; the rest have.
+
+1. **Trustworthy landing.**
+   - Pin the landing to the verified commit. Landing fetches the attempt branch fresh (`land.ts`), so a push between review and landing lands unseen code. Pin the trunk and attempt commits a saved resolution was written against too, and reject it when either has moved.
+   - Require a pass, or an explicit force. Only a finished `fail` blocks today: queued, running, errored and missing runs land, and a resolved reconciliation lands with the gate forced off. An attempt can also change its own checks in `braid.json`; required checks should come from trunk.
+   - Verify the merged result before it reaches trunk. This is the landing queue from step 5 and it also covers step 6.
+   - Hold landings while trunk is red.
+   - A verification run that dies mid-way leaves `busy` set in the runner for good, so that ref is never verified again and running it again does not help. Expire it. The preview tar is also read into memory with no cap.
+   - Creating a project removes any existing repository named `<slug>--trunk`. With two instances on one namespace, reusing a slug destroys a live trunk. Refuse when the repository exists.
+   - Conflicted files are matched by file name plus both sides' contents. Two same-named files with identical contents on both sides get the first resolution for both. Merge by full path.
+   - Abandoning or superseding an attempt does not stop its hosted agent, and its tools and credentials keep working. Stop the agent and refuse tools and credentials on a finished attempt.
+   - A crash between pushing trunk and recording the landing leaves git and the project's record out of step, and a retry says there is nothing to land. A failed copy to the context repo is logged and never retried.
+   - (unchecked) A recompute rewrites whole attempt rows from an earlier snapshot, so a claim or an abandon made while it runs can be undone.
+   - An attempt opts itself into reading project state through its own `braid.json` (`preview.api`). Take the flag from trunk.
+   - A hosted agent can call any path under the gateway, so any provider or model, with no budget or limit on how many run at once.
+2. **A person can respond.**
+   - "Send back with a note" on an attempt: it reaches the agent (brought back if hosted), and is kept as why.
+   - Answer an agent's question; message an agent. Agents can message each other, people cannot.
+   - Confirmation or undo on land and abandon. Abandon or edit an intent from the UI (the route exists, no button). Revert a landing.
+   - Acceptance is shown as prose and nothing checks an attempt against it. Landing accepts an attempt that is still `working`.
+3. **Reconciliation by region.**
+   - The model must return whole files, capped at 16,000 output tokens (8,000 on Workers AI). `project.ts` is 67 kB, so a conflict there cannot be resolved by the model, and that is the file the demo will collide on. Resolve each conflicted region and assemble the file on the server. Same for agents, which have to send the whole file in `resolve`.
+   - The editor is a 14-row text box pre-filled with trunk's file: no conflict markers, no base, no jump to the conflict. Show markers and the base, and show the merged diff after resolution.
+   - "Land this" stays the main button on a conflicted attempt under the open reconciliation. An open reconciliation shows only as a chip and one activity line.
+   - Lockfile conflicts go to a hand merge; regenerate the lockfile. A rename shows as delete plus edit and cannot be reconciled in the UI.
+4. **First ten minutes.**
+   - The UI copies `npx braid join ...`, which fails: the package is private and unpublished. The brief written into `BRAID.md` hard-codes the local path to `cli/braid.mjs`. "Clone trunk" gives a URL with no way to authenticate. The empty-project form points at `braid init`, which creates the project again.
+   - The home page does not say what Braid is. Rows of same-named projects look identical because the slug is not shown. The braid graph has no caption and no links. The page title is always "Braid".
+   - A public read-only view of the `braid` project, and the live URL and a screenshot at the top of the README before the prerequisites.
+   - Demo data with real verification and sessions: the `pnpm sim` projects show "not run yet" and "No session recorded" everywhere, because the starter app has no checks.
+   - Phone width: project, intent and Why pages are 820 to 1,330 px wide at 390 px.
+   - A "needs you" view: ready, conflicted and failed attempts in one place. Activity has no links and no paging.
+   - CLI: no descriptions in usage, `braid peek` outside an attempt says "attempt undefined not found". Sign-in is a browser prompt. Blame lines cannot be reached by keyboard. No `h1` on project or Why pages; chips are 11 px. The file tree is a flat list with no search, and there is no commit history view.
+5. **Why by line.**
+   - Clicking a line shows every decision the attempt recorded for that file. Link a line to the decision and the moment in the session that produced it.
+   - The Why view replays recorded landings only, so a change pushed to trunk outside Braid is shown with stale attribution. Attribute outside changes.
+   - Decisions are long paragraphs stacked above the diff; put the change and its evidence first. `record` accepts a title with no body or files. A landed or abandoned attempt can still record. Nothing requires any why before `ready` (a forced record invites filler, so prefer tying why to lines over making it mandatory).
+   - `by` on landings is a string the client sends: there are no people behind the one admin token.
+   - A check's `detail` is not redacted before it is committed to the context repo.
+6. **Planner and reviewer agent**, with whatever time is left, then the video.
+
+Also from the reviews:
+
+- Tests cover git analysis, redaction, capture and the tar reader. Nothing tests the project object, landing, the access guard or the two gateways' allow-lists.
+- Scale: landing fetches full history of trunk and the attempt into memory. Project state sends every decision and every reconciliation's full file contents on each change. A conflict in large files can exceed the row size limit.
+- Reviewers' suggestions to stop: more preview special cases, more redaction patterns, more session capture, export and import, and the Workers AI reconciliation path (an 8,000-token model writing whole files). Decision: keep what is built, do not extend it.
+- "Behind" counts commits but the UI says landings. `wrangler.jsonc` carries the author's account id. Running Braid needs Workers Paid, Docker and Artifacts access, so a judge cannot run it without those.
 
 ### Also needed for the submission
 
