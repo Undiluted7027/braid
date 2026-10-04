@@ -1,3 +1,4 @@
+import { RunChip, runFor } from "./Verify";
 import { useState, type FormEvent } from "react";
 import type { Attempt, Intent, State } from "../shared/types";
 import { api, ago, intentColor, short, useNow } from "./api";
@@ -64,6 +65,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 			<span className={`chip ${a.status}`}>{a.status}</span>
 			<span className="dim small">{a.files.length} file{a.files.length === 1 ? "" : "s"} · {decisions} decision{decisions === 1 ? "" : "s"}</span>
 			<span className="spacer" />
+			{LIVE.has(a.status) && <RunChip run={runFor(state, a.id)} head={a.headSha} />}
 			{LIVE.has(a.status) && a.behind > 0 && <span className="chip quiet" title="Landings on trunk since this attempt's base">{a.behind} behind</span>}
 			{LIVE.has(a.status) && a.trunkConflicts.length > 0 && <span className="chip conflict">conflicts with trunk</span>}
 			{conflicts.size > 0 && <span className="chip conflict">will conflict with {[...conflicts].join(", ")}</span>}

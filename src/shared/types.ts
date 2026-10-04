@@ -98,10 +98,20 @@ export interface Landing {
 }
 export interface Activity { id: number; at: number; kind: string; actor: string; text: string; intentId: number | null; attemptId: string | null }
 export interface ProjectInfo { slug: string; name: string; description: string; repo: string; remote: string; branch: string; head: string; contextRemote: string | null; llm: string | null }
+/** One command run in the sandbox for a commit. `tail` is the end of its output. */
+export interface RunStep { name: string; command: string; status: "running" | "pass" | "fail"; exitCode: number | null; ms: number; tail: string }
+/** A verification of one commit of an attempt (or of trunk): what Braid ran and what happened. */
+export interface Run {
+	id: number; ref: string; sha: string;
+	status: "queued" | "running" | "pass" | "fail" | "error" | "superseded";
+	steps: RunStep[]; preview: boolean; nothingToRun: boolean; error: string | null; startedAt: number; finishedAt: number | null;
+}
 export interface State {
 	/** Set when the instance has an admin token: the key that lets a sandboxed preview frame load each ref. */
 	previewKeys?: Record<string, string>;
 	project: ProjectInfo;
+	/** The latest run for each ref (attempt id or "trunk"). */
+	runs: Run[];
 	intents: Intent[];
 	attempts: Attempt[];
 	decisions: Decision[];

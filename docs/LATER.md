@@ -13,9 +13,8 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
 - **The demo subject is a toy.** Everything has run on a 60-line counter app with no build, tests or dependencies.
 - **"Why" depends on agents volunteering it.** Decisions are whatever the agent chose to record. What it read, tried and abandoned is not captured.
 - **Conflict detection is textual.** It predicts line-level merge conflicts per file. Two changes that break each other across different files are invisible.
-- **Review is still diff-reading.** Nothing runs the code, so choosing which attempt ships has no evidence behind it.
 - **Humans drive everything.** A person opens intents, starts agents in terminals, and clicks land.
-- **It barely uses the platform.** Sandbox, Workers Builds and Previews, and Queues are untouched.
+- **It barely uses the platform.** Workers Builds and Previews, and Queues are untouched. (Containers are now used for verification.)
 
 ### What to build
 
@@ -27,6 +26,8 @@ As of October 3, 2026 the core loop works locally on a toy project. Submission i
    - Done: capture is narrowed and redacted. Agents start with a scrubbed environment; command output is stored as a status line (plus a short tail for git, test and build commands); text is redacted in the launcher and again on the server; the committed transcript keeps only each result's status line; `sync` no longer returns a token, the clone has a read-only `trunk` remote instead.
    - Open: agents not started by the launcher leave only their Braid calls. The Why view does not yet link a line of code to the moment in the session that produced it. Agents still run with the user's own file access; real confinement comes with hosted agents (item 4).
 3. **Evidence-based review.** Run each attempt's tests and build in Cloudflare Sandbox on every push, and give every attempt a real deployed preview. Compare then shows results side by side.
+   - Done: every commit of an attempt, and trunk after each landing, is run in a fresh container (install, typecheck, lint, test, build, or `braid.json`). The sandbox has no Internet and no credentials; it reaches only its own repository (read) and the npm registry (read) through Worker gateways, checked from inside. Results show per step in the attempt view and on the board, reach the agent in `checkpoint` and `heads_up`, and block `ready` and landing on a failed commit unless forced. Build output is saved and served as the preview.
+   - Open: previews of apps that need a backend (Braid's own UI loads but cannot reach an API). Only Node projects. A run that dies mid-way stays "running" until someone runs it again. Not yet run on a deployed Worker.
 4. **Agents hosted on Cloudflare.** Start agents from the UI in Sandbox, so opening an intent is enough to get attempts.
 5. **Agents that coordinate.** A planner that splits a goal into intents, a reviewer agent that judges attempts against acceptance, and a landing queue that re-verifies after each landing.
 6. **Semantic collisions.** After each landing, re-run the other attempts' checks against the new trunk, so cross-file breakage is caught by execution.
@@ -43,7 +44,7 @@ Items 2 and 3 are the direct answers to the competition brief's questions about 
 ## Not built yet
 
 - **Hosted agents.** Agents run wherever you start them. Running them in Cloudflare Sandbox, started from the UI, is not built.
-- **Previews for projects with a build step.** Previews serve files straight from the attempt's repo, so only no-build projects are runnable.
+- **Previews for apps with a backend.** A built preview is static files; nothing runs the app's server.
 - **Reconciling delete-versus-edit in the UI.** Currently the agent has to merge trunk with git.
 - **Semantic overlap detection.** Prediction is per file, by three-way line merge. Two changes in different files that break each other are not caught.
 

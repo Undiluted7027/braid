@@ -8,9 +8,10 @@ import { commitFiles, land, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
+import type { RunJob, Runner } from "./runner";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Intent, JoinResult, Landing, Overlap, Reconciliation, SessionEvent, State,
+	Intent, JoinResult, Landing, Overlap, Reconciliation, Run, SessionEvent, State,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string };
@@ -66,6 +67,8 @@ export class Project extends DurableObject<BraidEnv> {
 				files TEXT, reconciled INTEGER, at INTEGER);
 			CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT, at INTEGER, kind TEXT, tool TEXT, text TEXT);
 			CREATE INDEX IF NOT EXISTS session_attempt ON session (attempt_id, id);
+			CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, sha TEXT, status TEXT, steps TEXT, preview INTEGER,
+				nothing_to_run INTEGER, error TEXT, started_at INTEGER, finished_at INTEGER);
 			CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, kind TEXT, actor TEXT, text TEXT, intent_id INTEGER, attempt_id TEXT);
 		`);
 	}
@@ -226,6 +229,9 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const repo of [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
 			try { await this.host.remove(repo); } catch {}
 		}
+		for (const { ref } of this.rows<{ ref: string }>("SELECT DISTINCT ref FROM runs")) {
+			try { await this.runner(ref)?.clear(); } catch {}
+		}
 		await this.ctx.storage.deleteAll();
 	}
 
@@ -236,6 +242,7 @@ export class Project extends DurableObject<BraidEnv> {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
 				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env),
 			},
+			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
 			intents: this.intents(),
 			attempts: this.attempts().map((a) => ({ ...a, now: this.latestEvent(a.id) })),
 			decisions: this.rows("SELECT * FROM decisions ORDER BY id").map(this.toDecision),
@@ -373,6 +380,10 @@ export class Project extends DurableObject<BraidEnv> {
 			if (!LIVE.has(a.status)) continue;
 			live.push(await this.refresh(a, trunkLog));
 		}
+		// Every new commit of an attempt is verified in a sandbox. Queued here, it runs on its own.
+		for (const a of live) {
+			if (a.headSha !== a.baseSha) await this.verify(a.id).catch((e) => console.error("verify", a.id, e));
+		}
 
 		const next = new Map<string, Overlap>();
 		const put = (o: Overlap) => {
@@ -450,6 +461,74 @@ export class Project extends DurableObject<BraidEnv> {
 				}
 			} else await this.recompute();
 		});
+	}
+
+	// ── verification: each commit of an attempt is run in a sandbox ──────────
+
+	private toRun = (r: any): Run => ({
+		id: r.id, ref: r.ref, sha: r.sha, status: r.status, steps: JSON.parse(r.steps), preview: !!r.preview, nothingToRun: !!r.nothing_to_run,
+		error: r.error, startedAt: r.started_at, finishedAt: r.finished_at,
+	});
+	private latestRun(ref: string): Run | null {
+		const r = this.rows("SELECT * FROM runs WHERE ref = ? ORDER BY id DESC LIMIT 1", ref)[0];
+		return r ? this.toRun(r) : null;
+	}
+	private runner(ref: string) {
+		const ns = this.env.RUNNER;
+		return ns ? (ns.get(ns.idFromName(`${this.meta("slug")}/${ref}`)) as unknown as Runner) : null;
+	}
+
+	/** Verify the current commit of an attempt (or of trunk) unless that commit already has a run. */
+	async verify(ref: string, again = false): Promise<Run | null> {
+		this.requireProject();
+		const runner = this.runner(ref);
+		if (!runner) return null;
+		const a = ref === "trunk" ? null : this.attempt(ref);
+		const target = a ? { repo: a.repo, remote: a.remote, sha: a.headSha } : { repo: this.trunk, remote: this.meta("remote"), sha: this.meta("head") };
+		if (!target.sha) return null;
+		const last = this.latestRun(ref);
+		if (!again && last?.sha === target.sha) return last;
+		const runId = this.rows<{ id: number }>("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at) VALUES (?, ?, 'queued', '[]', 0, 0, NULL, ?) RETURNING id", ref, target.sha, now())[0].id;
+		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: this.branch, sha: target.sha, runId };
+		await runner.start(job);
+		this.broadcast();
+		return this.latestRun(ref);
+	}
+
+	/** Progress and results, reported by the runner as each step starts and ends. */
+	async runUpdate(runId: number, patch: Partial<Run>) {
+		const row = this.rows("SELECT * FROM runs WHERE id = ?", runId)[0];
+		if (!row) return;
+		const run = { ...this.toRun(row), ...patch };
+		this.sql.exec("UPDATE runs SET status = ?, steps = ?, preview = ?, nothing_to_run = ?, error = ?, finished_at = ? WHERE id = ?",
+			run.status, json(run.steps), run.preview ? 1 : 0, run.nothingToRun ? 1 : 0, run.error ?? null, run.finishedAt ?? null, runId);
+		if (!patch.finishedAt || run.status === "superseded") return this.broadcast();
+
+		const a = run.ref === "trunk" ? null : this.attempt(run.ref);
+		const what = a ? `attempt ${a.id} (${a.agent})` : "trunk";
+		const checks = run.steps.filter((s) => s.name !== "clone" && s.name !== "install");
+		const summary = run.status === "error" ? `could not run: ${run.error}`
+			: run.nothingToRun ? "nothing to run" : (checks.length ? checks : run.steps).map((s) => `${s.name} ${s.status === "pass" ? "✓" : "✗"}`).join(" · ");
+		this.note("verify", "braid", `Verified ${what} at ${short(run.sha)}: ${summary}`, a?.intentId ?? null, a?.id ?? null);
+		// The agent hears about a failure the next time it talks to Braid, with the output that shows why.
+		if (a && run.status === "fail" && LIVE.has(a.status) && a.headSha === run.sha) {
+			this.signal(a.id, "checks-failed", {
+				commit: short(run.sha),
+				failed: run.steps.filter((s) => s.status === "fail").map((s) => ({ step: s.name, command: s.command, exit_code: s.exitCode, output: s.tail.slice(-2000) })),
+				note: "Braid ran this commit in a clean sandbox and these steps failed. Fix them, push, and checkpoint again.",
+			});
+		}
+	}
+
+	/** What an agent is told about the verification of its current commit. */
+	private verification(a: Attempt) {
+		const run = this.latestRun(a.id);
+		if (!run) return { status: "not run" };
+		if (run.sha !== a.headSha) return { status: "pending", note: "your latest commit has not been verified yet" };
+		return {
+			status: run.status, commit: short(run.sha), steps: run.steps.map((s) => ({ step: s.name, status: s.status, exit_code: s.exitCode })),
+			...(run.status === "queued" || run.status === "running" ? { note: "still running; a failure will arrive in heads_up" } : {}),
+		};
 	}
 
 	// ── sessions: the record of what each agent actually did ─────────────────
@@ -557,7 +636,7 @@ export class Project extends DurableObject<BraidEnv> {
 				if (args.summary) { a.summary = redact(String(args.summary)); this.saveAttempt(a); }
 				return {
 					head: a.headSha, changed: a.files.map((f) => `${f.status} ${f.path}`), behind_trunk_by: a.behind,
-					would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id),
+					would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a),
 				};
 			}
 			case "peek": {
@@ -587,11 +666,15 @@ export class Project extends DurableObject<BraidEnv> {
 				await this.serial(() => this.recompute());
 				const a = this.attempt(me.id);
 				if (a.headSha === a.baseSha) throw new BraidError("nothing pushed yet: push your commits to the attempt remote before marking ready");
+				const run = this.latestRun(a.id);
+				if (run?.sha === a.headSha && run.status === "fail") {
+					throw new BraidError(`commit ${short(a.headSha)} failed verification (${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}). Fix it and push before marking ready; \`checkpoint\` shows the result.`);
+				}
 				if (a.status === "working") a.status = "ready";
 				if (args.summary) a.summary = redact(String(args.summary));
 				this.saveAttempt(a);
 				this.note("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id);
-				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id) };
+				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a) };
 			}
 			case "reconciliation": {
 				const r = this.openRecon(me.id);
@@ -644,9 +727,10 @@ export class Project extends DurableObject<BraidEnv> {
 			"2. `claim` the paths you expect to change before editing, so others hear about it early.",
 			"3. `record` every real decision as you make it (what you chose, what you rejected, what you assumed). This is the project's memory of why.",
 			`4. Commit and \`git push origin HEAD:${this.branch}\` often, then \`checkpoint\`. Braid answers with overlaps and predicted conflicts, including the other agent's reasoning.`,
-			"5. Read `heads_up` on every response. If another intent conflicts with yours, adapt, or `message` that agent.",
-			"6. `ready` with a summary when the goal is met. A human or reviewer lands it.",
-			"7. If landing conflicts, `reconciliation` gives you both sides and why each exists; answer with `resolve`.",
+			"5. Braid runs every commit you push in a clean sandbox: install, then the project's typecheck, tests and build. `checkpoint` reports the result under `verification`, and a failure arrives in `heads_up` with the output. Fix failures before you call `ready`.",
+			"6. Read `heads_up` on every response. If another intent conflicts with yours, adapt, or `message` that agent.",
+			"7. `ready` with a summary when the goal is met. A human or reviewer lands it.",
+			"8. If landing conflicts, `reconciliation` gives you both sides and why each exists; answer with `resolve`.",
 		].filter((l) => l !== "").join("\n");
 	}
 
@@ -675,7 +759,7 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	/** Land an attempt on trunk. On conflict, open a reconciliation that carries both sides' reasoning. */
-	land(attemptId: string, by = "human") {
+	land(attemptId: string, by = "human", force = false) {
 		return this.serial(async () => {
 			this.requireProject();
 			await this.recompute();
@@ -684,6 +768,10 @@ export class Project extends DurableObject<BraidEnv> {
 			if (intent.status !== "open") throw new BraidError(`I${intent.id} is already ${intent.status}`);
 			if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
 			if (a.headSha === a.baseSha) throw new BraidError(`attempt ${a.id} has no commits to land`);
+			const run = this.latestRun(a.id);
+			if (!force && run?.sha === a.headSha && run.status === "fail") {
+				throw new BraidError(`attempt ${a.id} failed verification at ${short(a.headSha)} (${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}); land it anyway with force`, 409);
+			}
 
 			const resolvedRow = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id DESC LIMIT 1", a.id)[0];
 			const recon = resolvedRow ? this.toRecon(resolvedRow) : null;
@@ -740,6 +828,8 @@ export class Project extends DurableObject<BraidEnv> {
 				}
 			}
 			await this.recompute();
+			// Trunk is verified too: a merge of two attempts that each passed can still be broken.
+			await this.verify("trunk").catch((e) => console.error("verify trunk", e));
 			return { landed: true as const, sha: result.sha };
 		});
 	}
@@ -777,7 +867,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.note("reconcile", by, `${by} resolved R${reconId}: ${rationale.trim()}`, r.intentId, r.attemptId);
 		const a = this.attempt(r.attemptId);
 		if (a.status === "conflicted") { a.status = "ready"; this.saveAttempt(a); }
-		const landed = await this.land(r.attemptId, by);
+		const landed = await this.land(r.attemptId, by, true);
 		return { resolved: true, ...landed };
 	}
 
@@ -831,10 +921,18 @@ export class Project extends DurableObject<BraidEnv> {
 		return head ? listTree(this.host, repo, head.treeHash) : [];
 	}
 
-	async raw(ref: string, path: string): Promise<Uint8Array | null> {
+	/** A file for the preview of `ref`: from the build Braid made of its current commit if there is one, otherwise straight from the repository. */
+	async raw(ref: string, path: string): Promise<{ bytes: Uint8Array; path: string; built: boolean } | null> {
 		this.requireProject();
 		const { repo, ref: gitRef } = this.where(ref);
-		return this.host.readFile(repo, gitRef, path);
+		const head = ref === "trunk" ? this.meta("head") : this.attempt(ref).headSha;
+		const built = this.rows("SELECT id FROM runs WHERE ref = ? AND sha = ? AND preview = 1 ORDER BY id DESC LIMIT 1", ref, head)[0];
+		if (built) {
+			const file = await this.runner(ref)!.file(path);
+			return file ? { bytes: new Uint8Array(file.body), path: file.path, built: true } : null;
+		}
+		const bytes = await this.host.readFile(repo, gitRef, path);
+		return bytes ? { bytes, path, built: false } : null;
 	}
 
 	/** A trunk file with line-level why: which landing (and so which intent) last wrote each line. */

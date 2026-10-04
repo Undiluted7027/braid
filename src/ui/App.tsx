@@ -1,3 +1,4 @@
+import { RunChip, runFor } from "./Verify";
 import { useEffect, useState, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import { api, ago, navigate, useAsync, useProject } from "./api";
 import { IntentPage } from "./Intent";
@@ -86,6 +87,7 @@ function ProjectShell({ slug, rest }: { slug: string; rest: string[] }) {
 				</nav>
 				<span className="spacer" />
 				<span className="mono dim">trunk {state.project.head ? state.project.head.slice(0, 7) : "empty"}</span>
+				<RunChip run={runFor(state, "trunk")} head={state.project.head} />
 				<span className={`live ${live ? "on" : ""}`}>{live ? "live" : "reconnecting"}</span>
 			</header>
 			{tab === "why" ? <WhyPage state={state} /> : tab === "intent" ? <IntentPage state={state} intentId={Number(rest[1])} /> : <ProjectPage state={state} />}

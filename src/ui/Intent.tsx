@@ -1,3 +1,4 @@
+import { runFor, Verification } from "./Verify";
 import { useEffect, useState } from "react";
 import type { Attempt, Conflict, Decision, DiffFile, Reconciliation, State } from "../shared/types";
 import { api, ago, intentColor, short, useAsync } from "./api";
@@ -125,6 +126,14 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const [frame, setFrame] = useState(0);
 	useEffect(() => setFrame((f) => f + 1), [a.headSha]);
 	const land = useAction(), drop = useAction();
+	const run = runFor(state, a.id);
+	const landIt = () => land.run(async () => {
+		try { await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human" }); } catch (e) {
+			// A commit that failed verification needs a second, deliberate yes.
+			if (!/failed verification/.test((e as Error).message) || !window.confirm(`${(e as Error).message}.\n\nLand it anyway?`)) throw e;
+			await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true });
+		}
+	});
 	const byId = new Map(state.attempts.map((x) => [x.id, x]));
 	const collisions = state.overlaps.filter((o) => o.a === a.id || o.b === a.id).map((o) => ({ ...o, other: byId.get(o.a === a.id ? o.b : o.a)! })).filter((o) => o.other);
 
@@ -136,7 +145,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				<span className="spacer" />
 				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {}))}>Abandon</button>}
 				{canLand && LIVE.has(a.status) && (
-					<button className="primary" disabled={land.busy || a.headSha === a.baseSha} onClick={() => land.run(() => api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human" }))}>
+					<button className="primary" disabled={land.busy || a.headSha === a.baseSha} onClick={landIt}>
 						{land.busy ? "Landing…" : "Land this"}
 					</button>
 				)}
@@ -146,6 +155,11 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			{a.summary && <p>{a.summary}</p>}
 
 			{LIVE.has(a.status) && a.trunkConflicts.length > 0 && <p className="warn">Landing now would conflict with trunk on <span className="mono">{a.trunkConflicts.join(", ")}</span>. Braid will open a reconciliation.</p>}
+			{a.headSha !== a.baseSha && <>
+				<h3>Verified by Braid</h3>
+				<Verification slug={slug} refName={a.id} run={run} head={a.headSha} />
+			</>}
+			{a.checks.length > 0 && <h3>Reported by the agent</h3>}
 			{a.checks.length > 0 && <ul className="checks">{a.checks.map((c) => <li key={c.name} className={c.status}><strong>{c.status === "pass" ? "✓" : "✕"}</strong> {c.name} <span className="dim">{c.detail}</span></li>)}</ul>}
 
 			<h3>Why</h3>
@@ -176,6 +190,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 
 			<div className="row section-head">
 				<h3>Preview</h3><span className="spacer" />
+				{run?.preview && run.sha === a.headSha && <span className="chip pass" title="Served from the build Braid made of this commit">built</span>}
 				<button onClick={() => setPreview(!preview)}>{preview ? "Hide" : "Run it"}</button>
 				<a className="button" href={previewUrl} target="_blank" rel="noreferrer">Open</a>
 			</div>
