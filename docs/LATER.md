@@ -72,14 +72,14 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Open: an agent started on someone's machine only hears a note if it is still running or is started again by hand; `braid join` has no "resume".
    - Open: a revert is pushed and then verified on trunk, not verified first. A reverted attempt cannot be landed again, because its commits are already in trunk's history; the intent needs a new attempt.
    - Open: acceptance is still prose. Nothing checks an attempt against it (the reviewer agent in item 6).
-3. **Reconciliation by region.** Done locally on October 4, 2026; not yet deployed.
+3. **Reconciliation by region.** Done and deployed on October 4, 2026.
    - Done: a resolution is one replacement per conflict, and Braid puts them in place (`assemble` in `gitops.ts`). The model is shown the merged file with numbered conflict blocks and unchanged stretches left out, and answers per conflict. Checked on a 51 kB, 3,000-line file with two conflicts and separate clean changes from each side: Claude resolved both in 16 seconds and every other line was kept.
    - Done: an agent's `reconciliation` tool returns the conflicts with a few lines around each (3 kB for that file) instead of three copies of the file; `full: true` adds the whole files. `resolve` takes `regions` or a whole `content`.
    - Done: hosted Codex, brought back to a conflict, answered with one replacement for the one conflicting line and it landed with both attributes. Its sandbox is stopped the moment the attempt lands, so its session ends with "stopped: the attempt is over" instead of its own last words.
    - Done: the one-sided guard also refuses an answer that takes the same side at every conflict.
    - Done: the editor works one conflict at a time: both sides, their base, the lines around, starting points (trunk's, the attempt's, both in either order, neither), and a switch to the whole file with markers. A resolved reconciliation shows what it changed in trunk's version. A conflicted attempt no longer shows "Land this".
    - Done: `package.json` is merged by key, so two attempts that each add a dependency do not conflict. A lockfile left in conflict is regenerated in a sandbox from the merged `package.json`, starting from trunk's lockfile, and the result is verified like any merge. Checked with npm: two attempts each added a dependency, the second landed with all of them locked and `npm ci` passing, and nobody touched the lockfile.
-   - Open: lockfile regeneration is checked for npm only; pnpm uses the same path with its own command and has not been run. yarn and bun are not handled.
+   - Open: lockfiles are regenerated for npm and pnpm. yarn and bun are not handled.
    - Open: a rename still shows as delete plus edit and cannot be reconciled in the UI.
    - Open: an open reconciliation shows on the project page only as a chip and one activity line (the "needs you" view in item 4).
    - Open: the state sent to the UI still carries full file contents for every open reconciliation; settled ones now carry only trunk's version and the result.
@@ -129,8 +129,8 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 ## Not verified yet
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
-- **Recovery paths in item 1.** A run interrupted mid-way, and a landing interrupted between the push and its record, are handled in code but were not forced to happen.
-- **Item 3 on the deployed instance.** Region resolutions, the model on a large file, the `package.json` merge and lockfile regeneration have only run locally.
+- **A landing interrupted between the push and its record.** Handled in code, never forced to happen. (An interrupted run did happen, during a deploy on October 4: it was reported as "could not run" and ran again when asked.)
+- **The region editor on the deployed instance.** It was used in Chrome locally; on the deployed instance resolutions went through the API, the model and a hosted agent.
 - **On the deployed instance: landing refused while a hosted agent is still working.** It ran locally; on the deployed instance my request arrived before the agent had pushed anything, so it was refused for having no commits instead.
 
 Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.
@@ -145,6 +145,7 @@ Checked on October 4, 2026:
   - A second conflict was reconciled with Claude through the gateway, and trunk verification passed afterwards.
 - Item 1 on the deployed instance, in a separate project (`dep-item1`, since deleted): a landing asked for before verification finished waited and landed by itself; an attempt that passed alone and failed when merged with trunk was refused with trunk untouched, and Claude Code, brought back, merged trunk, fixed it and it landed; a landing was refused for the wrong commit and when the attempt moved after the request; an attempt that removed the test script and added its own `braid.json` still had the test run; on a failing trunk a bystander was refused and a fix landed; a landed attempt's tools were refused; creating a project named after an existing repository was refused. The existing `braid` project loaded after the schema change.
 - Item 2 on the deployed instance, in a separate project (`dep-item2`, since deleted): an answer, a message and an intent edit all reached the agent's next tool response; feedback on a ready attempt sent it back and dropped its queued landing; abandon and reopen; a landing reverted with a later landing kept; hosted Codex, sent back with a note, came back, made the change, recorded how, and it landed. Also the item 1 checks that had only run locally: a resolved conflict was verified as a merge before it landed, a landing was cancelled, "Land now" landed without waiting, and abandoning an attempt stopped its running agent.
+- Item 3 on the deployed instance, in two separate projects (since deleted): Claude resolved two conflicts in a 68 kB, 4,000-line file in 25 seconds with every other line kept; a wrong number of replacements and one side at every conflict were refused; with npm and with pnpm, two attempts each added a dependency and the second landed with `package.json` merged by key, the lockfile regenerated in six seconds and the frozen install passing; hosted Claude Code, brought back to a conflict, answered with one replacement for the one line and it landed with both attributes.
 - Deployed at https://braid.undiluted7027.workers.dev: the push-event Workflow (a push with no `checkpoint` updated the attempt), sandbox runs and their isolation on Cloudflare's microVM, sign-in, the live socket, both kinds of preview, `ready` refused on a failed commit, and the forced-landing confirmation.
 
 The `braid` project now lives on the deployed instance. It was moved there with its intents, decisions, landings and sessions; the local instance has forgotten it.
