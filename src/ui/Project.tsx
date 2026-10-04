@@ -24,6 +24,32 @@ export function JoinCommand({ slug, intentId }: { slug: string; intentId: number
 	);
 }
 
+function TrunkRemote({ remote }: { remote: string }) {
+	const [copied, setCopied] = useState(false);
+	const [error, setError] = useState(false);
+	const copy = async () => {
+		setError(false);
+		try {
+			await navigator.clipboard.writeText(remote);
+			setCopied(true);
+			setTimeout(() => setCopied(false), 1500);
+		} catch {
+			setError(true);
+		}
+	};
+	return (
+		<section className="card">
+			<h2>Clone trunk</h2>
+			<p className="small dim">Use this git remote to clone the project’s code.</p>
+			<div className="row">
+				<code className="cmd">{remote}</code>
+				<button onClick={copy} aria-label="Copy trunk remote URL">{copied ? "Copied" : "Copy"}</button>
+			</div>
+			{error && <p className="error" role="alert">Could not copy. Select and copy the URL above.</p>}
+		</section>
+	);
+}
+
 function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const mine = state.overlaps.filter((o) => o.a === a.id || o.b === a.id);
 	const conflicts = new Set(mine.filter((o) => o.severity === "conflict").map((o) => (o.a === a.id ? o.b : o.a)));
@@ -106,6 +132,7 @@ export function ProjectPage({ state }: { state: State }) {
 					{done.map((i) => <IntentCard key={i.id} intent={i} state={state} />)}
 				</div>
 				<aside className="col-side">
+					<TrunkRemote remote={state.project.remote} />
 					<h2>Activity</h2>
 					<ol className="activity">
 						{state.activity.map((e) => (
