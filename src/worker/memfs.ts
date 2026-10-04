@@ -8,7 +8,8 @@ function fsError(code: string, path: string) {
 }
 
 class Stats {
-	constructor(private e: Entry) {}
+	private e: Entry;
+	constructor(e: Entry) { this.e = e; }
 	get size() { return this.e.kind === "file" ? this.e.data.byteLength : 0; }
 	get mtimeMs() { return this.e.mtimeMs; }
 	get ctimeMs() { return this.e.mtimeMs; }

@@ -1,7 +1,7 @@
 // Read-only git analysis over RepoHost: what an attempt changed, where its history
 // left trunk, and whether two concurrent changes to a file can be merged.
 import { diff3Merge } from "node-diff3";
-import type { RepoHost, TreeEntry } from "./host";
+import type { RepoHost, TreeEntry } from "./host.ts";
 
 export interface FileChange { path: string; status: "added" | "modified" | "deleted"; base: string | null; head: string | null }
 

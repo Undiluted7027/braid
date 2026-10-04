@@ -81,10 +81,11 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	const agentBusy = owner?.hosted === "starting" || owner?.hosted === "running";
 	const canBringBack = !!owner && state.project.hosting[owner.kind === "codex" ? "codex" : "claude"];
 
-	if (r.status === "resolved") {
+	if (r.status === "resolved" || r.status === "stale") {
 		return (
 			<section className="card recon resolved">
-				<h2>⚯ Reconciliation R{r.id} <span className="chip landed">resolved by {r.resolvedBy}</span></h2>
+				<h2>⚯ Reconciliation R{r.id} <span className={`chip ${r.status === "stale" ? "quiet" : "landed"}`}>{r.status === "stale" ? "not used" : `resolved by ${r.resolvedBy}`}</span></h2>
+				{r.status === "stale" && <p className="warn small">Trunk or the attempt moved before this resolution landed, so it was set aside. It was written by {r.resolvedBy}.</p>}
 				<p>{r.rationale}</p>
 				<p className="mono dim small">{r.conflicts.map((c) => c.path).join("  ")}</p>
 			</section>
@@ -142,12 +143,22 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	useEffect(() => setFrame((f) => f + 1), [a.headSha]);
 	const land = useAction(), drop = useAction(), halt = useAction();
 	const run = runFor(state, a.id);
+	// The commit on screen is the one that lands: if the attempt has moved since, Braid refuses.
 	const landIt = () => land.run(async () => {
-		try { await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human" }); } catch (e) {
-			// A commit that failed verification needs a second, deliberate yes.
-			if (!/failed verification/.test((e as Error).message) || !window.confirm(`${(e as Error).message}.\n\nLand it anyway?`)) throw e;
-			await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true });
+		try { await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", sha: a.headSha }); } catch (e) {
+			// Landing something that did not pass needs a second, deliberate yes.
+			if (!/with force/.test((e as Error).message) || !window.confirm(`${(e as Error).message.replace(/[.;] [Ll]and it anyway with force$/, "")}.\n\nLand it anyway, without verification?`)) throw e;
+			await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true, sha: a.headSha });
 		}
+	});
+	const queued = state.queue.find((q) => q.attemptId === a.id);
+	// A merge result only says something while trunk is still where the merge was made.
+	const candidate = state.candidates.find((c) => c.attemptId === a.id && c.attemptSha === a.headSha && c.trunkSha === state.project.head);
+	const mergeRun = candidate ? state.runs.find((r) => r.ref === `land:${a.id}` && r.sha === candidate.sha) ?? null : null;
+	const failing = run?.status === "fail" && run.sha === a.headSha ? "the failed checks" : mergeRun?.status === "fail" ? "the merge with trunk" : null;
+	const skipQueue = () => land.run(async () => {
+		if (!window.confirm(`Land attempt ${a.id} now, without waiting for verification?`)) return;
+		await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true, sha: a.headSha });
 	});
 	const byId = new Map(state.attempts.map((x) => [x.id, x]));
 	const collisions = state.overlaps.filter((o) => o.a === a.id || o.b === a.id).map((o) => ({ ...o, other: byId.get(o.a === a.id ? o.b : o.a)! })).filter((o) => o.other);
@@ -162,15 +173,24 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				{(a.hosted === "starting" || a.hosted === "running") && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}>Stop agent</button>}
 				{LIVE.has(a.status) && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {}))}>Abandon</button>}
 				{canLand && LIVE.has(a.status) && (
-					<button className="primary" disabled={land.busy || a.headSha === a.baseSha} onClick={landIt}>
-						{land.busy ? "Landing…" : "Land this"}
+					<button className="primary" disabled={land.busy || !!queued || a.headSha === a.baseSha} onClick={landIt}>
+						{land.busy ? "Landing…" : queued ? "Waiting to land" : "Land this"}
 					</button>
 				)}
 			</div>
 			{(land.error || drop.error || halt.error) && <p className="error">{land.error ?? drop.error ?? halt.error}</p>}
 			{a.hosted === "failed" && <p className="warn small">The hosted agent failed: {a.hostedDetail}</p>}
-			{LIVE.has(a.status) && run?.status === "fail" && run.sha === a.headSha && a.hosted !== "starting" && a.hosted !== "running" && state.project.hosting[a.kind === "codex" ? "codex" : "claude"] && (
-				<p className="row"><button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/rehost`, { task: "fix" }))}>Have {a.agent} fix the failed checks</button></p>
+			{queued && (
+				<div className="row landing-wait" role="status">
+					<span className="chip quiet">{queued.state === "verifying" ? "verifying the merge" : queued.state === "pushing" ? "landing" : "waiting to land"}</span>
+					<span className="small">Landing asked for by {queued.by}{queued.note ? `: ${queued.note}. It lands by itself when that is done.` : "."}</span>
+					<span className="spacer" />
+					{queued.state !== "pushing" && <button disabled={land.busy} onClick={skipQueue}>Land now</button>}
+					{queued.state !== "pushing" && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/cancel-landing`, { by: "human" }))}>Cancel landing</button>}
+				</div>
+			)}
+			{LIVE.has(a.status) && failing && a.hosted !== "starting" && a.hosted !== "running" && state.project.hosting[a.kind === "codex" ? "codex" : "claude"] && (
+				<p className="row"><button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/rehost`, { task: "fix" }))}>Have {a.agent} fix {failing}</button></p>
 			)}
 			<p className="small dim mono">base {short(a.baseSha)} → head {short(a.headSha)} · updated {ago(a.updatedAt)}{a.behind > 0 && LIVE.has(a.status) ? ` · ${a.behind} landing${a.behind === 1 ? "" : "s"} behind trunk` : ""}</p>
 			{a.summary && <p>{a.summary}</p>}
@@ -179,6 +199,10 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			{a.headSha !== a.baseSha && <>
 				<h3>Verified by Braid</h3>
 				<Verification slug={slug} refName={a.id} run={run} head={a.headSha} />
+			</>}
+			{LIVE.has(a.status) && candidate && mergeRun && <>
+				<h3>Merged with trunk at <span className="mono">{short(candidate.trunkSha)}</span></h3>
+				<Verification slug={slug} refName={`land:${a.id}`} run={mergeRun} head={candidate.sha} fixed />
 			</>}
 			{a.checks.length > 0 && <h3>Reported by the agent</h3>}
 			{a.checks.length > 0 && <ul className="checks">{a.checks.map((c) => <li key={c.name} className={c.status}><strong>{c.status === "pass" ? "✓" : "✕"}</strong> {c.name} <span className="dim">{c.detail}</span></li>)}</ul>}

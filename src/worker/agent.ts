@@ -17,7 +17,7 @@ export interface HostJob {
 	/** Why the agent is being started: a new attempt, or brought back to an attempt that needs something. */
 	task: "work" | "reconcile" | "fix";
 }
-interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string }
+interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string; kind: HostedKind }
 
 /** A hostname that exists only inside the sandbox: requests to it are answered by this Worker. */
 const BRAID_HOST = "braid.internal";
@@ -61,20 +61,29 @@ export class AgentOutbound extends WorkerEntrypoint<BraidEnv, OutboundProps> {
 			return fetch(new Request(request, { headers }));
 		}
 
-		// The model. The key or gateway token is added here and whatever placeholder the agent sent is dropped.
+		// The model: only the calls this agent makes to its own provider, so the sandbox cannot spend on
+		// anything else the gateway or the key could reach. The key or gateway token is added here and
+		// whatever placeholder the agent sent is dropped.
 		const headers = new Headers(request.headers);
-		if (useGateway(env) && url.hostname === GATEWAY_HOST && (url.pathname === gatewayPath(env) || url.pathname.startsWith(`${gatewayPath(env)}/`))) {
+		const calls = p.kind === "claude" ? /^\/v1\/messages(\/count_tokens)?$/ : p.kind === "codex" ? /^\/(v1\/)?responses$/ : null;
+		const provider = p.kind === "claude" ? "anthropic" : "openai", modelHost = p.kind === "claude" ? "api.anthropic.com" : "api.openai.com";
+		const viaGateway = useGateway(env) && url.hostname === GATEWAY_HOST && url.pathname.startsWith(`${gatewayPath(env)}/${provider}/`);
+		if (viaGateway || (!useGateway(env) && url.hostname === modelHost)) {
+			const path = viaGateway ? url.pathname.slice(`${gatewayPath(env)}/${provider}`.length) : url.pathname;
+			if (request.method !== "POST" || !calls?.test(path)) return refuse(`only this agent's model calls are reachable on ${url.hostname}`);
+		}
+		if (viaGateway) {
 			headers.delete("x-api-key");
 			headers.delete("authorization");
 			headers.set("cf-aig-authorization", `Bearer ${env.AI_GATEWAY_TOKEN}`);
 			return fetch(new Request(request, { headers }));
 		}
-		if (!useGateway(env) && url.hostname === "api.anthropic.com" && env.ANTHROPIC_API_KEY) {
+		if (!useGateway(env) && p.kind === "claude" && url.hostname === "api.anthropic.com" && env.ANTHROPIC_API_KEY) {
 			headers.delete("authorization");
 			headers.set("x-api-key", env.ANTHROPIC_API_KEY);
 			return fetch(new Request(request, { headers }));
 		}
-		if (!useGateway(env) && url.hostname === "api.openai.com" && env.OPENAI_API_KEY) {
+		if (!useGateway(env) && p.kind === "codex" && url.hostname === "api.openai.com" && env.OPENAI_API_KEY) {
 			headers.set("authorization", `Bearer ${env.OPENAI_API_KEY}`);
 			return fetch(new Request(request, { headers }));
 		}
@@ -100,7 +109,7 @@ const TASKS = {
 Landing this attempt conflicted with trunk: another intent changed the same lines. Call the braid \`reconciliation\` tool to get both versions, their base, and the intent and decisions behind the trunk side.
 Write a version of each conflicted file that satisfies BOTH intents, then call \`resolve\` with the resolutions and a rationale that says concretely how each side's intent survives. Record the decision. Do not start other work.`,
 	fix: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
-Braid ran your last commit in a clean sandbox and it failed. Call \`checkpoint\` to see which steps failed and their output, fix the cause, commit, push, checkpoint again, wait for verification to pass, then mark the attempt ready. Record what you changed and why.`,
+Braid ran your last commit in a clean sandbox and it failed, either on its own or once merged with trunk. Call \`checkpoint\` to see which steps failed and their output (\`verification\`, and \`merged_with_trunk\` inside it). If it is the merge that fails, merge trunk into your attempt first (see \`sync\`). Fix the cause, commit, push, checkpoint again, wait for verification to pass, then mark the attempt ready. Record what you changed and why.`,
 };
 
 // Stands in for an agent when checking the plumbing: it speaks, uses Braid's tools, commits, pushes and probes what it can reach.
@@ -155,10 +164,10 @@ export class AgentHost extends DurableObject<BraidEnv> {
 		await this.ctx.storage.setAlarm(Date.now());
 	}
 
-	async stop() {
+	async stop(why = "stopped by a person") {
 		const job = this.kv.get<HostJob>("job");
 		if (!job || this.kv.get("phase") === "done") return;
-		await this.finish(job, "stopped", "stopped by a person");
+		await this.finish(job, "stopped", why);
 	}
 
 	async clear() {
@@ -219,7 +228,7 @@ export class AgentHost extends DurableObject<BraidEnv> {
 		if (!container) throw new Error("no container is configured for hosted agents");
 		if (container.running) await container.destroy().catch(() => {});
 		const git = new URL(job.remote), env = this.env;
-		const props: OutboundProps = { slug: job.slug, gitHost: git.hostname, repo: job.repo, repoPath: git.pathname, trunkRepo: job.trunkRepo, trunkPath: new URL(job.trunkRemote).pathname, agentToken: job.agentToken };
+		const props: OutboundProps = { slug: job.slug, gitHost: git.hostname, repo: job.repo, repoPath: git.pathname, trunkRepo: job.trunkRepo, trunkPath: new URL(job.trunkRemote).pathname, agentToken: job.agentToken, kind: job.kind };
 		container.start({ image: container.images.agent, enableInternet: false, instance: "standard-2" });
 		const outbound = this.ctx.exports.AgentOutbound({ props });
 		await container.interceptAllOutboundHttp(outbound);

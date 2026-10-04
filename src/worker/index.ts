@@ -139,7 +139,8 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "attempts" && rest[2] === "rehost") return Response.json(await p.rehost(rest[1], b.task === "fix" ? "fix" : "reconcile"), { status: 201 });
 		if (rest[0] === "attempts" && rest[2] === "stop") return Response.json(await p.stopHosted(rest[1]));
 		if (rest[0] === "intents" && rest[2] === "abandon") return Response.json((await p.abandonIntent(Number(rest[1]), b.by)) ?? { ok: true });
-		if (rest[0] === "attempts" && rest[2] === "land") return Response.json(await p.land(rest[1], b.by, !!b.force));
+		if (rest[0] === "attempts" && rest[2] === "land") return Response.json(await p.land(rest[1], b.by, !!b.force, typeof b.sha === "string" ? b.sha : undefined));
+		if (rest[0] === "attempts" && rest[2] === "cancel-landing") return Response.json(await p.cancelLanding(rest[1], b.by));
 		if (rest[0] === "runs") return Response.json(await p.verify(String(b.ref ?? "trunk"), true));
 		if (rest[0] === "attempts" && rest[2] === "abandon") return Response.json((await p.abandonAttempt(rest[1], b.by)) ?? { ok: true });
 		if (rest[0] === "reconciliations" && rest[2] === "resolve") return Response.json(await p.resolve(Number(rest[1]), b.resolutions ?? [], String(b.rationale ?? ""), b.by, b.oneSided === true));

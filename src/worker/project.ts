@@ -4,22 +4,24 @@ import { DurableObject } from "cloudflare:workers";
 import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
 import { asText, diffTrees, listTree, mergeBase, predict } from "./gitops";
-import { commitFiles, land, seed } from "./land";
+import { CANDIDATE, commitFiles, prepare, promote, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
-import type { RunJob, Runner } from "./runner";
+import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Intent, JoinResult, Landing, Overlap, Reconciliation, Run, SessionEvent, State,
+	Intent, JoinResult, Landing, LandOutcome, Overlap, QueuedLanding, Reconciliation, Run, SessionEvent, State,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
-	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string;
+	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string; HOSTED_MAX?: string;
 };
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
+/** How many agents Braid runs for one project at a time, unless HOSTED_MAX says otherwise. */
+const HOSTED_MAX = 6;
 const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
 const MAX_TEXT = 400_000;
 const MAX_EVENT_TEXT = 4000;
@@ -79,11 +81,15 @@ export class Project extends DurableObject<BraidEnv> {
 			CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT, sha TEXT, status TEXT, steps TEXT, preview INTEGER,
 				nothing_to_run INTEGER, error TEXT, started_at INTEGER, finished_at INTEGER, preview_api INTEGER DEFAULT 0);
 			CREATE TABLE IF NOT EXISTS activity (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER, kind TEXT, actor TEXT, text TEXT, intent_id INTEGER, attempt_id TEXT);
+			CREATE TABLE IF NOT EXISTS queue (attempt_id TEXT PRIMARY KEY, by TEXT, at INTEGER, attempt_sha TEXT, force INTEGER, state TEXT, note TEXT,
+				candidate_sha TEXT, trunk_sha TEXT, reconciled TEXT);
+			CREATE TABLE IF NOT EXISTS candidates (attempt_id TEXT PRIMARY KEY, sha TEXT, trunk_sha TEXT, attempt_sha TEXT, at INTEGER);
 		`);
 		// Added after the first projects existed.
 		try { this.sql.exec("ALTER TABLE runs ADD COLUMN preview_api INTEGER DEFAULT 0"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted_detail TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN attempt_sha TEXT"); } catch {}
 	}
 
 	// ── storage helpers ──────────────────────────────────────────────────────
@@ -119,7 +125,7 @@ export class Project extends DurableObject<BraidEnv> {
 	});
 	private toRecon = (r: any): Reconciliation => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, status: r.status, trunkSha: r.trunk_sha, conflicts: JSON.parse(r.conflicts),
-		resolutions: JSON.parse(r.resolutions), rationale: r.rationale, resolvedBy: r.resolved_by, at: r.at,
+		resolutions: JSON.parse(r.resolutions), rationale: r.rationale, resolvedBy: r.resolved_by, at: r.at, attemptSha: r.attempt_sha ?? null,
 	});
 	private toLanding = (r: any): Landing => ({
 		sha: r.sha, parentSha: r.parent_sha, intentId: r.intent_id, attemptId: r.attempt_id, agent: r.agent, title: r.title,
@@ -148,6 +154,13 @@ export class Project extends DurableObject<BraidEnv> {
 			a.baseSha, a.headSha, a.status, a.summary, json(a.files), json(a.claims), a.behind, json(a.trunkConflicts), json(a.checks), now(), a.id,
 		);
 	}
+
+	/** What a re-read of the repository found. Written on its own, so it cannot undo a claim, a check or a status change made meanwhile. */
+	private saveGit(a: Attempt) {
+		this.sql.exec("UPDATE attempts SET base_sha=?, head_sha=?, files=?, behind=?, trunk_conflicts=?, updated_at=? WHERE id=?",
+			a.baseSha, a.headSha, json(a.files), a.behind, json(a.trunkConflicts), now(), a.id);
+	}
+	private setStatus(id: string, status: Attempt["status"]) { this.sql.exec("UPDATE attempts SET status = ?, updated_at = ? WHERE id = ?", status, now(), id); }
 
 	private note(kind: string, actor: string, text: string, intentId: number | null = null, attemptId: string | null = null) {
 		this.sql.exec("INSERT INTO activity (at, kind, actor, text, intent_id, attempt_id) VALUES (?, ?, ?, ?, ?, ?)", now(), kind, actor, redact(text), intentId, attemptId);
@@ -191,13 +204,14 @@ export class Project extends DurableObject<BraidEnv> {
 	async init(input: { slug: string; name: string; description: string; source?: "starter" | "empty" | "import"; url?: string; branch?: string }) {
 		if (this.trunk) throw new BraidError("project already exists", 409);
 		const repo = `${input.slug}--trunk`;
-		// This project has no state, so a repo with its trunk name is left over from a failed create. Clear it.
-		await this.host.remove(repo).catch(() => {});
+		// Never clear a repository of that name first: the Artifacts namespace can be shared with another
+		// Braid instance, and the repository may be that instance's live trunk.
+		const taken = (e: unknown) => new BraidError(`could not create the repository ${repo} (${String((e as Error)?.message ?? e).slice(0, 200)}). If a repository with that name already exists in this Artifacts namespace, another Braid instance may own it: choose another name.`, 409);
 		const source = input.source ?? "starter";
 		let remote: string, head = "", branch = "main";
 		if (source === "import") {
 			if (!input.url) throw new BraidError("import needs a repository URL");
-			const imported = await this.host.importRepo(input.url, repo, input.branch);
+			const imported = await this.host.importRepo(input.url, repo, input.branch).catch((e) => { throw taken(e); });
 			remote = imported.remote;
 			// The reported default branch is not always the one that was imported, so look for commits.
 			const tried: string[] = [];
@@ -211,9 +225,14 @@ export class Project extends DurableObject<BraidEnv> {
 				throw new BraidError(`imported ${input.url} but found no commits on ${tried.join(", ")}; pass the branch to import`);
 			}
 		} else {
-			const created = await this.host.create(repo, `Braid trunk for ${input.name}`);
+			const created = await this.host.create(repo, `Braid trunk for ${input.name}`).catch((e) => { throw taken(e); });
 			remote = created.remote;
-			if (source === "starter") head = await seed(created.remote, created.token, DEMO_FILES, "Seed project", { name: "Braid", email: "seed@braid.dev" });
+			try {
+				if (source === "starter") head = await seed(created.remote, created.token, DEMO_FILES, "Seed project", { name: "Braid", email: "seed@braid.dev" });
+			} catch (e) {
+				await this.host.remove(repo).catch(() => {}); // created a moment ago by this call, so it is ours to remove
+				throw e;
+			}
 		}
 		this.setMeta("slug", input.slug);
 		this.setMeta("name", input.name);
@@ -286,6 +305,8 @@ export class Project extends DurableObject<BraidEnv> {
 				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env),
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
+			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note })),
+			candidates: this.rows<any>("SELECT * FROM candidates").map((c) => ({ attemptId: c.attempt_id, sha: c.sha, trunkSha: c.trunk_sha, attemptSha: c.attempt_sha })),
 			intents: this.intents(),
 			attempts: this.attempts().map((a) => ({ ...a, now: this.latestEvent(a.id) })),
 			decisions: this.rows("SELECT * FROM decisions ORDER BY id").map(this.toDecision),
@@ -314,8 +335,10 @@ export class Project extends DurableObject<BraidEnv> {
 	async abandonIntent(id: number, by = "human") {
 		this.intent(id);
 		this.sql.exec("UPDATE intents SET status = 'abandoned' WHERE id = ? AND status = 'open'", id);
+		const live = this.attempts().filter((a) => a.intentId === id && LIVE.has(a.status));
 		this.sql.exec("UPDATE attempts SET status = 'abandoned' WHERE intent_id = ? AND status IN ('working','ready','conflicted')", id);
 		this.note("intent", by, `Abandoned I${id}`, id);
+		for (const a of live) await this.retire(a.id);
 		await this.serial(() => this.recompute());
 	}
 
@@ -351,10 +374,17 @@ export class Project extends DurableObject<BraidEnv> {
 	async abandonAttempt(id: string, by = "human") {
 		const a = this.attempt(id);
 		if (!LIVE.has(a.status)) throw new BraidError(`attempt ${id} is ${a.status}`);
-		a.status = "abandoned";
-		this.saveAttempt(a);
+		this.setStatus(id, "abandoned");
 		this.note("attempt", by, `Attempt ${id} abandoned`, a.intentId, id);
+		await this.retire(id);
 		await this.serial(() => this.recompute());
+	}
+
+	/** An attempt that is over takes no further part: its agent is stopped and any landing asked for it is dropped. */
+	private async retire(id: string) {
+		this.sql.exec("DELETE FROM queue WHERE attempt_id = ?", id);
+		const hosted = this.rows<{ hosted: string | null }>("SELECT hosted FROM attempts WHERE id = ?", id)[0]?.hosted;
+		if (hosted === "starting" || hosted === "running") await this.agentHost(id)?.stop("the attempt is over").catch((e) => console.error("stop agent", id, e));
 	}
 
 	// ── awareness: what changed, and who is about to collide ─────────────────
@@ -393,15 +423,16 @@ export class Project extends DurableObject<BraidEnv> {
 				if (p.conflict) a.trunkConflicts.push(f.path);
 			}
 		}
+		this.saveGit(a);
+		this.sql.exec("UPDATE attempts SET trunk_seen = ? WHERE id = ?", trunkHead.hash, a.id);
 		// An agent that merged trunk into its attempt has reconciled the git way: the open reconciliation is moot.
-		if (a.status === "conflicted" && a.behind === 0) {
-			a.status = "ready";
-			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status != 'resolved'", a.id);
+		// The status is read again here: this attempt may have been abandoned or landed while the repository was being read.
+		if (this.attempt(a.id).status === "conflicted" && a.behind === 0) {
+			this.setStatus(a.id, "ready");
+			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
 			this.note("reconcile", a.agent, `${a.agent} merged trunk into attempt ${a.id}; it is ready to land again`, a.intentId, a.id);
 		}
-		this.saveAttempt(a);
-		this.sql.exec("UPDATE attempts SET trunk_seen = ? WHERE id = ?", trunkHead.hash, a.id);
-		return a;
+		return this.attempt(a.id);
 	}
 
 	private blobCache = new Map<string, string | null>();
@@ -421,7 +452,8 @@ export class Project extends DurableObject<BraidEnv> {
 		const live: Attempt[] = [];
 		for (const a of this.attempts()) {
 			if (!LIVE.has(a.status)) continue;
-			live.push(await this.refresh(a, trunkLog));
+			const fresh = await this.refresh(a, trunkLog);
+			if (LIVE.has(fresh.status)) live.push(fresh);
 		}
 		// Every new commit of an attempt is verified in a sandbox. Queued here, it runs on its own.
 		for (const a of live) {
@@ -506,6 +538,7 @@ export class Project extends DurableObject<BraidEnv> {
 					this.note("push", after.agent, `${after.agent} pushed ${short(after.headSha)} to attempt ${after.id} (${after.files.length} file${after.files.length === 1 ? "" : "s"} changed)`, after.intentId, after.id);
 				}
 			} else await this.recompute();
+			await this.advance();
 		});
 	}
 
@@ -522,6 +555,7 @@ export class Project extends DurableObject<BraidEnv> {
 		const can = hosting(this.env);
 		if (!can.available) throw new BraidError("this Braid instance cannot run agents itself");
 		if (kind !== "selftest" && !can[kind]) throw new BraidError(`no model credentials for ${kind}: set up AI Gateway (AI_GATEWAY_ID and the AI_GATEWAY_TOKEN secret) or the provider's API key`);
+		this.roomForAgent();
 		const agent = kind === "claude" ? "claude-code" : kind;
 		const joined = await this.join({ intentId, agent, kind: kind === "selftest" ? "agent" : kind, origin: "" });
 		const row = this.rows<{ repo: string }>("SELECT repo FROM attempts WHERE id = ?", joined.attemptId)[0];
@@ -544,6 +578,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
 		const kind: HostedKind = a.kind === "codex" ? "codex" : "claude";
 		if (!hosting(this.env)[kind]) throw new BraidError(`this Braid instance cannot run ${kind} itself`);
+		this.roomForAgent();
 		const job: HostJob = {
 			slug: this.meta("slug"), attemptId: a.id, kind, agent: a.agent, repo: a.repo, remote: a.remote, trunkRepo: this.trunk,
 			trunkRemote: this.meta("remote"), branch: this.branch, agentToken: row.token, brief: this.briefText(a), task,
@@ -552,6 +587,13 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("UPDATE attempts SET hosted = 'starting', hosted_detail = '' WHERE id = ?", a.id);
 		this.note("attempt", "braid", `Brought ${a.agent} back to attempt ${a.id} in a Cloudflare sandbox to ${task === "reconcile" ? "reconcile with trunk" : "fix failed verification"}`, a.intentId, a.id);
 		return { attemptId: a.id };
+	}
+
+	/** Agents cost money while they run, so a project runs a bounded number at once. */
+	private roomForAgent() {
+		const max = Number(this.env.HOSTED_MAX) || HOSTED_MAX;
+		const running = this.rows<{ n: number }>("SELECT COUNT(*) AS n FROM attempts WHERE hosted IN ('starting', 'running')")[0].n;
+		if (running >= max) throw new BraidError(`${running} agents are already running for this project, which is the limit (HOSTED_MAX). Wait for one to finish or stop one.`, 409);
 	}
 
 	async stopHosted(attemptId: string) {
@@ -589,6 +631,25 @@ export class Project extends DurableObject<BraidEnv> {
 		return ns ? (ns.get(ns.idFromName(`${this.meta("slug")}/${ref}`)) as unknown as Runner) : null;
 	}
 
+	/** What trunk says a run consists of. Read from trunk, so a commit being verified cannot take a check out of its own verification. */
+	private policyAt: { head: string; policy: RunPolicy } | null = null;
+	private async policy(): Promise<RunPolicy> {
+		const head = this.meta("head");
+		if (this.policyAt?.head === head) return this.policyAt.policy;
+		const read = async (path: string) => { try { return JSON.parse(asText(await this.host.readFile(this.trunk, head, path)) ?? "null"); } catch { return null; } };
+		const [config, pkg] = [await read("braid.json"), await read("package.json")];
+		const policy = { config: config && typeof config === "object" ? config : null, scripts: Object.keys(pkg?.scripts ?? {}) };
+		this.policyAt = { head, policy };
+		return policy;
+	}
+
+	private async startRun(ref: string, target: { repo: string; remote: string; sha: string; branch: string }) {
+		const runId = this.rows<{ id: number }>("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at) VALUES (?, ?, 'queued', '[]', 0, 0, NULL, ?) RETURNING id", ref, target.sha, now())[0].id;
+		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy: await this.policy() };
+		await this.runner(ref)!.start(job);
+		this.broadcast();
+	}
+
 	/** Verify the current commit of an attempt (or of trunk) unless that commit already has a run. */
 	async verify(ref: string, again = false): Promise<Run | null> {
 		this.requireProject();
@@ -599,10 +660,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (!target.sha) return null;
 		const last = this.latestRun(ref);
 		if (!again && last?.sha === target.sha) return last;
-		const runId = this.rows<{ id: number }>("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at) VALUES (?, ?, 'queued', '[]', 0, 0, NULL, ?) RETURNING id", ref, target.sha, now())[0].id;
-		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: this.branch, sha: target.sha, runId };
-		await runner.start(job);
-		this.broadcast();
+		await this.startRun(ref, { ...target, branch: this.branch });
 		return this.latestRun(ref);
 	}
 
@@ -615,20 +673,23 @@ export class Project extends DurableObject<BraidEnv> {
 			run.status, json(run.steps), run.preview ? 1 : 0, run.previewApi ? 1 : 0, run.nothingToRun ? 1 : 0, run.error ?? null, run.finishedAt ?? null, runId);
 		if (!patch.finishedAt || run.status === "superseded") return this.broadcast();
 
-		const a = run.ref === "trunk" ? null : this.attempt(run.ref);
-		const what = a ? `attempt ${a.id} (${a.agent})` : "trunk";
+		const merged = run.ref.startsWith("land:");
+		const a = run.ref === "trunk" ? null : this.attempt(merged ? run.ref.slice(5) : run.ref);
+		const what = !a ? "trunk" : merged ? `attempt ${a.id} (${a.agent}) merged with trunk` : `attempt ${a.id} (${a.agent})`;
 		const checks = run.steps.filter((s) => s.name !== "clone" && s.name !== "install");
 		const summary = run.status === "error" ? `could not run: ${run.error}`
 			: run.nothingToRun ? "nothing to run" : (checks.length ? checks : run.steps).map((s) => `${s.name} ${s.status === "pass" ? "✓" : "✗"}`).join(" · ");
 		this.note("verify", "braid", `Verified ${what} at ${short(run.sha)}: ${summary}`, a?.intentId ?? null, a?.id ?? null);
 		// The agent hears about a failure the next time it talks to Braid, with the output that shows why.
-		if (a && run.status === "fail" && LIVE.has(a.status) && a.headSha === run.sha) {
+		if (a && !merged && run.status === "fail" && LIVE.has(a.status) && a.headSha === run.sha) {
 			this.signal(a.id, "checks-failed", {
 				commit: short(run.sha),
 				failed: run.steps.filter((s) => s.status === "fail").map((s) => ({ step: s.name, command: s.command, exit_code: s.exitCode, output: s.tail.slice(-2000) })),
 				note: "Braid ran this commit in a clean sandbox and these steps failed. Fix them, push, and checkpoint again.",
 			});
 		}
+		// A result can be what a landing was waiting for.
+		await this.serial(() => this.advance()).catch((e) => this.note("land", "braid", `The landing queue stopped: ${splitError(e).message}`));
 	}
 
 	/** What an agent is told about the verification of its current commit. */
@@ -636,9 +697,17 @@ export class Project extends DurableObject<BraidEnv> {
 		const run = this.latestRun(a.id);
 		if (!run) return { status: "not run" };
 		if (run.sha !== a.headSha) return { status: "pending", note: "your latest commit has not been verified yet" };
+		// Before it lands, the commit is also run merged with trunk. A failure there is the agent's to fix too.
+		const candidate = this.rows<any>("SELECT * FROM candidates WHERE attempt_id = ? AND attempt_sha = ? AND trunk_sha = ?", a.id, a.headSha, this.meta("head"))[0];
+		const merged = candidate ? this.latestRun(`land:${a.id}`) : null;
 		return {
 			status: run.status, commit: short(run.sha), steps: run.steps.map((s) => ({ step: s.name, status: s.status, exit_code: s.exitCode })),
 			...(run.status === "queued" || run.status === "running" ? { note: "still running; a failure will arrive in heads_up" } : {}),
+			...(merged && merged.sha === candidate.sha ? { merged_with_trunk: {
+				status: merged.status, trunk: short(candidate.trunk_sha),
+				steps: merged.steps.map((s) => ({ step: s.name, status: s.status, exit_code: s.exitCode, ...(s.status === "fail" ? { command: s.command, output: s.tail.slice(-2000) } : {}) })),
+				...(merged.status === "fail" ? { note: "Your commit passes alone but fails once merged with trunk. Merge trunk into your attempt (`sync`), fix it, push, and checkpoint." } : {}),
+			} } : {}),
 		};
 	}
 
@@ -691,7 +760,6 @@ export class Project extends DurableObject<BraidEnv> {
 		const repo = `${this.meta("slug")}--context`;
 		let empty = false;
 		if (!this.meta("context_remote")) {
-			await this.host.remove(repo).catch(() => {});
 			this.setMeta("context_remote", (await this.host.create(repo, `Braid context (why and sessions) for ${this.meta("name")}`)).remote);
 			empty = true;
 		}
@@ -713,6 +781,10 @@ export class Project extends DurableObject<BraidEnv> {
 		const row = this.rows("SELECT * FROM attempts WHERE token = ?", token)[0];
 		if (!row) throw new BraidError("unknown agent token", 401);
 		const me = this.toAttempt(row);
+		if (!LIVE.has(me.status)) {
+			const landed = me.status === "landed" ? ` It landed on trunk as ${short(this.intent(me.intentId).landedSha ?? "")}.` : "";
+			throw new BraidError(`attempt ${me.id} is ${me.status} and takes no more tool calls.${landed} Stop work.`, 409);
+		}
 		this.addEvents(me.id, [{ kind: "braid", tool, text: describeCall(tool, args ?? {}) }]);
 		const result = await this.runTool(me, tool, args ?? {});
 		const pending = this.rows<any>("SELECT * FROM signals WHERE to_attempt = ? AND seen = 0 ORDER BY id", me.id);
@@ -839,8 +911,9 @@ export class Project extends DurableObject<BraidEnv> {
 			"3. `record` every real decision as you make it (what you chose, what you rejected, what you assumed). This is the project's memory of why.",
 			`4. Commit and \`git push origin HEAD:${this.branch}\` often, then \`checkpoint\`. Braid answers with overlaps and predicted conflicts, including the other agent's reasoning.`,
 			"5. Braid runs every commit you push in a clean sandbox: install, then the project's typecheck, tests and build. `checkpoint` reports the result under `verification`, and a failure arrives in `heads_up` with the output. Fix failures before you call `ready`.",
+			"   Which checks run is decided by trunk, not by your copy of `braid.json`. Before your work lands it is run once more, merged with trunk; if that fails you hear about it the same way.",
 			"6. Read `heads_up` on every response. If another intent conflicts with yours, adapt, or `message` that agent.",
-			"7. `ready` with a summary when the goal is met. A human or reviewer lands it.",
+			"7. `ready` with a summary when the goal is met. A human or reviewer lands it. Do not push after that unless you are asked to: a landing is for the commit that was reviewed.",
 			"8. If landing conflicts, `reconciliation` gives you both sides and why each exists; answer with `resolve`.",
 		].filter((l) => l !== "").join("\n");
 	}
@@ -848,7 +921,7 @@ export class Project extends DurableObject<BraidEnv> {
 	// ── landing and reconciliation ───────────────────────────────────────────
 
 	private openRecon(attemptId: string): Reconciliation | null {
-		const r = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status != 'resolved' ORDER BY id DESC LIMIT 1", attemptId)[0];
+		const r = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving') ORDER BY id DESC LIMIT 1", attemptId)[0];
 		return r ? this.toRecon(r) : null;
 	}
 
@@ -869,8 +942,14 @@ export class Project extends DurableObject<BraidEnv> {
 		return lines.join("\n");
 	}
 
-	/** Land an attempt on trunk. On conflict, open a reconciliation that carries both sides' reasoning. */
-	land(attemptId: string, by = "human", force = false) {
+	/**
+	 * Ask for an attempt to be landed. Trunk only takes commits that have been run: the attempt's own
+	 * commit must have passed, and when trunk has moved since the attempt started, the merge of the two
+	 * is built, verified in a sandbox, and only then becomes trunk. Requests wait in a queue and are
+	 * tried one at a time, so each is verified against the trunk it will actually land on.
+	 * `sha` is the commit the person was looking at; `force` lands without waiting for any of this.
+	 */
+	land(attemptId: string, by = "human", force = false, sha?: string): Promise<LandOutcome> {
 		return this.serial(async () => {
 			this.requireProject();
 			await this.recompute();
@@ -879,68 +958,214 @@ export class Project extends DurableObject<BraidEnv> {
 			if (intent.status !== "open") throw new BraidError(`I${intent.id} is already ${intent.status}`);
 			if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
 			if (a.headSha === a.baseSha) throw new BraidError(`attempt ${a.id} has no commits to land`);
-			const run = this.latestRun(a.id);
-			if (!force && run?.sha === a.headSha && run.status === "fail") {
-				throw new BraidError(`attempt ${a.id} failed verification at ${short(a.headSha)} (${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}); land it anyway with force`, 409);
-			}
+			if (sha && sha !== a.headSha) throw new BraidError(`attempt ${a.id} has moved to ${short(a.headSha)} since you looked at ${short(sha)}; review it again before landing`, 409);
+			const before = this.rows<any>("SELECT * FROM queue WHERE attempt_id = ?", a.id)[0];
+			if (before && before.attempt_sha === a.headSha) this.sql.exec("UPDATE queue SET force = ?, by = ? WHERE attempt_id = ?", force || before.force ? 1 : 0, by, a.id);
+			else this.sql.exec("INSERT OR REPLACE INTO queue (attempt_id, by, at, attempt_sha, force, state, note) VALUES (?, ?, ?, ?, ?, 'waiting', '')", a.id, by, now(), a.headSha, force ? 1 : 0);
+			return this.advance(a.id);
+		});
+	}
 
-			const resolvedRow = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id DESC LIMIT 1", a.id)[0];
-			const recon = resolvedRow ? this.toRecon(resolvedRow) : null;
-			const result = await land({
-				branch: this.branch,
-				trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
-				attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
-				message: this.landingMessage(intent, a, recon),
-				author: { name: a.agent, email: `${a.agent.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@agents.braid.dev` },
-				resolutions: new Map((recon?.resolutions ?? []).map((r) => [r.path, r.content])),
-			});
+	/** Take back a landing that was asked for and has not happened yet. */
+	async cancelLanding(attemptId: string, by = "human") {
+		const a = this.attempt(attemptId);
+		if (!this.rows("SELECT 1 FROM queue WHERE attempt_id = ? AND state != 'pushing'", attemptId).length) throw new BraidError(`attempt ${attemptId} is not waiting to land`);
+		this.sql.exec("DELETE FROM queue WHERE attempt_id = ?", attemptId);
+		this.note("land", by, `Landing of attempt ${attemptId} cancelled`, a.intentId, a.id);
+		await this.serial(() => this.advance());
+		return { ok: true };
+	}
 
-			if (!result.ok && result.reason === "nothing-to-land") throw new BraidError(`attempt ${a.id} has nothing that trunk does not already have`);
-			if (!result.ok) {
-				const conflicts: Conflict[] = result.conflicts.map((c) => ({ ...c, trunkWhy: this.trunkWhy(a.baseSha, c.path) }));
-				this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status != 'resolved'", a.id);
-				this.sql.exec("INSERT INTO reconciliations (attempt_id, intent_id, status, trunk_sha, conflicts, resolutions, rationale, resolved_by, at) VALUES (?, ?, 'open', ?, ?, '[]', '', '', ?)",
-					a.id, a.intentId, result.trunkSha, json(conflicts), now());
-				const id = this.rows<{ id: number }>("SELECT id FROM reconciliations ORDER BY id DESC LIMIT 1")[0].id;
-				a.status = "conflicted";
-				this.saveAttempt(a);
-				this.signal(a.id, "reconcile", { paths: conflicts.map((c) => c.path), note: "Landing conflicted with trunk. Call `reconciliation` for both sides and their reasoning, then `resolve`." });
-				this.note("conflict", by, `Landing ${a.id} conflicted with trunk on ${conflicts.map((c) => c.path).join(", ")}; reconciliation R${id} opened`, a.intentId, a.id);
-				return { landed: false as const, reconciliationId: id, conflicts: conflicts.map((c) => c.path) };
-			}
-
-			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status != 'resolved'", a.id);
-			const files = a.files.map((f) => f.path);
-			this.sql.exec("INSERT INTO landings (sha, parent_sha, intent_id, attempt_id, agent, title, files, reconciled, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				result.sha, result.parentSha, intent.id, a.id, a.agent, intent.title, json(files), result.reconciled.length ? 1 : 0, now());
-			this.sql.exec("UPDATE intents SET status = 'landed', landed_sha = ?, landed_attempt = ? WHERE id = ?", result.sha, a.id, intent.id);
-			a.status = "landed";
-			this.saveAttempt(a);
-			this.setMeta("head", result.sha);
-			this.note("land", by, `Landed I${intent.id} (${a.agent}, attempt ${a.id}) on trunk as ${short(result.sha)}${result.reconciled.length ? `, reconciled ${result.reconciled.join(", ")}` : ""}`, intent.id, a.id);
-
-			try {
-				await this.saveContext(this.intent(intent.id), a, result.sha);
-			} catch (e) {
-				// The landing already happened; losing the context copy must not undo or fail it.
-				this.note("context", "braid", `Could not save context for attempt ${a.id}: ${splitError(e).message}`, intent.id, a.id);
-			}
-
-			const landedWhy = this.describe(a);
-			for (const other of this.attempts()) {
-				if (other.id === a.id || !LIVE.has(other.status)) continue;
-				if (other.intentId === intent.id) {
-					other.status = "superseded";
-					this.saveAttempt(other);
-					this.signal(other.id, "superseded", { note: `Attempt ${a.id} by ${a.agent} was chosen for this intent. Stop work.` });
-					this.note("attempt", "braid", `Attempt ${other.id} (${other.agent}) superseded by ${a.id}`, intent.id, other.id);
-				} else {
-					this.signal(other.id, "trunk-moved", { landed: landedWhy, files, note: "Trunk moved. Call `checkpoint` to see whether this affects you, and `sync` for how to merge trunk into your attempt." });
+	/**
+	 * Move the landing queue as far as it will go. Safe to call at any time: every step reads what is
+	 * true now. Returns what happened to `focus`; if its landing was refused, that is thrown.
+	 */
+	private async advance(focus?: string): Promise<LandOutcome> {
+		let outcome: LandOutcome | null = null, refused: BraidError | null = null;
+		for (let moved = true, rounds = 0; moved && rounds < 50; rounds++) {
+			moved = false;
+			for (const entry of this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id")) {
+				const step = await this.tryLanding(entry);
+				if (step.kind === "wait" || step.kind === "hold") {
+					this.sql.exec("UPDATE queue SET note = ? WHERE attempt_id = ?", step.why, entry.attempt_id);
+					if (entry.attempt_id === focus) outcome = { landed: false, queued: true, waiting: step.why };
+					if (step.kind === "wait") continue;
+					// One merge is verified at a time: whatever lands next changes what the others must be merged with.
+					this.sql.exec("UPDATE queue SET note = ? WHERE attempt_id != ? AND state = 'waiting' AND force = 0 AND note = ''", `behind attempt ${entry.attempt_id} in the landing queue`, entry.attempt_id);
+					break;
+				}
+				this.sql.exec("DELETE FROM queue WHERE attempt_id = ?", entry.attempt_id);
+				if (step.kind === "landed") {
+					if (entry.attempt_id === focus) outcome = { landed: true, sha: step.sha };
+					moved = true; // trunk moved, so start again from the front
+					break;
+				}
+				if (step.kind === "conflict" && entry.attempt_id === focus) outcome = { landed: false, reconciliationId: step.id, conflicts: step.paths };
+				if (step.kind === "refused") {
+					const a = this.attempt(entry.attempt_id);
+					this.note("land", "braid", `Attempt ${a.id} was not landed: ${step.why}`, a.intentId, a.id);
+					if (entry.attempt_id === focus) refused = new BraidError(step.why, 409);
 				}
 			}
-			await this.recompute();
-			return { landed: true as const, sha: result.sha };
+		}
+		this.broadcast();
+		if (refused) throw refused;
+		return outcome ?? { landed: false, queued: true, waiting: "" };
+	}
+
+	/** One queued landing, one step. */
+	private async tryLanding(entry: any): Promise<
+		{ kind: "wait" | "hold" | "refused"; why: string } | { kind: "landed"; sha: string } | { kind: "conflict"; id: number; paths: string[] } | { kind: "gone" }
+	> {
+		const a = this.attempt(entry.attempt_id), intent = this.intent(a.intentId), by = String(entry.by), forced = !!entry.force;
+		const failed = (run: Run) => run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ");
+
+		// A landing that was being pushed when this object stopped: trunk says whether it got there.
+		if (entry.state === "pushing") {
+			if ((await this.trunkLog()).some((c) => c.hash === entry.candidate_sha)) {
+				if (!this.rows("SELECT 1 FROM landings WHERE sha = ?", entry.candidate_sha).length) await this.recordLanding(a, intent, by, entry.candidate_sha, entry.trunk_sha, JSON.parse(entry.reconciled || "[]"));
+				return { kind: "landed", sha: entry.candidate_sha };
+			}
+			this.sql.exec("UPDATE queue SET state = 'waiting', candidate_sha = NULL WHERE attempt_id = ?", a.id);
+			entry = { ...entry, state: "waiting", candidate_sha: null };
+		}
+		if (!LIVE.has(a.status) || intent.status !== "open") return { kind: "gone" };
+		if (a.headSha !== entry.attempt_sha) return { kind: "refused", why: `attempt ${a.id} moved to ${short(a.headSha)} after landing was asked for at ${short(entry.attempt_sha)}; review it and land again` };
+
+		const head = this.meta("head"), verifies = !!this.env.RUNNER && !forced;
+		const own = this.latestRun(a.id), trunkRun = this.latestRun("trunk");
+		const trunkRed = trunkRun?.sha === head && trunkRun.status === "fail";
+		if (verifies) {
+			if (!own || own.sha !== a.headSha || own.status === "queued" || own.status === "running") return { kind: "wait", why: `waiting for ${short(a.headSha)} to be verified` };
+			if (own.status === "fail") return { kind: "refused", why: `attempt ${a.id} failed verification at ${short(a.headSha)} (${failed(own)}); land it anyway with force` };
+			if (own.status !== "pass") return { kind: "refused", why: `attempt ${a.id} could not be verified at ${short(a.headSha)}${own.error ? ` (${own.error})` : ""}; run the verification again, or land it anyway with force` };
+
+			// A merge already built for this trunk and this commit: its result decides.
+			if (entry.state === "verifying" && entry.trunk_sha === head && entry.candidate_sha) {
+				const run = this.latestRun(`land:${a.id}`);
+				if (run && run.sha === entry.candidate_sha) {
+					if (run.status === "queued" || run.status === "running") {
+						if (now() - run.startedAt < 45 * 60_000) return { kind: "hold", why: `verifying the merge with trunk at ${short(head)}` };
+						return { kind: "refused", why: `the merge of attempt ${a.id} with trunk was not verified within 45 minutes; land it again` };
+					}
+					if (run.status === "fail") {
+						this.signal(a.id, "merge-failed", {
+							trunk: short(head),
+							failed: run.steps.filter((s) => s.status === "fail").map((s) => ({ step: s.name, command: s.command, exit_code: s.exitCode, output: s.tail.slice(-2000) })),
+							note: "Your commit passes on its own but fails once merged with trunk. Merge trunk into your attempt (see `sync`), fix it, push, and checkpoint.",
+						});
+						return { kind: "refused", why: `attempt ${a.id} passes on its own but failed verification when merged with trunk at ${short(head)} (${failed(run)})${trunkRed ? "; trunk itself is failing, and this attempt does not fix it" : ""}. Land it anyway with force` };
+					}
+					if (run.status !== "pass") return { kind: "refused", why: `the merge of attempt ${a.id} with trunk could not be verified${run.error ? ` (${run.error})` : ""}; land it again` };
+					this.sql.exec("UPDATE queue SET state = 'pushing' WHERE attempt_id = ?", a.id);
+					const moved = await promote({
+						branch: this.branch, sha: entry.candidate_sha, parentSha: entry.trunk_sha,
+						trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
+						attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
+					});
+					if (moved.ok) {
+						await this.recordLanding(a, intent, by, entry.candidate_sha, entry.trunk_sha, JSON.parse(entry.reconciled || "[]"));
+						return { kind: "landed", sha: entry.candidate_sha };
+					}
+					await this.trunkLog(); // trunk moved under it (a push from outside Braid): merge again
+				}
+			}
+		}
+
+		// Build the merge. A saved resolution is only for the two commits it was written against.
+		const trunkHead = this.meta("head");
+		this.sql.exec("UPDATE reconciliations SET status = 'stale' WHERE attempt_id = ? AND status = 'resolved' AND (trunk_sha != ? OR COALESCE(attempt_sha, ?) != ?)", a.id, trunkHead, a.headSha, a.headSha);
+		const resolvedRow = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id DESC LIMIT 1", a.id)[0];
+		const recon = resolvedRow ? this.toRecon(resolvedRow) : null;
+		const result = await prepare({
+			branch: this.branch,
+			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
+			attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
+			message: this.landingMessage(intent, a, recon),
+			author: { name: a.agent, email: `${a.agent.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@agents.braid.dev` },
+			resolutions: new Map((recon?.resolutions ?? []).map((r) => [r.path, r.content])),
+			expect: { trunk: trunkHead, attempt: a.headSha },
 		});
+		if (!result.ok && result.reason === "moved") {
+			// Something was pushed since this object last looked. Look again; the next pass decides with what is there now.
+			await this.recompute();
+			return { kind: "wait", why: `${result.what === "trunk" ? "trunk" : `attempt ${a.id}`} moved while landing; trying again` };
+		}
+		if (!result.ok && result.reason === "nothing-to-land") return { kind: "refused", why: `attempt ${a.id} has nothing that trunk does not already have` };
+		if (!result.ok) {
+			const conflicts: Conflict[] = result.conflicts.map((c) => ({ ...c, trunkWhy: this.trunkWhy(a.baseSha, c.path) }));
+			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
+			this.sql.exec("INSERT INTO reconciliations (attempt_id, intent_id, status, trunk_sha, attempt_sha, conflicts, resolutions, rationale, resolved_by, at) VALUES (?, ?, 'open', ?, ?, ?, '[]', '', '', ?)",
+				a.id, a.intentId, result.trunkSha, result.attemptSha, json(conflicts), now());
+			const id = this.rows<{ id: number }>("SELECT id FROM reconciliations ORDER BY id DESC LIMIT 1")[0].id;
+			this.setStatus(a.id, "conflicted");
+			this.signal(a.id, "reconcile", { paths: conflicts.map((c) => c.path), note: "Landing conflicted with trunk. Call `reconciliation` for both sides and their reasoning, then `resolve`." });
+			this.note("conflict", by, `Landing ${a.id} conflicted with trunk on ${conflicts.map((c) => c.path).join(", ")}; reconciliation R${id} opened`, a.intentId, a.id);
+			return { kind: "conflict", id, paths: conflicts.map((c) => c.path) };
+		}
+
+		// What has already been run does not need running again: an attempt that starts from trunk's head
+		// merges to exactly the tree that passed, and a project with no checks has nothing to run.
+		const sameTree = a.baseSha === result.parentSha && result.reconciled.length === 0;
+		const nothing = !!own?.nothingToRun && trunkRun?.sha === result.parentSha && trunkRun.status === "pass" && trunkRun.nothingToRun;
+		if (!verifies || sameTree || (nothing && !trunkRed)) {
+			// Written down before the push, so a landing that reaches trunk is recorded even if this object stops in between.
+			this.sql.exec("UPDATE queue SET state = 'pushing', candidate_sha = ?, trunk_sha = ?, reconciled = ? WHERE attempt_id = ?", result.sha, result.parentSha, json(result.reconciled), a.id);
+			await result.push();
+			await this.recordLanding(a, intent, by, result.sha, result.parentSha, result.reconciled, forced && !!this.env.RUNNER);
+			return { kind: "landed", sha: result.sha };
+		}
+		await result.stage(await this.host.token(a.repo, "write", 600));
+		this.sql.exec("UPDATE queue SET state = 'verifying', candidate_sha = ?, trunk_sha = ?, reconciled = ? WHERE attempt_id = ?", result.sha, result.parentSha, json(result.reconciled), a.id);
+		this.sql.exec("INSERT OR REPLACE INTO candidates (attempt_id, sha, trunk_sha, attempt_sha, at) VALUES (?, ?, ?, ?, ?)", a.id, result.sha, result.parentSha, a.headSha, now());
+		await this.startRun(`land:${a.id}`, { repo: a.repo, remote: a.remote, sha: result.sha, branch: CANDIDATE });
+		this.note("land", by, `Merged attempt ${a.id} with trunk at ${short(result.parentSha)} as ${short(result.sha)}; it lands if that passes verification`, a.intentId, a.id);
+		return { kind: "hold", why: `verifying the merge with trunk at ${short(result.parentSha)}` };
+	}
+
+	/** Trunk has the landing commit: write down what it was, tell everyone affected, and keep the why. */
+	private async recordLanding(a: Attempt, intent: Intent, by: string, sha: string, parentSha: string, reconciled: string[], unverified = false) {
+		this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
+		const files = a.files.map((f) => f.path);
+		this.sql.exec("INSERT OR REPLACE INTO landings (sha, parent_sha, intent_id, attempt_id, agent, title, files, reconciled, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			sha, parentSha, intent.id, a.id, a.agent, intent.title, json(files), reconciled.length ? 1 : 0, now());
+		this.sql.exec("UPDATE intents SET status = 'landed', landed_sha = ?, landed_attempt = ? WHERE id = ?", sha, a.id, intent.id);
+		this.setStatus(a.id, "landed");
+		this.setMeta("head", sha);
+		this.note("land", by, `Landed I${intent.id} (${a.agent}, attempt ${a.id}) on trunk as ${short(sha)}${reconciled.length ? `, reconciled ${reconciled.join(", ")}` : ""}${unverified ? ", forced without waiting for verification" : ""}`, intent.id, a.id);
+		await this.retire(a.id);
+
+		this.setMeta("context_pending", json([...new Set([...this.pendingContext(), a.id])]));
+		await this.saveContexts();
+
+		const landedWhy = this.describe(a);
+		for (const other of this.attempts()) {
+			if (other.id === a.id || !LIVE.has(other.status)) continue;
+			if (other.intentId === intent.id) {
+				this.setStatus(other.id, "superseded");
+				this.signal(other.id, "superseded", { note: `Attempt ${a.id} by ${a.agent} was chosen for this intent. Stop work.` });
+				this.note("attempt", "braid", `Attempt ${other.id} (${other.agent}) superseded by ${a.id}`, intent.id, other.id);
+				await this.retire(other.id);
+			} else {
+				this.signal(other.id, "trunk-moved", { landed: landedWhy, files, note: "Trunk moved. Call `checkpoint` to see whether this affects you, and `sync` for how to merge trunk into your attempt." });
+			}
+		}
+		await this.recompute();
+	}
+
+	/** Landed attempts whose why has not reached the context repo yet. A failed copy stays here and is tried again at the next landing. */
+	private pendingContext(): string[] { try { return JSON.parse(this.meta("context_pending") || "[]"); } catch { return []; } }
+	private async saveContexts() {
+		for (const id of this.pendingContext()) {
+			const a = this.attempt(id), intent = this.intent(a.intentId);
+			try {
+				await this.saveContext(intent, a, intent.landedSha ?? "");
+				this.setMeta("context_pending", json(this.pendingContext().filter((x) => x !== id)));
+			} catch (e) {
+				// The landing already happened; losing the context copy must not undo or fail it.
+				this.note("context", "braid", `Could not save context for attempt ${id}; it will be tried again at the next landing: ${splitError(e).message}`, intent.id, id);
+			}
+		}
 	}
 
 	/** The intents that changed `path` on trunk after `baseSha`, with their reasoning. */
@@ -980,9 +1205,9 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, ?)",
 			r.attemptId, r.intentId, by, `Reconciled with trunk (R${reconId})`, rationale.trim(), json(r.conflicts.map((c) => c.path)), r.trunkSha, now());
 		this.note("reconcile", by, `${by} resolved R${reconId}: ${rationale.trim()}`, r.intentId, r.attemptId);
-		const a = this.attempt(r.attemptId);
-		if (a.status === "conflicted") { a.status = "ready"; this.saveAttempt(a); }
-		const landed = await this.land(r.attemptId, by, true);
+		// The resolved merge is verified like any other before it becomes trunk.
+		if (this.attempt(r.attemptId).status === "conflicted") this.setStatus(r.attemptId, "ready");
+		const landed = await this.land(r.attemptId, by, false, r.attemptSha ?? undefined);
 		return { resolved: true, ...landed };
 	}
 
@@ -1080,6 +1305,7 @@ export class Project extends DurableObject<BraidEnv> {
 	async credentials(agentToken: string) {
 		const row = this.rows("SELECT * FROM attempts WHERE token = ?", agentToken)[0];
 		if (!row) throw new BraidError("unknown agent token", 401);
+		if (!LIVE.has(row.status)) throw new BraidError(`attempt ${row.id} is ${row.status}; it gets no new credentials`, 403);
 		return {
 			remote: row.remote as string, gitToken: await this.host.token(row.repo, "write", 86400),
 			trunkRemote: this.meta("remote"), trunkToken: await this.host.token(this.trunk, "read", 86400),

@@ -171,8 +171,23 @@ for (const o of state.overlaps) console.log(`  ${o.severity.padEnd(8)} ${o.path.
 stopAt("ready");
 await pause("All attempts are ready. Next: land persistence (I2).");
 console.log("\n— landing —");
+// A landing waits until Braid has run the commit (and, when trunk has moved, its merge with trunk) in a sandbox.
+const settled = async (agent, r) => {
+	if (!r.queued) return r;
+	say("braid", `landing of ${agent.attemptId} is queued: ${r.waiting || "waiting its turn"}`);
+	for (;;) {
+		await new Promise((done) => setTimeout(done, 1500));
+		const s = await api("GET", "");
+		const a = s.attempts.find((x) => x.id === agent.attemptId);
+		if (a.status === "landed") return { landed: true, sha: s.intents.find((i) => i.id === a.intentId).landedSha };
+		if (s.queue.some((q) => q.attemptId === a.id)) continue;
+		const open = s.reconciliations.find((x) => x.attemptId === a.id && x.status === "open");
+		if (open) return { landed: false, reconciliationId: open.id, conflicts: open.conflicts.map((c) => c.path) };
+		throw new Error(`landing of ${a.id} was refused: ${s.activity.find((x) => x.attemptId === a.id && x.kind === "land")?.text}`);
+	}
+};
 const land = async (agent) => {
-	const r = await api("POST", `/attempts/${agent.attemptId}/land`, { by: "reviewer" });
+	const r = await settled(agent, await api("POST", `/attempts/${agent.attemptId}/land`, { by: "reviewer" }));
 	say("reviewer", r.landed ? `landed ${agent.attemptId} (${agent.name}) as ${r.sha.slice(0, 7)}` : `landing ${agent.attemptId} conflicted on ${r.conflicts.join(", ")} → reconciliation R${r.reconciliationId}`);
 	return r;
 };
@@ -195,10 +210,10 @@ if (!conflicted.landed) {
 		`document.getElementById("add").addEventListener("click", addCounter);\ndocument.getElementById("theme").addEventListener("click", () => {\n\tstate.theme = state.theme === "dark" ? "light" : "dark";\n\trender();\n});\nload();\nrender();`,
 	).replace(`\tnextId: 3,\n};`, `\tnextId: 3,\n\ttheme: "light",\n};`)
 		.replace(`function render() {\n\tconst board`, `function render() {\n\tdocument.documentElement.dataset.theme = state.theme;\n\tconst board`);
-	const done = await claude.call("resolve", {
+	const done = await settled(claude, await claude.call("resolve", {
 		resolutions: [{ path: "app.js", content: merged }],
 		rationale: "Kept I2's load() before the first render and save() after every render, and registered the theme toggle before load(). Because I2 persists the whole state object, state.theme is saved and restored with no extra code, so the chosen theme now survives reloads.",
-	});
+	}));
 	say(claude.name, done.landed ? `resolved and landed as ${done.sha.slice(0, 7)}` : `still conflicted: ${JSON.stringify(done)}`);
 }
 await pause("Next: land the reset button (I3), which is now two landings behind.");

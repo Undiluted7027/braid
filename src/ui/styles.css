@@ -256,3 +256,5 @@ button.danger.solid { background: var(--bad); border-color: var(--bad); color: v
 .step-out { margin: 0; padding: 8px 10px; max-height: 320px; overflow: auto; font: 12px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; border-top: 1px solid var(--line); }
 
 .join-or { margin-top: 12px; }
+
+.landing-wait { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; flex-wrap: wrap; }

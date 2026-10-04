@@ -22,7 +22,8 @@ export function RunChip({ run, head }: { run: Run | null; head: string }) {
 	);
 }
 
-export function Verification({ slug, refName, run, head }: { slug: string; refName: string; run: Run | null; head: string }) {
+/** `fixed`: the run is of a commit Braid built (an attempt merged with trunk), so there is nothing to run again by hand. */
+export function Verification({ slug, refName, run, head, fixed = false }: { slug: string; refName: string; run: Run | null; head: string; fixed?: boolean }) {
 	const [open, setOpen] = useState<string | null>(null);
 	const again = useAction();
 	const rerun = <button disabled={again.busy} onClick={() => again.run(() => api("POST", `/p/${slug}/runs`, { ref: refName }))}>{run ? "Run again" : "Verify now"}</button>;
@@ -34,7 +35,7 @@ export function Verification({ slug, refName, run, head }: { slug: string; refNa
 				<span className={`chip ${tone(run.status)}`}>{LABEL[run.status]}</span>
 				<span className="small dim">commit <span className="mono">{short(run.sha)}</span>, in a sandbox with no network access beyond its own repository and the package registry</span>
 				<span className="spacer" />
-				{!active && rerun}
+				{!active && !fixed && rerun}
 			</div>
 			{run.sha !== head && <p className="warn small">This result is for an earlier commit. The current one, <span className="mono">{short(head)}</span>, is waiting to be verified.</p>}
 			{again.error && <p className="error">{again.error}</p>}

@@ -80,8 +80,11 @@ export interface Reconciliation {
 	id: number;
 	attemptId: string;
 	intentId: number;
-	status: "open" | "resolving" | "resolved";
+	/** `stale`: resolved, but trunk or the attempt moved before it landed, so it was not used. */
+	status: "open" | "resolving" | "resolved" | "stale";
 	trunkSha: string;
+	/** The attempt commit the conflict was found at. A resolution is only used for these two commits. */
+	attemptSha: string | null;
 	conflicts: Conflict[];
 	resolutions: { path: string; content: string }[];
 	rationale: string;
@@ -118,8 +121,12 @@ export interface State {
 	/** Set when the instance has an admin token: the key that lets a sandboxed preview frame load each ref. */
 	previewKeys?: Record<string, string>;
 	project: ProjectInfo;
-	/** The latest run for each ref (attempt id or "trunk"). */
+	/** The latest run for each ref: an attempt id, "trunk", or "land:<attempt id>" for an attempt merged with trunk. */
 	runs: Run[];
+	/** Attempts someone asked to land, in the order they will be tried. */
+	queue: QueuedLanding[];
+	/** The last merge with trunk that was built for an attempt and sent to be verified. */
+	candidates: { attemptId: string; sha: string; trunkSha: string; attemptSha: string }[];
 	intents: Intent[];
 	attempts: Attempt[];
 	decisions: Decision[];
@@ -128,6 +135,22 @@ export interface State {
 	landings: Landing[];
 	activity: Activity[];
 }
+/**
+ * A landing that has been asked for and not happened yet. An attempt lands once its own commit has passed
+ * in a sandbox and, when trunk has moved since, once its merge with trunk has passed too.
+ */
+export interface QueuedLanding {
+	attemptId: string; by: string; at: number;
+	/** The commit the person asked to land. If the attempt moves, the request is dropped. */
+	attemptSha: string;
+	state: "waiting" | "verifying" | "pushing";
+	/** What it is waiting for, in words. */
+	note: string;
+}
+export type LandOutcome =
+	| { landed: true; sha: string }
+	| { landed: false; reconciliationId: number; conflicts: string[] }
+	| { landed: false; queued: true; waiting: string };
 /** An agent Braid is running for an attempt in a sandbox, and how that went. */
 export type Hosted = "starting" | "running" | "finished" | "failed" | "stopped";
 export interface JoinResult { attemptId: string; intentId: number; branch: string; remote: string; gitToken: string; agentToken: string; trunkRemote: string; trunkToken: string; mcpUrl: string; brief: string }

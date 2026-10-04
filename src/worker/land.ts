@@ -1,19 +1,25 @@
 // Writes to Artifacts. The binding is read-only, so landing clones nothing to disk:
-// it fetches trunk and the attempt into an in-memory repo, merges, and pushes over Git.
+// it fetches trunk and the attempt into an in-memory repo, merges by full path, and pushes over Git.
 import git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
 import { MemoryFS } from "./memfs";
 import { gitAuth } from "./host";
-import { merge3, type ConflictRegion } from "./gitops";
+import { mergeTrees, type MergeConflict } from "./merge.ts";
+export { mergeTrees, type MergeConflict };
 
 const dir = "/repo";
 type Author = { name: string; email: string };
 
-export interface MergeConflict { path: string; kind: "content" | "delete"; base: string | null; trunk: string | null; attempt: string | null; regions: ConflictRegion[] }
+/** A merge that is ready but has not moved anything: `push` puts it on trunk, `stage` parks it on the attempt's repository to be verified first. */
+export interface Prepared { ok: true; sha: string; parentSha: string; attemptSha: string; reconciled: string[]; push(): Promise<void>; stage(writeToken: string): Promise<void> }
 export type LandResult =
-	| { ok: true; sha: string; parentSha: string; reconciled: string[] }
-	| { ok: false; reason: "conflict"; trunkSha: string; conflicts: MergeConflict[] }
-	| { ok: false; reason: "nothing-to-land"; trunkSha: string };
+	| Prepared
+	| { ok: false; reason: "conflict"; trunkSha: string; attemptSha: string; conflicts: MergeConflict[] }
+	| { ok: false; reason: "nothing-to-land"; trunkSha: string }
+	| { ok: false; reason: "moved"; what: "trunk" | "attempt"; expected: string; found: string };
+
+/** Where a merged commit waits, on the attempt's repository, while it is verified. */
+export const CANDIDATE = "braid-candidate";
 
 export interface LandInput {
 	/** Trunk's branch name; attempts are forks, so they share it. */
@@ -24,12 +30,14 @@ export interface LandInput {
 	author: Author;
 	/** Reconciled file contents, keyed by path. Used instead of a textual merge for that file. */
 	resolutions: Map<string, string>;
+	/** The commits this landing was decided on. If either side has moved, nothing is merged. */
+	expect?: { trunk?: string; attempt?: string };
 }
 
-/** Merge an attempt into trunk as one landing commit (parents: trunk head, attempt head) and push it. */
-export async function land(input: LandInput): Promise<LandResult> {
+/** Merge an attempt into trunk as one landing commit (parents: trunk head, attempt head), without pushing it anywhere yet. */
+export async function prepare(input: LandInput): Promise<LandResult> {
 	const { branch } = input;
-	const fs = new MemoryFS();
+	const fs = new MemoryFS(), repo = { fs, dir };
 	await fs.promises.mkdir(dir);
 	await git.init({ fs, dir, defaultBranch: branch });
 	await git.addRemote({ fs, dir, remote: "trunk", url: input.trunk.remote });
@@ -38,54 +46,53 @@ export async function land(input: LandInput): Promise<LandResult> {
 	await git.fetch({ fs, http, dir, remote: "attempt", ref: branch, singleBranch: true, onAuth: gitAuth(input.attempt.token) });
 	const trunkSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/trunk/${branch}` });
 	const attemptSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/attempt/${branch}` });
+	if (input.expect?.trunk && input.expect.trunk !== trunkSha) return { ok: false, reason: "moved", what: "trunk", expected: input.expect.trunk, found: trunkSha };
+	if (input.expect?.attempt && input.expect.attempt !== attemptSha) return { ok: false, reason: "moved", what: "attempt", expected: input.expect.attempt, found: attemptSha };
 	if (await git.isDescendent({ fs, dir, oid: trunkSha, ancestor: attemptSha, depth: -1 }) || trunkSha === attemptSha) {
 		return { ok: false, reason: "nothing-to-land", trunkSha };
 	}
-	await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: trunkSha, force: true });
 
-	// isomorphic-git gives the merge driver a file's name without its folder, so a file is identified
-	// by its name together with both sides' contents, and its full path is looked up from those.
-	const text = async (oid: string, filepath: string) => {
-		try { return new TextDecoder().decode((await git.readBlob({ fs, dir, oid, filepath })).blob); } catch { return null; }
+	const treeOf = async (oid: string) => (await git.readCommit({ fs, dir, oid })).commit.tree;
+	const baseSha = ((await git.findMergeBase({ fs, dir, oids: [trunkSha, attemptSha] })) as string[])[0];
+	const merged = await mergeTrees(repo, baseSha ? await treeOf(baseSha) : null, await treeOf(trunkSha), await treeOf(attemptSha), input.resolutions);
+	if (merged.conflicts.length) return { ok: false, reason: "conflict", trunkSha, attemptSha, conflicts: merged.conflicts };
+
+	const who = { ...input.author, timestamp: Math.floor(Date.now() / 1000), timezoneOffset: 0 };
+	const sha = await git.writeCommit({ fs, dir, commit: { message: `${input.message.trimEnd()}\n`, tree: merged.tree, parent: [trunkSha, attemptSha], author: who, committer: who } });
+	const send = async (url: string, token: string, ref: string, force: boolean) => {
+		await git.writeRef({ fs, dir, ref: `refs/heads/${ref}`, value: sha, force: true });
+		const push = await git.push({ fs, http, dir, url, ref, force, onAuth: gitAuth(token) });
+		if (!push.ok) throw new Error(`push of ${ref} rejected: ${JSON.stringify(push.refs)}`);
 	};
-	const name = (path: string) => path.slice(path.lastIndexOf("/") + 1);
-	const sides = async (path: string) => ({ path, trunk: await text(trunkSha, path), attempt: await text(attemptSha, path) });
-	const resolved = await Promise.all([...input.resolutions.keys()].map(sides));
-	const conflicts: MergeConflict[] = [];
-	const reconciled: string[] = [];
-	try {
-		const merged = await git.merge({
-			fs, dir, ours: branch, theirs: `refs/remotes/attempt/${branch}`,
-			fastForward: false, abortOnConflict: true,
-			message: input.message, author: input.author, committer: input.author,
-			mergeDriver: ({ contents, path }) => {
-				const [base, trunk, attempt] = contents;
-				const hit = resolved.find((r) => name(r.path) === path && r.trunk === trunk && r.attempt === attempt);
-				if (hit) {
-					reconciled.push(hit.path);
-					return { cleanMerge: true, mergedText: input.resolutions.get(hit.path)! };
-				}
-				const r = merge3(base, trunk, attempt);
-				if (!r.clean) conflicts.push({ path, kind: "content", base, trunk, attempt, regions: r.regions });
-				return { cleanMerge: r.clean, mergedText: r.text };
-			},
-		});
-		const sha = merged.oid!;
-		const push = await git.push({ fs, http, dir, url: input.trunk.remote, ref: branch, onAuth: gitAuth(input.trunk.token) });
-		if (!push.ok) throw new Error(`push to trunk rejected: ${JSON.stringify(push.refs)}`);
-		return { ok: true, sha, parentSha: trunkSha, reconciled };
-	} catch (e: any) {
-		if (e?.code !== "MergeConflictError") throw e;
-		for (const full of await Promise.all(((e.data?.bothModified ?? []) as string[]).map(sides))) {
-			const c = conflicts.find((c) => c.path === name(full.path) && c.trunk === full.trunk && c.attempt === full.attempt);
-			if (c) c.path = full.path;
-		}
-		// One side deleted a file the other edited: there is no text to merge.
-		for (const path of [...(e.data?.deleteByUs ?? []), ...(e.data?.deleteByTheirs ?? [])]) {
-			conflicts.push({ path, kind: "delete", base: null, trunk: null, attempt: null, regions: [] });
-		}
-		return { ok: false, reason: "conflict", trunkSha, conflicts };
-	}
+	return {
+		ok: true, sha, parentSha: trunkSha, attemptSha, reconciled: merged.reconciled,
+		push: () => send(input.trunk.remote, input.trunk.token, branch, false),
+		stage: (writeToken) => send(input.attempt.remote, writeToken, CANDIDATE, true),
+	};
+}
+
+/**
+ * Move trunk to a commit that was staged on the attempt's repository and has since been verified.
+ * Trunk only moves forward: if it is no longer where the commit was built from, nothing happens.
+ */
+export async function promote(input: { branch: string; trunk: { remote: string; token: string }; attempt: { remote: string; token: string }; sha: string; parentSha: string }): Promise<{ ok: true } | { ok: false; found: string }> {
+	const { branch } = input;
+	const fs = new MemoryFS();
+	await fs.promises.mkdir(dir);
+	await git.init({ fs, dir, defaultBranch: branch });
+	await git.addRemote({ fs, dir, remote: "trunk", url: input.trunk.remote });
+	await git.addRemote({ fs, dir, remote: "attempt", url: input.attempt.remote });
+	await git.fetch({ fs, http, dir, remote: "trunk", ref: branch, singleBranch: true, onAuth: gitAuth(input.trunk.token) });
+	const trunkSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/trunk/${branch}` });
+	if (trunkSha === input.sha) return { ok: true };
+	if (trunkSha !== input.parentSha) return { ok: false, found: trunkSha };
+	await git.fetch({ fs, http, dir, remote: "attempt", ref: CANDIDATE, singleBranch: true, onAuth: gitAuth(input.attempt.token) });
+	const staged = await git.resolveRef({ fs, dir, ref: `refs/remotes/attempt/${CANDIDATE}` });
+	if (staged !== input.sha) return { ok: false, found: trunkSha };
+	await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: staged, force: true });
+	const push = await git.push({ fs, http, dir, url: input.trunk.remote, ref: branch, onAuth: gitAuth(input.trunk.token) });
+	if (!push.ok) throw new Error(`push to trunk rejected: ${JSON.stringify(push.refs)}`);
+	return { ok: true };
 }
 
 /** Create the first commit of a new repo from a set of files. */

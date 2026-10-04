@@ -7,12 +7,15 @@ import type { Run, RunStep } from "../shared/types";
 import { ArtifactsHost } from "./host";
 import type { BraidEnv, Project } from "./project";
 
-export interface RunJob { slug: string; ref: string; repo: string; remote: string; branch: string; sha: string; runId: number }
+/** What to run, as trunk defines it: its braid.json, and the check scripts its package.json has. An attempt cannot drop a check by editing these. */
+export interface RunPolicy { config: any | null; scripts: string[] }
+export interface RunJob { slug: string; ref: string; repo: string; remote: string; branch: string; sha: string; runId: number; policy?: RunPolicy }
 
 const CA = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 const WORK = "/workspace";
 const STEP_SECONDS = 600;
 const TAIL = 6000;
+const MAX_RUN_MS = 60 * 60 * 1000;
 const MAX_PREVIEW_FILE = 1_900_000; // a SQLite value holds 2 MB
 const MAX_PREVIEW_TOTAL = 40_000_000;
 const REGISTRIES = ["registry.npmjs.org"];
@@ -40,6 +43,7 @@ export class RegistryGateway extends WorkerEntrypoint<BraidEnv> {
 	}
 }
 
+interface Busy { at: number; job?: RunJob }
 interface Plan { install: string | null; checks: [string, string][]; previewDir: string | null; previewApi: boolean }
 
 export class Runner extends DurableObject<BraidEnv> {
@@ -51,14 +55,24 @@ export class Runner extends DurableObject<BraidEnv> {
 	/** Queue a run and return at once; the work happens in the alarm. A newer job replaces one still waiting. */
 	async start(job: RunJob) {
 		await this.ctx.storage.put("next", job);
-		if (!(await this.ctx.storage.get("busy"))) await this.ctx.storage.setAlarm(Date.now());
+		const busy = await this.ctx.storage.get<Busy>("busy");
+		// A run that has been going longer than any run can was lost with its object; the alarm clears it.
+		if (!busy || !(Date.now() - busy.at <= MAX_RUN_MS)) await this.ctx.storage.setAlarm(Date.now());
 	}
 
 	async alarm() {
+		// Only one alarm runs at a time, so a run still marked busy here did not finish: the object
+		// was restarted under it (a deploy, a crash, the time limit). Say so, or it would stay "running" for good.
+		const lost = await this.ctx.storage.get<Busy>("busy");
+		if (lost) {
+			await this.ctx.storage.delete("busy");
+			if (this.ctx.container?.running) await this.ctx.container.destroy().catch(() => {});
+			if (lost.job) await this.report(lost.job, { status: "error", error: "the run was interrupted before it finished; run it again", finishedAt: Date.now() }).catch(() => {});
+		}
 		const job = await this.ctx.storage.get<RunJob>("next");
 		if (!job) return;
 		await this.ctx.storage.delete("next");
-		await this.ctx.storage.put("busy", job.runId);
+		await this.ctx.storage.put("busy", { at: Date.now(), job } satisfies Busy);
 		try {
 			await this.run(job);
 		} catch (e) {
@@ -112,7 +126,7 @@ export class Runner extends DurableObject<BraidEnv> {
 			`git init -q ${WORK} && cd ${WORK} && git remote add origin "$0" && (git fetch -q --depth=1 origin "$1" || git fetch -q --depth=50 origin "$2") && git checkout -q "$1"`, job.remote, job.sha, job.branch]);
 		if (!cloned) return finish({ status: "error", error: "could not fetch the commit" });
 
-		const plan = await this.plan(exec);
+		const plan = await this.plan(exec, job.policy);
 		if (plan.install && !(await step("install", plan.install, ["sh", "-c", plan.install], WORK))) return finish({ status: "fail" });
 		for (const [name, command] of plan.checks) {
 			if (await superseded()) return finish({ status: "superseded" });
@@ -126,17 +140,18 @@ export class Runner extends DurableObject<BraidEnv> {
 	}
 
 	/** What to run: the repository's braid.json if it has one, otherwise what its package.json offers. */
-	private async plan(exec: (argv: string[], cwd?: string) => Promise<{ code: number; text: string }>): Promise<Plan> {
+	private async plan(exec: (argv: string[], cwd?: string) => Promise<{ code: number; text: string }>, policy?: RunPolicy): Promise<Plan> {
 		const read = async (file: string) => { const r = await exec(["cat", file], WORK); try { return r.code === 0 ? JSON.parse(r.text) : null; } catch { return null; } };
 		const has = async (path: string) => (await exec(["test", "-e", path], WORK)).code === 0;
-		const config = await read("braid.json"), pkg = await read("package.json");
+		// With a policy, trunk's braid.json decides and this commit's own copy is not consulted.
+		const config = policy ? policy.config : await read("braid.json"), pkg = await read("package.json");
 		let install: string | null = null;
 		if (typeof config?.install === "string") install = config.install;
 		else if (pkg) install = (await has("pnpm-lock.yaml")) ? "pnpm install --frozen-lockfile" : (await has("package-lock.json")) ? "npm ci --no-audit --no-fund" : "npm install --no-audit --no-fund";
 		const runner = install?.startsWith("pnpm") ? "pnpm" : "npm";
 		const checks: [string, string][] = config?.checks && typeof config.checks === "object"
 			? Object.entries(config.checks).map(([name, command]) => [name.slice(0, 40), String(command)])
-			: SCRIPTS.filter((s) => pkg?.scripts?.[s]).map((s) => [s, `${runner} run ${s}`]);
+			: SCRIPTS.filter((s) => pkg?.scripts?.[s] || policy?.scripts.includes(s)).map((s) => [s, `${runner} run ${s}`]);
 		let previewDir: string | null = typeof config?.preview?.dir === "string" ? config.preview.dir : null;
 		// Decided before the build, from what the project says or where builds usually land; checked again after.
 		if (!previewDir && config?.preview !== false) previewDir = pkg?.scripts?.build ? "auto" : (await has("index.html")) ? "." : null;
@@ -154,8 +169,10 @@ export class Runner extends DurableObject<BraidEnv> {
 		} else if (!/^[\w./-]+$/.test(dir) || dir.includes("..") || !(await probe(dir))) return false;
 
 		// node_modules and .git only matter when the site is the repository root.
-		const tar = await container.exec(["tar", "-cf", "-", "--exclude=./node_modules", "--exclude=./.git", "-C", dir, "."], { cwd: WORK, stderr: "ignore" });
+		// Cut off just past the limit, so an enormous build output is never read into memory.
+		const tar = await container.exec(["sh", "-c", `tar -cf - --exclude=./node_modules --exclude=./.git -C "$0" . | head -c ${MAX_PREVIEW_TOTAL + 1_000_000}`, dir], { cwd: WORK, stderr: "ignore" });
 		const bytes = new Uint8Array((await tar.output()).stdout);
+		if (bytes.byteLength > MAX_PREVIEW_TOTAL) return false;
 		this.ctx.storage.sql.exec("DELETE FROM files");
 		let total = 0, count = 0;
 		for (const f of untar(bytes)) {

@@ -46,19 +46,22 @@ Items 2 and 3 are the direct answers to the competition brief's questions about 
 
 Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra (code and product), a fresh Claude Opus session as competition judge and engineer, and a fresh Claude Opus session using the local instance in a browser as a first-time developer and designer. They agreed that landing cannot yet be trusted and that a person cannot answer an agent, and that both come before the planner and reviewer agent. This order replaces steps 5 and 6 above. Findings marked (unchecked) have not been confirmed against the code; the rest have.
 
-1. **Trustworthy landing.**
-   - Pin the landing to the verified commit. Landing fetches the attempt branch fresh (`land.ts`), so a push between review and landing lands unseen code. Pin the trunk and attempt commits a saved resolution was written against too, and reject it when either has moved.
-   - Require a pass, or an explicit force. Only a finished `fail` blocks today: queued, running, errored and missing runs land, and a resolved reconciliation lands with the gate forced off. An attempt can also change its own checks in `braid.json`; required checks should come from trunk.
-   - Verify the merged result before it reaches trunk. This is the landing queue from step 5 and it also covers step 6.
-   - Hold landings while trunk is red.
-   - A verification run that dies mid-way leaves `busy` set in the runner for good, so that ref is never verified again and running it again does not help. Expire it. The preview tar is also read into memory with no cap.
-   - Creating a project removes any existing repository named `<slug>--trunk`. With two instances on one namespace, reusing a slug destroys a live trunk. Refuse when the repository exists.
-   - Conflicted files are matched by file name plus both sides' contents. Two same-named files with identical contents on both sides get the first resolution for both. Merge by full path.
-   - Abandoning or superseding an attempt does not stop its hosted agent, and its tools and credentials keep working. Stop the agent and refuse tools and credentials on a finished attempt.
-   - A crash between pushing trunk and recording the landing leaves git and the project's record out of step, and a retry says there is nothing to land. A failed copy to the context repo is logged and never retried.
-   - (unchecked) A recompute rewrites whole attempt rows from an earlier snapshot, so a claim or an abandon made while it runs can be undone.
-   - An attempt opts itself into reading project state through its own `braid.json` (`preview.api`). Take the flag from trunk.
-   - A hosted agent can call any path under the gateway, so any provider or model, with no budget or limit on how many run at once.
+1. **Trustworthy landing.** Done locally on October 4, 2026; not yet deployed.
+   - Done: a landing is for one commit. "Land this" sends the commit on screen; if the attempt has moved, or moves while the landing waits, it is refused. A saved resolution records the trunk and attempt commits it was written against and is marked stale when either moves.
+   - Done: a pass is required. Not run, queued and running wait; failed and errored are refused; only "Land now" (force) skips it, and that is recorded on the landing. Checks come from trunk's `braid.json` and trunk's scripts, and so does the `preview.api` flag.
+   - Done: the landing queue. The merged commit is built, parked on the attempt's repository (`braid-candidate`), run in a sandbox, and only then pushed to trunk. A reconciled merge goes through the same run. This is also step 6: an attempt that passed alone and broke when merged with a landed change in another file was refused, with the failing output sent to the agent.
+   - Done: while trunk is failing, an attempt lands only if its merge passes.
+   - Done: a run that was interrupted is reported as "could not run" by the next alarm, and a stuck marker expires. The preview tar is cut off at the size limit.
+   - Done: creating a project never removes a repository. An existing one is an error.
+   - Done: the merge is done by full path over git trees (`src/worker/merge.ts`, with tests), not through isomorphic-git's merge driver.
+   - Done: an abandoned, superseded or landed attempt has its hosted agent stopped, and its tools and credentials are refused.
+   - Done: the landing is journalled before the push and recovered from trunk's log. A failed context copy is kept on a list and tried again at the next landing.
+   - Done: re-reading a repository writes only the columns it computed, so it cannot undo a claim, check or status change.
+   - Done: a hosted agent reaches only its own provider's inference calls, and a project runs at most six agents at once (`HOSTED_MAX`).
+   - Open: one merge is verified at a time, so a long check suite makes the queue slow. Other ready attempts are not re-run against the new trunk after each landing; they are checked when someone lands them.
+   - Open: the queue does not bring an agent back by itself when a merge fails; a person presses "Have it fix the merge with trunk".
+   - Open: no spending budget per agent beyond the 45-minute limit and the six-agent limit.
+   - Open: an attempt can still change what a check script does (`"test": "true"`). It shows in the diff; nothing flags it.
 2. **A person can respond.**
    - "Send back with a note" on an attempt: it reaches the agent (brought back if hosted), and is kept as why.
    - Answer an agent's question; message an agent. Agents can message each other, people cannot.
@@ -115,7 +118,9 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 ## Not verified yet
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
-- **The landing fix for same-named files on the deployed instance.** Conflicted files are now identified by full path (checked locally with `a/index.txt` and `b/index.txt`); the deployed instance gets it at the next deploy.
+- **Trustworthy landing on the deployed instance.** The landing queue, trunk-controlled checks, the full-path merge and the rest of item 1 of the revised order have only run locally.
+- **Recovery paths in item 1.** A run interrupted mid-way, and a landing interrupted between the push and its record, are handled in code but were not forced to happen.
+- **A hosted agent brought back to fix a failed merge with trunk.** The button and the agent's instructions exist; only the failing merge itself was tested.
 
 Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.
 
