@@ -53,7 +53,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 			if (!SLUG.test(slug)) return Response.json({ error: "slug must be 3-40 characters: lowercase letters, digits, single hyphens" }, { status: 400 });
 			await registry.registerProject(slug, String(b.name || slug), String(b.description ?? ""));
 			try {
-				await project(env, slug).init({ slug, name: String(b.name || slug), description: String(b.description ?? "") });
+				await project(env, slug).init({ slug, name: String(b.name || slug), description: String(b.description ?? ""), source: b.source, url: b.url, branch: b.branch });
 			} catch (e) {
 				await registry.unregisterProject(slug);
 				throw e;
@@ -87,6 +87,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "reconciliations" && rest[2] === "resolve") return Response.json(await p.resolve(Number(rest[1]), b.resolutions ?? [], String(b.rationale ?? ""), b.by));
 		if (rest[0] === "reconciliations" && rest[2] === "auto") return Response.json(await p.resolveWithModel(Number(rest[1])));
 		if (rest[0] === "push") return Response.json((await p.onPush(String(b.repo))) ?? { ok: true });
+		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
 		if (rest[0] === "credentials") return Response.json(await p.credentials(String(b.agentToken ?? "")));
 	}
 	return Response.json({ error: "not found" }, { status: 404 });

@@ -85,7 +85,7 @@ export interface Landing {
 	at: number;
 }
 export interface Activity { id: number; at: number; kind: string; actor: string; text: string; intentId: number | null; attemptId: string | null }
-export interface ProjectInfo { slug: string; name: string; description: string; repo: string; remote: string; head: string; llm: string | null }
+export interface ProjectInfo { slug: string; name: string; description: string; repo: string; remote: string; branch: string; head: string; llm: string | null }
 export interface State {
 	project: ProjectInfo;
 	intents: Intent[];
@@ -96,7 +96,7 @@ export interface State {
 	landings: Landing[];
 	activity: Activity[];
 }
-export interface JoinResult { attemptId: string; intentId: number; remote: string; gitToken: string; agentToken: string; mcpUrl: string; brief: string }
+export interface JoinResult { attemptId: string; intentId: number; branch: string; remote: string; gitToken: string; agentToken: string; mcpUrl: string; brief: string }
 export interface DiffFile { path: string; status: FileChange["status"]; base: string | null; head: string | null; binary: boolean }
 export interface BlameLine { text: string; sha: string | null }
 export interface FileView { path: string; content: string | null; binary: boolean; blame: BlameLine[]; trail: Landing[] }

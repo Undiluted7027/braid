@@ -96,6 +96,7 @@ export function ProjectPage({ state }: { state: State }) {
 	const open = state.intents.filter((i) => i.status === "open"), done = state.intents.filter((i) => i.status !== "open");
 	return (
 		<main className="page">
+			{!state.project.head && <p className="warn">Trunk is empty. Push a first commit to <span className="mono">{state.project.remote}</span>, or run <code>braid init</code> from a local repository, before starting attempts.</p>}
 			<Braid state={state} />
 			<div className="columns">
 				<div className="col-main">

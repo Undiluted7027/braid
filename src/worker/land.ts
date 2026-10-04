@@ -16,6 +16,8 @@ export type LandResult =
 	| { ok: false; reason: "nothing-to-land"; trunkSha: string };
 
 export interface LandInput {
+	/** Trunk's branch name; attempts are forks, so they share it. */
+	branch: string;
 	trunk: { remote: string; token: string };
 	attempt: { remote: string; token: string };
 	message: string;
@@ -26,25 +28,26 @@ export interface LandInput {
 
 /** Merge an attempt into trunk as one landing commit (parents: trunk head, attempt head) and push it. */
 export async function land(input: LandInput): Promise<LandResult> {
+	const { branch } = input;
 	const fs = new MemoryFS();
 	await fs.promises.mkdir(dir);
-	await git.init({ fs, dir, defaultBranch: "main" });
+	await git.init({ fs, dir, defaultBranch: branch });
 	await git.addRemote({ fs, dir, remote: "trunk", url: input.trunk.remote });
 	await git.addRemote({ fs, dir, remote: "attempt", url: input.attempt.remote });
-	await git.fetch({ fs, http, dir, remote: "trunk", ref: "main", singleBranch: true, onAuth: gitAuth(input.trunk.token) });
-	await git.fetch({ fs, http, dir, remote: "attempt", ref: "main", singleBranch: true, onAuth: gitAuth(input.attempt.token) });
-	const trunkSha = await git.resolveRef({ fs, dir, ref: "refs/remotes/trunk/main" });
-	const attemptSha = await git.resolveRef({ fs, dir, ref: "refs/remotes/attempt/main" });
+	await git.fetch({ fs, http, dir, remote: "trunk", ref: branch, singleBranch: true, onAuth: gitAuth(input.trunk.token) });
+	await git.fetch({ fs, http, dir, remote: "attempt", ref: branch, singleBranch: true, onAuth: gitAuth(input.attempt.token) });
+	const trunkSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/trunk/${branch}` });
+	const attemptSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/attempt/${branch}` });
 	if (await git.isDescendent({ fs, dir, oid: trunkSha, ancestor: attemptSha, depth: -1 }) || trunkSha === attemptSha) {
 		return { ok: false, reason: "nothing-to-land", trunkSha };
 	}
-	await git.writeRef({ fs, dir, ref: "refs/heads/main", value: trunkSha, force: true });
+	await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: trunkSha, force: true });
 
 	const conflicts: MergeConflict[] = [];
 	const reconciled: string[] = [];
 	try {
 		const merged = await git.merge({
-			fs, dir, ours: "main", theirs: "refs/remotes/attempt/main",
+			fs, dir, ours: branch, theirs: `refs/remotes/attempt/${branch}`,
 			fastForward: false, abortOnConflict: true,
 			message: input.message, author: input.author, committer: input.author,
 			mergeDriver: ({ contents, path }) => {
@@ -60,7 +63,7 @@ export async function land(input: LandInput): Promise<LandResult> {
 			},
 		});
 		const sha = merged.oid!;
-		const push = await git.push({ fs, http, dir, url: input.trunk.remote, ref: "main", onAuth: gitAuth(input.trunk.token) });
+		const push = await git.push({ fs, http, dir, url: input.trunk.remote, ref: branch, onAuth: gitAuth(input.trunk.token) });
 		if (!push.ok) throw new Error(`push to trunk rejected: ${JSON.stringify(push.refs)}`);
 		return { ok: true, sha, parentSha: trunkSha, reconciled };
 	} catch (e: any) {

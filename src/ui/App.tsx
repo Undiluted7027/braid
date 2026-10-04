@@ -30,10 +30,12 @@ function Projects() {
 	const { data, error } = useAsync(() => api<{ slug: string; name: string; description: string; createdAt: number }[]>("GET", "/projects"), [version]);
 	const [slug, setSlug] = useState("");
 	const [description, setDescription] = useState("");
+	const [source, setSource] = useState<"starter" | "import" | "empty">("starter");
+	const [url, setUrl] = useState("");
 	const create = useAction();
 	const submit = async (e: FormEvent) => {
 		e.preventDefault();
-		if (await create.run(() => api("POST", "/projects", { slug, name: slug, description }))) navigate(`/p/${slug}`);
+		if (await create.run(() => api("POST", "/projects", { slug, name: slug, description, source, url }))) navigate(`/p/${slug}`);
 		else setVersion((v) => v + 1);
 	};
 	return (
@@ -53,9 +55,17 @@ function Projects() {
 				<h2>New project</h2>
 				<label>Name<input value={slug} onChange={(e) => setSlug(e.target.value.toLowerCase())} placeholder="tally" pattern="[a-z0-9](?:[a-z0-9]|-(?!-)){1,38}[a-z0-9]" required /></label>
 				<label>Description<input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What this codebase is" /></label>
-				<p className="dim small">Creates an Artifacts repo seeded with a small no-build web app, so every attempt has a live preview.</p>
+				<label>Trunk starts from
+					<select value={source} onChange={(e) => setSource(e.target.value as typeof source)}>
+						<option value="starter">A starter app (small, no build, previewable)</option>
+						<option value="import">An existing git repository (import by URL)</option>
+						<option value="empty">Nothing yet (I will push a repository)</option>
+					</select>
+				</label>
+				{source === "import" && <label>Repository URL<input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/owner/repo" type="url" required /></label>}
+				{source === "empty" && <p className="dim small">From a local repository, <code>braid init {location.origin} --name {slug || "<name>"}</code> creates the project and pushes HEAD in one step.</p>}
 				{create.error && <p className="error">{create.error}</p>}
-				<button className="primary" disabled={create.busy}>{create.busy ? "Creating repo…" : "Create project"}</button>
+				<button className="primary" disabled={create.busy}>{create.busy ? (source === "import" ? "Importing…" : "Creating repo…") : "Create project"}</button>
 			</form>
 		</main>
 	);
@@ -75,7 +85,7 @@ function ProjectShell({ slug, rest }: { slug: string; rest: string[] }) {
 					<Link to={`/p/${slug}/why`} className={tab === "why" ? "on" : ""}>Why</Link>
 				</nav>
 				<span className="spacer" />
-				<span className="mono dim">trunk {state.project.head.slice(0, 7)}</span>
+				<span className="mono dim">trunk {state.project.head ? state.project.head.slice(0, 7) : "empty"}</span>
 				<span className={`live ${live ? "on" : ""}`}>{live ? "live" : "reconnecting"}</span>
 			</header>
 			{tab === "why" ? <WhyPage state={state} /> : tab === "intent" ? <IntentPage state={state} intentId={Number(rest[1])} /> : <ProjectPage state={state} />}

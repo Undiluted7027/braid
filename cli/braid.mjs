@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // braid: put a coding agent to work on an intent.
 //
+//   braid init <braid-url> --name <slug> [--from <dir>] [--description <text>]
+//       Create a project whose trunk is the HEAD of a local git repository (default: this one).
 //   braid join <project-url> --intent <n> [--agent <name>] [--dir <path>] [--run]
 //       Fork trunk into a new attempt, clone it, and wire the agent to Braid over MCP.
 //       --run starts the agent headless right away (claude or codex, from --agent). It runs
@@ -49,7 +51,7 @@ function scopeCredential(dir, remote, gitToken) {
 
 const PROMPT = `You are working on a Braid attempt. Read BRAID.md in this directory first and follow its protocol exactly.
 The braid MCP server is connected in this session: call its tools directly (brief, claim, record, checkpoint, ready, ...) and use the shell form only if an MCP call fails.
-Do the work the intent asks for, commit, push with \`git push origin HEAD:main\`, checkpoint after every push, record your decisions as you make them, and finish by marking the attempt ready.`;
+Do the work the intent asks for, commit, push with the command given in BRAID.md, checkpoint after every push, record your decisions as you make them, and finish by marking the attempt ready.`;
 
 async function joinCommand() {
 	const target = process.argv[3];
@@ -93,7 +95,7 @@ Tools: ${TOOLS.join(", ")}.
 ## Git
 
 - This directory is your attempt: a private fork of trunk. \`origin\` is already authenticated.
-- Push with \`git push origin HEAD:main\`, then call \`checkpoint\`.
+- Push with \`git push origin HEAD:${joined.branch}\`, then call \`checkpoint\`.
 - Do not commit BRAID.md, .mcp.json, or .braid/ (they are ignored locally).
 `);
 	// Local-only ignore: these files describe the session, not the change.
@@ -117,8 +119,29 @@ Tools: ${TOOLS.join(", ")}.
 	child.on("exit", (code) => process.exit(code ?? 0));
 }
 
+async function initCommand() {
+	let url;
+	try { url = new URL(process.argv[3]); } catch { fail("usage: braid init <braid-url> --name <slug> [--from <dir>] [--description <text>]"); }
+	const slug = String(flag("name", "")), from = resolve(String(flag("from", ".")));
+	if (!slug) fail("usage: braid init <braid-url> --name <slug> [--from <dir>] [--description <text>]");
+	const admin = flag("token", process.env.BRAID_ADMIN_TOKEN);
+	const post = async (path, body) => {
+		const res = await fetch(`${url.origin}/api${path}`, { method: "POST", headers: { "content-type": "application/json", ...(admin ? { authorization: `Bearer ${admin}` } : {}) }, body: JSON.stringify(body) });
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok) fail(data.error ?? `${path} failed (${res.status})`);
+		return data;
+	};
+	const head = execFileSync("git", ["-C", from, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+	await post("/projects", { slug, name: slug, description: String(flag("description", "")), source: "empty" });
+	const cred = await post(`/p/${slug}/trunk-credentials`, {});
+	execFileSync("git", ["-C", from, "-c", `http.extraHeader=Authorization: Bearer ${cred.gitToken}`, "push", "-q", cred.remote, `HEAD:refs/heads/${cred.branch}`], { stdio: "inherit" });
+	await post(`/p/${slug}/push`, { repo: `${slug}--trunk` });
+	console.log(`Project ${slug} created with trunk at ${head.slice(0, 7)}\n${url.origin}/p/${slug}`);
+}
+
 const command = process.argv[2];
 if (command === "join") await joinCommand();
+else if (command === "init") await initCommand();
 else if (command === "auth") {
 	const a = findAttempt();
 	const res = await fetch(`${a.base}/api/p/${a.project}/credentials`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentToken: a.agentToken }) });
@@ -131,6 +154,6 @@ else if (command === "auth") {
 	if (process.argv[3]) { try { args = JSON.parse(process.argv[3]); } catch { fail("tool arguments must be one JSON object"); } }
 	console.log(await callTool(findAttempt(), command, args));
 } else {
-	console.log(`braid join <project-url> --intent <n> [--agent <name>] [--dir <path>] [--run] [--token <admin token>]\nbraid <${TOOLS.join("|")}> ['<json args>']\nbraid auth`);
+	console.log(`braid init <braid-url> --name <slug> [--from <dir>]\nbraid join <project-url> --intent <n> [--agent <name>] [--dir <path>] [--run] [--token <admin token>]\nbraid <${TOOLS.join("|")}> ['<json args>']\nbraid auth`);
 	process.exit(command && command !== "help" && command !== "--help" ? 1 : 0);
 }

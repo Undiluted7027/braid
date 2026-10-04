@@ -69,6 +69,8 @@ export class Project extends DurableObject<BraidEnv> {
 	private meta(k: string): string { return this.rows<{ v: string }>("SELECT v FROM meta WHERE k = ?", k)[0]?.v ?? ""; }
 	private setMeta(k: string, v: string) { this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", k, v); }
 	private get trunk() { return this.meta("repo"); }
+	/** Trunk's branch. Imported repositories keep their own default branch; attempts are forks and share it. */
+	private get branch() { return this.meta("branch") || "main"; }
 	private requireProject() { if (!this.trunk) throw new BraidError("project not found", 404); }
 
 	/** Run one mutation at a time. Git and Artifacts calls yield, so the DO's input gate alone is not enough. */
@@ -158,18 +160,51 @@ export class Project extends DurableObject<BraidEnv> {
 
 	// ── project lifecycle ────────────────────────────────────────────────────
 
-	async init(input: { slug: string; name: string; description: string }) {
+	/**
+	 * Create the trunk repo. `starter` seeds a small demo app, `import` copies an existing
+	 * git repository, and `empty` waits for a first push (see trunkCredentials).
+	 */
+	async init(input: { slug: string; name: string; description: string; source?: "starter" | "empty" | "import"; url?: string; branch?: string }) {
 		if (this.trunk) throw new BraidError("project already exists", 409);
 		const repo = `${input.slug}--trunk`;
-		const created = await this.host.create(repo, `Braid trunk for ${input.name}`);
-		const head = await seed(created.remote, created.token, DEMO_FILES, "Seed project", { name: "Braid", email: "seed@braid.dev" });
+		// This project has no state, so a repo with its trunk name is left over from a failed create. Clear it.
+		await this.host.remove(repo).catch(() => {});
+		const source = input.source ?? "starter";
+		let remote: string, head = "", branch = "main";
+		if (source === "import") {
+			if (!input.url) throw new BraidError("import needs a repository URL");
+			const imported = await this.host.importRepo(input.url, repo, input.branch);
+			remote = imported.remote;
+			// The reported default branch is not always the one that was imported, so look for commits.
+			const tried: string[] = [];
+			for (const candidate of [...new Set([input.branch, imported.defaultBranch, "main", "master"].filter(Boolean) as string[])]) {
+				tried.push(candidate);
+				head = (await this.host.log(repo, candidate, 1))[0]?.hash ?? "";
+				if (head) { branch = candidate; break; }
+			}
+			if (!head) {
+				await this.host.remove(repo).catch(() => {});
+				throw new BraidError(`imported ${input.url} but found no commits on ${tried.join(", ")}; pass the branch to import`);
+			}
+		} else {
+			const created = await this.host.create(repo, `Braid trunk for ${input.name}`);
+			remote = created.remote;
+			if (source === "starter") head = await seed(created.remote, created.token, DEMO_FILES, "Seed project", { name: "Braid", email: "seed@braid.dev" });
+		}
 		this.setMeta("slug", input.slug);
 		this.setMeta("name", input.name);
 		this.setMeta("description", input.description);
 		this.setMeta("repo", repo);
-		this.setMeta("remote", created.remote);
+		this.setMeta("remote", remote);
+		this.setMeta("branch", branch);
 		this.setMeta("head", head);
-		this.note("project", "braid", `Project created with trunk ${repo} at ${short(head)}`);
+		this.note("project", "braid", head ? `Project created with trunk ${repo} at ${short(head)}` : `Project created with an empty trunk ${repo}; waiting for a first push`);
+	}
+
+	/** A short-lived write credential for trunk, for pushing a first commit into an empty project. */
+	async trunkCredentials() {
+		this.requireProject();
+		return { remote: this.meta("remote"), branch: this.branch, gitToken: await this.host.token(this.trunk, "write", 900) };
 	}
 
 	async destroy() {
@@ -185,7 +220,7 @@ export class Project extends DurableObject<BraidEnv> {
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
-				repo: this.trunk, remote: this.meta("remote"), head: this.meta("head"), llm: llmName(this.env),
+				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), llm: llmName(this.env),
 			},
 			intents: this.intents(),
 			attempts: this.attempts(),
@@ -228,12 +263,13 @@ export class Project extends DurableObject<BraidEnv> {
 		this.requireProject();
 		const intent = this.intent(input.intentId);
 		if (intent.status !== "open") throw new BraidError(`I${intent.id} is ${intent.status}`);
+		if (!this.meta("head")) throw new BraidError("trunk has no commits yet: push a first commit before starting attempts");
 		const agent = (input.agent || "agent").trim().slice(0, 40);
 		const n = this.rows<{ n: number }>("SELECT COUNT(*) AS n FROM attempts WHERE intent_id = ?", intent.id)[0].n + 1;
 		const id = `${intent.id}.${n}`;
 		const repo = `${this.meta("slug")}--i${intent.id}-a${n}-${crypto.randomUUID().slice(0, 4)}`;
 		const forked = await this.host.fork(this.trunk, repo, `Braid attempt ${id} (${agent}) for: ${intent.title}`);
-		const base = (await this.host.log(repo, "main", 1))[0]?.hash ?? this.meta("head");
+		const base = (await this.host.log(repo, this.branch, 1))[0]?.hash ?? this.meta("head");
 		const token = "brd_" + [...crypto.getRandomValues(new Uint8Array(20))].map((b) => b.toString(16).padStart(2, "0")).join("");
 		this.sql.exec(
 			`INSERT INTO attempts (id, intent_id, agent, kind, repo, remote, token, base_sha, head_sha, trunk_seen, status, summary, files, claims, behind,
@@ -242,7 +278,7 @@ export class Project extends DurableObject<BraidEnv> {
 		);
 		this.note("attempt", agent, `${agent} started attempt ${id} on I${intent.id} from ${short(base)}`, intent.id, id);
 		return {
-			attemptId: id, intentId: intent.id, remote: forked.remote, gitToken: forked.token, agentToken: token,
+			attemptId: id, intentId: intent.id, branch: this.branch, remote: forked.remote, gitToken: forked.token, agentToken: token,
 			mcpUrl: `${input.origin}/mcp/${this.meta("slug")}`, brief: this.briefText(this.attempt(id)),
 		};
 	}
@@ -259,14 +295,17 @@ export class Project extends DurableObject<BraidEnv> {
 	// ── awareness: what changed, and who is about to collide ─────────────────
 
 	private async trunkLog(): Promise<CommitMeta[]> {
-		const log = await this.host.log(this.trunk, "main", 300);
-		if (log[0] && log[0].hash !== this.meta("head")) this.setMeta("head", log[0].hash);
+		const log = await this.host.log(this.trunk, this.branch, 300);
+		if (log[0] && log[0].hash !== this.meta("head")) {
+			if (!this.meta("head")) this.note("project", "braid", `Trunk received its first commit ${short(log[0].hash)}`);
+			this.setMeta("head", log[0].hash);
+		}
 		return log;
 	}
 
 	/** Re-read an attempt from Artifacts: head, the trunk commit it is based on, changed files, conflicts with trunk. */
 	private async refresh(a: Attempt, trunkLog: CommitMeta[]): Promise<Attempt> {
-		const head = (await this.host.log(a.repo, "main", 1))[0];
+		const head = (await this.host.log(a.repo, this.branch, 1))[0];
 		const trunkHead = trunkLog[0];
 		if (!head || !trunkHead) return a;
 		const seen = this.rows<{ trunk_seen: string }>("SELECT trunk_seen FROM attempts WHERE id = ?", a.id)[0]?.trunk_seen;
@@ -489,7 +528,7 @@ export class Project extends DurableObject<BraidEnv> {
 				return {
 					trunk_head: this.meta("head"),
 					trunk_url: url,
-					commands: [`git fetch ${url} main`, "git merge FETCH_HEAD", "git push origin HEAD:main"],
+					commands: [`git fetch ${url} ${this.branch}`, "git merge FETCH_HEAD", `git push origin HEAD:${this.branch}`],
 					note: "Merging trunk into your attempt and resolving conflicts in your working copy is always a valid way to reconcile. Call checkpoint after pushing.",
 				};
 			}
@@ -525,7 +564,7 @@ export class Project extends DurableObject<BraidEnv> {
 			"1. `brief` first: see who else is working and why.",
 			"2. `claim` the paths you expect to change before editing, so others hear about it early.",
 			"3. `record` every real decision as you make it (what you chose, what you rejected, what you assumed). This is the project's memory of why.",
-			"4. Commit and `git push origin HEAD:main` often, then `checkpoint`. Braid answers with overlaps and predicted conflicts, including the other agent's reasoning.",
+			`4. Commit and \`git push origin HEAD:${this.branch}\` often, then \`checkpoint\`. Braid answers with overlaps and predicted conflicts, including the other agent's reasoning.`,
 			"5. Read `heads_up` on every response. If another intent conflicts with yours, adapt, or `message` that agent.",
 			"6. `ready` with a summary when the goal is met. A human or reviewer lands it.",
 			"7. If landing conflicts, `reconciliation` gives you both sides and why each exists; answer with `resolve`.",
@@ -570,6 +609,7 @@ export class Project extends DurableObject<BraidEnv> {
 			const resolvedRow = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id DESC LIMIT 1", a.id)[0];
 			const recon = resolvedRow ? this.toRecon(resolvedRow) : null;
 			const result = await land({
+				branch: this.branch,
 				trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
 				attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
 				message: this.landingMessage(intent, a, recon),
@@ -693,15 +733,15 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	private where(ref: string) {
-		if (ref === "trunk") return { repo: this.trunk, ref: "main" };
+		if (ref === "trunk") return { repo: this.trunk, ref: this.branch };
 		const a = this.attempt(ref);
-		return { repo: a.repo, ref: "main" };
+		return { repo: a.repo, ref: this.branch };
 	}
 
 	async tree(ref: string): Promise<string[]> {
 		this.requireProject();
 		const { repo } = this.where(ref);
-		const head = (await this.host.log(repo, "main", 1))[0];
+		const head = (await this.host.log(repo, this.branch, 1))[0];
 		return head ? listTree(this.host, repo, head.treeHash) : [];
 	}
 
@@ -714,7 +754,7 @@ export class Project extends DurableObject<BraidEnv> {
 	/** A trunk file with line-level why: which landing (and so which intent) last wrote each line. */
 	async file(path: string): Promise<FileView> {
 		this.requireProject();
-		const content = asText(await this.host.readFile(this.trunk, "main", path));
+		const content = asText(await this.host.readFile(this.trunk, this.branch, path));
 		const trail = this.landings().filter((l) => l.files.includes(path));
 		if (content === null) return { path, content: null, binary: true, blame: [], trail };
 		const split = (s: string | null) => (s ? s.replace(/\n$/, "").split("\n") : []);

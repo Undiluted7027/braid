@@ -10,11 +10,12 @@ export interface CommitMeta {
 	authoredAt: number;
 }
 export interface TreeEntry { name: string; mode: string; hash: string; type: "tree" | "blob" | "symlink" | "gitlink" | "exec" }
-export interface RepoRef { name: string; remote: string; token: string }
+export interface RepoRef { name: string; remote: string; token: string; defaultBranch: string }
 
 export interface RepoHost {
 	create(name: string, description?: string): Promise<RepoRef>;
 	fork(source: string, name: string, description?: string): Promise<RepoRef>;
+	importRepo(url: string, name: string, branch?: string): Promise<RepoRef>;
 	remote(name: string): Promise<string>;
 	token(name: string, scope: "read" | "write", ttlSeconds: number): Promise<string>;
 	log(name: string, ref: string, limit: number): Promise<CommitMeta[]>;
@@ -31,13 +32,13 @@ export class ArtifactsHost implements RepoHost {
 	constructor(private ns: Artifacts) {}
 
 	// Forks and creates are asynchronous; get() throws *_IN_PROGRESS until the repo is ready.
-	private async open(name: string): Promise<ArtifactsRepo> {
-		for (let i = 0; ; i++) {
+	private async open(name: string, waitMs = 10_000): Promise<ArtifactsRepo> {
+		for (const deadline = Date.now() + waitMs; ; ) {
 			try {
 				return await this.ns.get(name);
 			} catch (e) {
 				const code = (e as ArtifactsError).code ?? "";
-				if (!code.endsWith("_IN_PROGRESS") || i >= 40) throw e;
+				if (!code.endsWith("_IN_PROGRESS") || Date.now() > deadline) throw e;
 				await sleep(250);
 			}
 		}
@@ -49,12 +50,18 @@ export class ArtifactsHost implements RepoHost {
 
 	async create(name: string, description?: string) {
 		const r = await this.ns.create(name, { description, setDefaultBranch: "main" });
-		return { name: r.name, remote: r.remote, token: r.token };
+		return { name: r.name, remote: r.remote, token: r.token, defaultBranch: r.defaultBranch };
 	}
 	async fork(source: string, name: string, description?: string) {
 		const r = await this.with(source, (repo) => repo.fork(name, { description, defaultBranchOnly: true }));
 		await this.with(name, (repo) => repo.info()); // wait until the fork is ready
-		return { name: r.name, remote: r.remote, token: r.token };
+		return { name: r.name, remote: r.remote, token: r.token, defaultBranch: r.defaultBranch };
+	}
+	async importRepo(url: string, name: string, branch?: string) {
+		const r = await this.ns.import({ source: { url, branch }, target: { name } });
+		using ready = await this.open(name, 120_000); // imports of real repositories take a while
+		// The imported repo keeps its own default branch (often not "main").
+		return { name: r.name, remote: r.remote, token: r.token, defaultBranch: (await ready.info()).defaultBranch };
 	}
 	remote(name: string) { return this.with(name, async (r) => (await r.info()).remote); }
 	token(name: string, scope: "read" | "write", ttl: number) {
