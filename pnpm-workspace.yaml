@@ -1,7 +1,4 @@
+# pnpm 11 refuses to run package scripts until dependency build scripts are approved or denied.
 allowBuilds:
-  esbuild: set this to true or false
-  workerd: set this to true or false
-onlyBuiltDependencies:
-  - esbuild
-  - workerd
-  - sharp
+  esbuild: true
+  workerd: true

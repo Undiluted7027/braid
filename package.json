@@ -12,7 +12,7 @@
     "dev": "vite build && wrangler dev --port 8787",
     "build": "vite build",
     "deploy": "vite build && wrangler deploy",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "wrangler types && tsc --noEmit",
     "test": "node --test test/*.test.mjs",
     "sim": "node scripts/sim.mjs"
   },
