@@ -62,7 +62,7 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Open: the queue does not bring an agent back by itself when a merge fails; a person presses "Have it fix the merge with trunk".
    - Open: no spending budget per agent beyond the 45-minute limit and the six-agent limit.
    - Open: an attempt can still change what a check script does (`"test": "true"`). It shows in the diff; nothing flags it.
-2. **A person can respond.** Done locally on October 4, 2026; not yet deployed.
+2. **A person can respond.** Done and deployed on October 4, 2026.
    - Done: "Send back for changes" on an attempt. The note is kept with the attempt's decisions (kind `feedback`), so it is in the why log, the brief and the landing commit. The attempt goes back to working, a landing that was asked for is dropped, and the agent hears it in `heads_up`. For Claude Code and Codex attempts Braid starts the agent again in a sandbox to act on it. Checked with a hosted Claude Code run: it made the change asked for, recorded how, and the note is in the landing commit message.
    - Done: a reply box under each unanswered `question` an agent recorded; the answer is kept as a decision (kind `answer`). "Just tell it" sends a message without changing the attempt.
    - Done: an open intent can be edited and abandoned from its page; agents working on it are told the new text.
@@ -124,8 +124,7 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
 - **Recovery paths in item 1.** A run interrupted mid-way, and a landing interrupted between the push and its record, are handled in code but were not forced to happen.
-- **Item 2 on the deployed instance.** Responding to an attempt, answering a question, editing an intent, reopening and reverting have only run locally.
-- **On the deployed instance, from item 1:** a conflict resolved and then verified as a merge, cancelling a landing, "Land now", and stopping a hosted agent by abandoning its attempt. These ran locally only.
+- **On the deployed instance: landing refused while a hosted agent is still working.** It ran locally; on the deployed instance my request arrived before the agent had pushed anything, so it was refused for having no commits instead.
 
 Model-backed reconciliation (Workers AI and Claude) and a real-agent conflict through reconciliation were both verified locally on October 4, 2026, in the acceptance test for step 4.
 
@@ -138,6 +137,7 @@ Checked on October 4, 2026:
   - A commit with a failing test was pushed to a third attempt. Claude Code, brought back to fix it, found the cause, pushed, waited for verification to pass and marked the attempt ready.
   - A second conflict was reconciled with Claude through the gateway, and trunk verification passed afterwards.
 - Item 1 on the deployed instance, in a separate project (`dep-item1`, since deleted): a landing asked for before verification finished waited and landed by itself; an attempt that passed alone and failed when merged with trunk was refused with trunk untouched, and Claude Code, brought back, merged trunk, fixed it and it landed; a landing was refused for the wrong commit and when the attempt moved after the request; an attempt that removed the test script and added its own `braid.json` still had the test run; on a failing trunk a bystander was refused and a fix landed; a landed attempt's tools were refused; creating a project named after an existing repository was refused. The existing `braid` project loaded after the schema change.
+- Item 2 on the deployed instance, in a separate project (`dep-item2`, since deleted): an answer, a message and an intent edit all reached the agent's next tool response; feedback on a ready attempt sent it back and dropped its queued landing; abandon and reopen; a landing reverted with a later landing kept; hosted Codex, sent back with a note, came back, made the change, recorded how, and it landed. Also the item 1 checks that had only run locally: a resolved conflict was verified as a merge before it landed, a landing was cancelled, "Land now" landed without waiting, and abandoning an attempt stopped its running agent.
 - Deployed at https://braid.undiluted7027.workers.dev: the push-event Workflow (a push with no `checkpoint` updated the attempt), sandbox runs and their isolation on Cloudflare's microVM, sign-in, the live socket, both kinds of preview, `ready` refused on a failed commit, and the forced-landing confirmation.
 
 The `braid` project now lives on the deployed instance. It was moved there with its intents, decisions, landings and sessions; the local instance has forgotten it.
