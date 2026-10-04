@@ -40,7 +40,12 @@ A scripted run with deterministic "agents". Everything else is real: Artifacts f
 
 ### Put real agents on it
 
-1. Open http://localhost:8787, create a project, and open an intent or two.
+1. Open http://localhost:8787, create a project, and open an intent or two. A project's trunk can start from the built-in starter app, from an existing git repository imported by URL, or from a local repository:
+
+```sh
+node cli/braid.mjs init http://localhost:8787 --name my-project --from /path/to/repo   # pushes that repo's HEAD as trunk
+```
+
 2. For each agent, in its own terminal:
 
 ```sh
@@ -78,7 +83,6 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 
 ## Limits
 
-- New projects are seeded from a built-in starter (a small no-build web app). Importing an existing repository is not wired up.
 - Previews serve files as they are; projects that need a build step have no preview.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`).
