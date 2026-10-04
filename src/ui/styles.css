@@ -142,6 +142,11 @@ label input, label textarea { color: var(--ink); font-size: 14px; }
 .chip.conflict, .chip.conflicted { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
 .chip.touch { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
 .chip.working { color: var(--ink); }
+.danger-zone { margin-top: 32px; }
+form.danger-zone { border-color: var(--bad); max-width: 520px; }
+button.danger { color: var(--bad); }
+button.danger:hover { border-color: var(--bad); }
+button.danger.solid { background: var(--bad); border-color: var(--bad); color: var(--surface); font-weight: 600; }
 .join { margin-top: 10px; padding: 10px 12px; background: var(--sunk); border-radius: 6px; display: grid; gap: 8px; }
 .cmd { flex: 1; min-width: 200px; padding: 6px 9px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; white-space: nowrap; }
 
