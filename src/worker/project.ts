@@ -12,7 +12,7 @@ import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Intent, JoinResult, Landing, LandOutcome, Overlap, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
+	Intent, JoinResult, Landing, LandOutcome, LineOrigin, Overlap, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
@@ -938,10 +938,13 @@ export class Project extends DurableObject<BraidEnv> {
 			case "record": {
 				const kind = (["decision", "assumption", "rejected", "question", "note"].includes(args.kind) ? args.kind : "decision") as DecisionKind;
 				if (!args.title) throw new BraidError("record needs a title");
+				// A title alone says what, not why. The why is the point: it is shown on the lines this decision led to.
+				if (kind !== "question" && kind !== "note" && !String(args.body ?? "").trim()) throw new BraidError(`a ${kind} needs a body: say why, in a sentence or two (what you weighed, what you ruled out)`);
+				const named = (args.files ?? []).map(String).filter(Boolean);
 				this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 					me.id, me.intentId, me.agent, kind, redact(String(args.title)), redact(String(args.body ?? "")), json((args.files ?? []).map(String)), me.headSha, now());
 				this.note("why", me.agent, `${me.agent} recorded ${kind}: ${args.title}`, me.intentId, me.id);
-				return { recorded: true };
+				return { recorded: true, ...(named.length || kind === "question" ? {} : { tip: "Name the files this is about in `files`, so it is shown on the lines it led to." }) };
 			}
 			case "checkpoint": {
 				await this.serial(() => this.recompute());
@@ -970,7 +973,7 @@ export class Project extends DurableObject<BraidEnv> {
 				return { delivered_to: targets.map((t) => t.id) };
 			}
 			case "check": {
-				const check: Check = { name: String(args.name), status: args.status === "pass" ? "pass" : "fail", detail: String(args.detail ?? ""), at: now() };
+				const check: Check = { name: String(args.name), status: args.status === "pass" ? "pass" : "fail", detail: redact(String(args.detail ?? "")).slice(0, 2000), at: now() };
 				me.checks = [...me.checks.filter((c) => c.name !== check.name), check];
 				this.saveAttempt(me);
 				this.note("check", me.agent, `${me.agent} reported check "${check.name}": ${check.status}`, me.intentId, me.id);
@@ -1542,28 +1545,120 @@ export class Project extends DurableObject<BraidEnv> {
 		return bytes ? { bytes, path, built: false, api: false } : null;
 	}
 
-	/** A trunk file with line-level why: which landing (and so which intent) last wrote each line. */
+	/**
+	 * A trunk file with its why, line by line. Each line is traced along trunk's own history to the
+	 * commit that wrote it: a landing (and inside it, the commit the agent made in its attempt, or the
+	 * reconciliation), a revert, or a push from outside Braid. For an agent's commit, the decisions it
+	 * recorded while making it and the place in its session are attached, so a line leads to the moment it was written.
+	 */
+	private fileViews = new Map<string, { head: string; view: FileView }>();
 	async file(path: string): Promise<FileView> {
 		this.requireProject();
-		const content = asText(await this.host.readFile(this.trunk, this.branch, path));
-		const trail = this.landings().filter((l) => l.files.includes(path));
-		if (content === null) return { path, content: null, binary: true, blame: [], trail };
+		const head = this.meta("head"), cached = this.fileViews.get(path);
+		if (cached?.head === head) return cached.view;
 		const split = (s: string | null) => (s ? s.replace(/\n$/, "").split("\n") : []);
-		let blame: BlameLine[] = [];
-		if (trail.length) blame = split(asText(await this.host.readFile(this.trunk, trail[0].parentSha, path))).map((text) => ({ text, sha: null }));
-		else blame = split(content).map((text) => ({ text, sha: null }));
-		for (const l of trail) {
-			const next = split(asText(await this.host.readFile(this.trunk, l.sha, path)));
-			const out: BlameLine[] = [];
-			let i = 0;
-			for (const part of diffArrays(blame.map((b) => b.text), next)) {
+		const read = async (ref: string) => { try { return asText(await this.host.readFile(this.trunk, ref, path)); } catch { return null; } };
+		const content = await read(this.branch);
+		const trail = this.landings().filter((l) => l.files.includes(path));
+		if (content === null) return { path, content: null, binary: true, blame: [], trail, origins: {} };
+
+		const chain = [...(await this.host.log(this.trunk, this.branch, 300))].reverse(); // oldest first, trunk's own line
+		const landings = new Map(this.landings().map((l) => [l.sha, l]));
+		const trunkLine = new Set(chain.map((c) => c.hash));
+		const when = (c: CommitMeta) => (c.authoredAt < 1e12 ? c.authoredAt * 1000 : c.authoredAt);
+		const meta = (c: CommitMeta) => ({ sha: c.hash, subject: c.message.split("\n")[0].slice(0, 200), author: c.author.name, at: when(c) });
+		/** Read many versions of the file without opening hundreds of requests at once. */
+		const readAll = async (refs: string[]) => {
+			const out: (string | null)[] = new Array(refs.length).fill(null);
+			for (let i = 0; i < refs.length; i += 12) await Promise.all(refs.slice(i, i + 12).map(async (ref, j) => { out[i + j] = await read(ref); }));
+			return out;
+		};
+		/** Follow one version to the next: lines that survive keep their mark, new lines get `mark(index in next)`. */
+		const step = <T>(prev: { text: string; mark: T }[], next: string[], mark: (index: number) => T) => {
+			const out: { text: string; mark: T }[] = [];
+			let i = 0, j = 0;
+			for (const part of diffArrays(prev.map((b) => b.text), next)) {
 				if (part.removed) i += part.value.length;
-				else if (part.added) out.push(...part.value.map((text) => ({ text, sha: l.sha })));
-				else { out.push(...blame.slice(i, i + part.value.length)); i += part.value.length; }
+				else if (part.added) for (const text of part.value) out.push({ text, mark: mark(j++) });
+				else { out.push(...prev.slice(i, i + part.value.length)); i += part.value.length; j += part.value.length; }
 			}
-			blame = out;
+			return out;
+		};
+
+		// A landing that does not list this file cannot have changed it, so its version is not read.
+		const mayChange = chain.map((c) => { const l = landings.get(c.hash); return !l || l.files.includes(path); });
+		const versions = await readAll(chain.filter((_, i) => mayChange[i]).map((c) => c.hash));
+		const origins: Record<string, LineOrigin> = {};
+		let lines: { text: string; mark: { sha: string | null; origin?: string } }[] = [];
+		let before: string | null = null, v = 0;
+		for (let n = 0; n < chain.length; n++) {
+			if (!mayChange[n]) continue;
+			const c = chain[n], now = versions[v++], l = landings.get(c.hash);
+			if (now === before) continue;
+			const next = split(now);
+			if (!c.parents.length) {
+				lines = step(lines, next, () => ({ sha: null }));
+			} else if (!l) {
+				origins[c.hash] = { key: c.hash, kind: "outside", landingSha: null, attemptId: null, commit: meta(c), decisionIds: [], eventId: null };
+				lines = step(lines, next, () => ({ sha: null, origin: c.hash }));
+			} else if (l.revertOf) {
+				origins[c.hash] = { key: c.hash, kind: "revert", landingSha: l.sha, attemptId: l.attemptId, commit: meta(c), decisionIds: this.rows<{ id: number }>("SELECT id FROM decisions WHERE attempt_id = ? AND title = 'Landing reverted'", l.attemptId).map((d) => d.id), eventId: null };
+				lines = step(lines, next, () => ({ sha: l.sha, origin: c.hash }));
+			} else {
+				const inside = await this.insideLanding(l, c, next, trunkLine, readAll, read, split, step, when, meta, path, origins);
+				lines = step(lines, next, (j) => ({ sha: l.sha, origin: inside[j] }));
+			}
+			before = now;
 		}
-		return { path, content, binary: false, blame, trail };
+		// Trunk beyond what was read (more than 300 commits back) is shown without marks rather than with wrong ones.
+		if (lines.map((b) => b.text).join("\n") !== split(content).join("\n")) lines = split(content).map((text) => ({ text, mark: { sha: null } }));
+		const view: FileView = { path, content, binary: false, blame: lines.map((b) => ({ text: b.text, ...b.mark })), trail, origins };
+		if (this.fileViews.size > 200) this.fileViews.clear();
+		this.fileViews.set(path, { head, view });
+		return view;
+	}
+
+	/**
+	 * For one landing: which of the agent's own commits wrote each line of the landed file. Returns, per
+	 * line of the landed version, the key of its origin. A line that is not in the attempt's last commit
+	 * was written by the merge itself, which for a reconciled landing means by whoever reconciled.
+	 */
+	private async insideLanding(
+		l: Landing, landed: CommitMeta, landedLines: string[], trunkLine: Set<string>,
+		readAll: (refs: string[]) => Promise<(string | null)[]>, read: (ref: string) => Promise<string | null>, split: (s: string | null) => string[],
+		step: <T>(prev: { text: string; mark: T }[], next: string[], mark: (index: number) => T) => { text: string; mark: T }[],
+		when: (c: CommitMeta) => number, meta: (c: CommitMeta) => { sha: string; subject: string; author: string; at: number }, path: string, origins: Record<string, LineOrigin>,
+	): Promise<(string | undefined)[]> {
+		const mergeKey = `${l.sha}:merge`;
+		const reconciled = this.rows<{ id: number }>("SELECT id FROM decisions WHERE attempt_id = ? AND title LIKE 'Reconciled with trunk%' ORDER BY id", l.attemptId).map((d) => d.id);
+		origins[mergeKey] = { key: mergeKey, kind: l.reconciled ? "reconcile" : "merge", landingSha: l.sha, attemptId: l.attemptId, commit: meta(landed), decisionIds: l.reconciled ? reconciled : [], eventId: null };
+		const headSha = landed.parents[1];
+		if (!headSha) return landedLines.map(() => mergeKey);
+		const made: CommitMeta[] = [];
+		for (const c of await this.host.log(this.trunk, headSha, 50).catch(() => [] as CommitMeta[])) { if (trunkLine.has(c.hash)) break; made.push(c); }
+		made.reverse(); // oldest first
+		if (!made.length) return landedLines.map(() => mergeKey);
+
+		const base = made[0].parents[0] ? await read(made[0].parents[0]) : null;
+		const versions = await readAll(made.map((c) => c.hash));
+		let lines: { text: string; mark: string | undefined }[] = split(base).map((text) => ({ text, mark: undefined }));
+		let before = base;
+		const decisions = this.decisionsFor(l.attemptId).filter((d) => d.kind !== "feedback" && d.kind !== "answer" && !d.title.startsWith("Reconciled with trunk"));
+		const about = (d: Decision) => d.files.some((f) => claimMatches(f, path) || claimMatches(path, f));
+		const name = path.slice(path.lastIndexOf("/") + 1);
+		made.forEach((c, k) => {
+			if (versions[k] === before) return;
+			// What the agent did between its previous commit and this one is what produced this one.
+			const from = k === 0 ? 0 : when(made[k - 1]), to = k === made.length - 1 ? Infinity : when(c);
+			const during = decisions.filter((d) => d.at > from && d.at <= to);
+			const picked = during.some(about) ? during.filter(about) : during.length ? during : decisions.filter(about);
+			const event = this.rows<{ id: number }>("SELECT id FROM session WHERE attempt_id = ? AND at > ? AND at <= ? AND kind = 'tool' AND text LIKE ? ORDER BY (CASE WHEN lower(tool) IN ('edit', 'write', 'multiedit', 'apply_patch') THEN 0 ELSE 1 END), id LIMIT 1", l.attemptId, from, to === Infinity ? Number.MAX_SAFE_INTEGER : to, `%${name}%`)[0];
+			origins[c.hash] = { key: c.hash, kind: "attempt", landingSha: l.sha, attemptId: l.attemptId, commit: meta(c), decisionIds: picked.map((d) => d.id), eventId: event?.id ?? null };
+			lines = step(lines, split(versions[k]), () => c.hash);
+			before = versions[k];
+		});
+		// Carry those marks across the merge: a landed line the attempt's last commit also has keeps its commit.
+		return step(lines, landedLines, () => mergeKey as string | undefined).map((b) => b.mark);
 	}
 
 	/** Fresh git credentials for an attempt (the token returned by join is short-lived). */

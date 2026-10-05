@@ -97,12 +97,14 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Done: the local `demo-ready`, `demo-conflict` and `demo-done` projects were recreated with the current starter app (`BRAID_PROJECT=<name> pnpm sim --until=ready`, `--until=conflict`, `--keep`), so every attempt in them shows a real test run.
    - Open: trunk history reads at most 300 commits of trunk's own line and 50 per attempt.
    - Open: sessions from `pnpm sim` hold only the scripted agents' Braid calls.
-5. **Why by line.**
-   - Clicking a line shows every decision the attempt recorded for that file. Link a line to the decision and the moment in the session that produced it.
-   - The Why view replays recorded landings only, so a change pushed to trunk outside Braid is shown with stale attribution. Attribute outside changes.
-   - Decisions are long paragraphs stacked above the diff; put the change and its evidence first. `record` accepts a title with no body or files. A landed or abandoned attempt can still record. Nothing requires any why before `ready` (a forced record invites filler, so prefer tying why to lines over making it mandatory).
-   - `by` on landings is a string the client sends: there are no people behind the one admin token.
-   - A check's `detail` is not redacted before it is committed to the context repo.
+5. **Why by line.** Done locally on October 4, 2026; not yet deployed.
+   - Done: a trunk file is traced along trunk's own history, commit by commit. A line belongs to the landing that put it there and, inside that landing, to the commit the agent made in its attempt. That commit carries the decisions the agent recorded between its previous commit and this one (those naming the file first) and the place in its session where it edited the file.
+   - Done: the Why page selects a run of lines, not a whole landing. It shows the commit, "decided while writing these lines", then other decisions about the file, and a link that opens the intent page on that attempt's Session tab with the edit in view and marked. Checked on `real-test`: seven lines from a hosted Codex attempt led to its one decision and to the edit event in its session.
+   - Done: lines that are in neither side of a merge are marked as written while reconciling, with the rationale. Lines pushed to trunk outside Braid are marked "out" and show their commit's subject, author and time, so they no longer wear a stale intent.
+   - Done: `record` refuses a decision, assumption or rejection with no body, and reminds the agent to name files when it names none. A check's `detail` is redacted before it is stored.
+   - Open: an attempt with one commit puts all its decisions on all its lines; the finer link needs agents that commit as they go. An attempt with no captured session has no moment to show.
+   - Open: the trace reads trunk's last 300 commits and 50 per attempt, and is rebuilt for each file when trunk moves (about six seconds locally for a file with five landings).
+   - Open: `by` on a landing is still a name the client sends. There are no people behind the one admin token.
 6. **Planner and reviewer agent**, with whatever time is left, then the video.
 
 Also from the reviews:
@@ -153,6 +155,7 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 ## Not verified yet
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
+- **Item 5 on the deployed instance.** Line-level why has only run locally. The `braid` project there is the real test: most of its commits were pushed outside Braid, and its files are large.
 - **A landing interrupted between the push and its record.** Handled in code, never forced to happen. (An interrupted run did happen, during a deploy on October 4: it was reported as "could not run" and ran again when asked.)
 - **The region editor on the deployed instance.** It was used in Chrome locally; on the deployed instance resolutions went through the API, the model and a hosted agent.
 - **On the deployed instance: landing refused while a hosted agent is still working.** It ran locally; on the deployed instance my request arrived before the agent had pushed anything, so it was refused for having no commits instead.

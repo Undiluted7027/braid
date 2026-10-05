@@ -12,13 +12,13 @@ const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: "2-dig
 
 type Row = { key: string; at: number; event?: SessionEvent; decision?: Decision };
 
-function EventRow({ e }: { e: SessionEvent }) {
-	const [open, setOpen] = useState(false);
+function EventRow({ e, focused }: { e: SessionEvent; focused: boolean }) {
+	const [open, setOpen] = useState(focused);
 	const lines = e.text.split("\n");
 	const long = lines.length > 4 || e.text.length > 400;
 	const shown = open || !long ? e.text : lines.slice(0, 4).join("\n").slice(0, 400);
 	return (
-		<li className={`ev ev-${e.kind} ${e.tool === "error" ? "ev-error" : ""}`}>
+		<li className={`ev ev-${e.kind} ${e.tool === "error" ? "ev-error" : ""} ${focused ? "ev-focus" : ""}`} data-event={e.id} aria-current={focused || undefined}>
 			<time className="ev-time">{clock(e.at)}</time>
 			<span className="ev-mark"><Icon name={MARK[e.kind]} size={14} label={WHAT[e.kind]} /></span>
 			<div className="ev-body">
@@ -30,7 +30,8 @@ function EventRow({ e }: { e: SessionEvent }) {
 	);
 }
 
-export function Session({ slug, attemptId, decisions, live }: { slug: string; attemptId: string; decisions: Decision[]; live: boolean }) {
+/** `focus` is an event to open on: the place in the session a line on the Why page was written. */
+export function Session({ slug, attemptId, decisions, live, focus }: { slug: string; attemptId: string; decisions: Decision[]; live: boolean; focus?: number }) {
 	const [events, setEvents] = useState<SessionEvent[] | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const box = useRef<HTMLOListElement>(null);
@@ -53,7 +54,16 @@ export function Session({ slug, attemptId, decisions, live }: { slug: string; at
 	].sort((a, b) => a.at - b.at), [events, decisions]);
 
 	// Follow the tail while the reader is at the bottom; stay put once they scroll up.
-	useEffect(() => { if (pinned.current && box.current) box.current.scrollTop = box.current.scrollHeight; }, [rows.length]);
+	useEffect(() => { if (pinned.current && box.current && !focus) box.current.scrollTop = box.current.scrollHeight; }, [rows.length]);
+	// Opened on a moment: bring it to the middle once, then leave scrolling to the reader.
+	const brought = useRef(false);
+	useEffect(() => {
+		const row = focus && !brought.current ? box.current?.querySelector<HTMLElement>(`[data-event="${focus}"]`) : null;
+		if (!row || !box.current) return;
+		brought.current = true;
+		pinned.current = false;
+		box.current.scrollTop = row.offsetTop - box.current.offsetTop - box.current.clientHeight / 3;
+	}, [rows.length, focus]);
 
 	if (error) return <Notice>{error}</Notice>;
 	if (!events) return <Empty kind="loading" title="Loading the session…" />;
@@ -65,7 +75,7 @@ export function Session({ slug, attemptId, decisions, live }: { slug: string; at
 				<span className="spacer" /><span>{events.length} event{events.length === 1 ? "" : "s"}</span>
 			</p>
 			<ol className="session" ref={box} tabIndex={0} aria-label="Session transcript" onScroll={(e) => { const el = e.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; }}>
-				{rows.map((r) => r.event ? <EventRow key={r.key} e={r.event} /> : (
+				{rows.map((r) => r.event ? <EventRow key={r.key} e={r.event} focused={r.event.id === focus} /> : (
 					<li key={r.key} className="ev decision-mark">
 						<time className="ev-time">{clock(r.at)}</time>
 						<span className="ev-mark"><Icon name="decision" size={14} label="Decision recorded" /></span>

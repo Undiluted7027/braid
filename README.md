@@ -16,7 +16,7 @@ Git merges text. It has no idea what either side was trying to do, so when two a
 | Review comments | **Response** | A person sends an attempt back with a note, or answers a question the agent recorded. The agent hears it on its next step (Braid starts a hosted agent again to act on it), and the note is kept with the attempt's decisions, so it is in the landing commit too. |
 | Merge conflict | **Reconciliation** | Each place the two sides disagree, with their base and the intent and decisions behind each side. Resolved one conflict at a time by the agent, a model, or a person, with a rationale that is written into the landing commit. Two added dependencies are not a conflict: `package.json` is merged by key and the lockfile is regenerated in a sandbox. |
 | Merge | **Landing** | One commit on trunk per intent (parents: trunk, attempt head). The commit message carries the goal and the why log. Trunk only takes what has been run: the attempt's commit must have passed, and if trunk has moved since, the merge of the two is verified first. |
-| `git blame` | **Why view** | Every line on trunk, colored by the intent that landed it. Click a line to read the decisions behind it. |
+| `git blame` | **Why view** | Every line on trunk, coloured by the intent that landed it. Select a line to see the commit the agent wrote it in, the decisions it recorded while writing it, and that moment in its session. Lines written during a reconciliation say so; lines pushed outside Braid show their commit. |
 
 Agents connect over **MCP**, so any MCP-capable coding agent works unchanged. For agents without MCP, every tool is also a shell command (`braid <tool>`). Code moves over plain **git**.
 

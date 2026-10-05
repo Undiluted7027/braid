@@ -11,7 +11,7 @@ export const TOOLS = [
 	tool("brief", "Start here. Your intent, the protocol, what trunk looks like, and every other agent working right now with the reasoning behind their work."),
 	tool("claim", "Declare the paths you expect to change, before editing. Other agents are told immediately, and you are told who already plans or has changes there.",
 		{ paths: { type: "array", items: str, description: "Files or directories, e.g. src/app.js or src/ui/" }, reason: str }, ["paths"]),
-	tool("record", "Record why. Call this whenever you make a real choice: what you decided, what you rejected, what you assumed. It is kept with the change forever and shown to agents whose work touches the same files.",
+	tool("record", "Record why. Call this whenever you make a real choice: what you decided, what you rejected, what you assumed. Give the reason in `body` and the files it is about in `files`. It is kept with the change forever, shown on the lines it led to, and shown to agents whose work touches the same files.",
 		{ kind: { type: "string", enum: ["decision", "assumption", "rejected", "question", "note"] }, title: str, body: str, files: { type: "array", items: str, description: "Paths this reasoning is about" } }, ["title"]),
 	tool("checkpoint", "Call after every push. Braid re-reads your attempt and reports changed files, how far trunk has moved, and overlaps or predicted conflicts with other agents, including their reasoning.",
 		{ summary: { type: "string", description: "One or two sentences on where the attempt stands" } }),

@@ -1,5 +1,5 @@
 import { runFor, Verification } from "./Verify";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Attempt, Conflict, Decision, DecisionKind, DiffFile, Intent, Reconciliation, State } from "../shared/types";
 import { api, ago, intentColor, short, useAsync } from "./api";
 import { Agent, IntentId, Link, useAction, useTitle } from "./App";
@@ -265,7 +265,12 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const slug = state.project.slug;
 	const { data: diff, error: diffError } = useAsync(() => api<DiffFile[]>("GET", `/p/${slug}/attempts/${a.id}/diff`), [a.id, a.headSha, a.baseSha]);
 	const decisions = state.decisions.filter((d) => d.attemptId === a.id);
-	const [tab, setTab] = useState<TabId>("changes");
+	// A link from the Why page names an attempt and a moment in its session: open there.
+	const asked = new URLSearchParams(location.search);
+	const focus = asked.get("attempt") === a.id && asked.get("event") ? Number(asked.get("event")) : undefined;
+	const [tab, setTab] = useState<TabId>(focus ? "session" : "changes");
+	const card = useRef<HTMLElement>(null);
+	useEffect(() => { if (focus) card.current?.scrollIntoView({ block: "start" }); }, []);
 	const key = state.previewKeys?.[a.id];
 	const previewUrl = `/preview/${slug}/${a.id}${key ? `~${key}` : ""}/`;
 	const [frame, setFrame] = useState(0);
@@ -312,7 +317,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	];
 
 	return (
-		<section className={`panel attempt ${a.status}`} aria-label={`Attempt ${a.id} by ${a.agent}`}>
+		<section ref={card} className={`panel attempt ${a.status}`} aria-label={`Attempt ${a.id} by ${a.agent}`}>
 			<header className="attempt-head">
 				<div className="attempt-top">
 					<h2><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="id">attempt <span className="mono">{a.id}</span></span></h2>
@@ -409,7 +414,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 						answer={going && canLand ? (q, body) => api("POST", `/p/${slug}/attempts/${a.id}/respond`, { kind: "answer", question: q.id, body, by: "human", bringBack: !!a.hosted && !hostedGoing }) : undefined} />
 				</>}
 
-				{tab === "session" && <Session slug={slug} attemptId={a.id} decisions={decisions} live={sessionLive} />}
+				{tab === "session" && <Session slug={slug} attemptId={a.id} decisions={decisions} live={sessionLive} focus={focus} />}
 
 				{tab === "preview" && <>
 					<div className="row preview-bar">

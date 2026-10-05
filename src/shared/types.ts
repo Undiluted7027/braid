@@ -170,5 +170,22 @@ export interface JoinResult { attemptId: string; intentId: number; branch: strin
 export interface DiffFile { path: string; status: FileChange["status"]; base: string | null; head: string | null; binary: boolean }
 /** One commit on trunk. `intentId` is set when Braid knows which intent it belongs to: a landing, a revert, or a commit made in an attempt that landed. */
 export interface TrunkCommit { sha: string; subject: string; author: string; at: number; kind: "landing" | "revert" | "attempt" | "outside" | "start"; intentId: number | null; attemptId: string | null }
-export interface BlameLine { text: string; sha: string | null }
-export interface FileView { path: string; content: string | null; binary: boolean; blame: BlameLine[]; trail: Landing[] }
+/** A line of a trunk file. `sha` is the landing that put it there (so its intent), `origin` says exactly where it was written. */
+export interface BlameLine { text: string; sha: string | null; origin?: string }
+/**
+ * Where a run of lines was written: a commit an agent made inside its attempt, the merge that
+ * landed it (lines written while reconciling), a revert, or a commit pushed to trunk outside Braid.
+ * For an attempt's commit it also says what the agent decided around then and where in its session to look.
+ */
+export interface LineOrigin {
+	key: string;
+	kind: "attempt" | "reconcile" | "merge" | "revert" | "outside" | "start";
+	landingSha: string | null;
+	attemptId: string | null;
+	commit: { sha: string; subject: string; author: string; at: number } | null;
+	/** Decisions recorded while this commit was being made, the ones about this file first. */
+	decisionIds: number[];
+	/** Where in the session this file was edited on the way to this commit (or first touched, if no edit was captured). */
+	eventId: number | null;
+}
+export interface FileView { path: string; content: string | null; binary: boolean; blame: BlameLine[]; trail: Landing[]; origins: Record<string, LineOrigin> }

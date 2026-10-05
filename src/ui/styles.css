@@ -732,3 +732,8 @@ p .mono, .ihead .mono { overflow-wrap: anywhere; }
 	.offset:active { transform: none; }
 	* { transition-duration: 0s !important; }
 }
+
+/* Why by line: lines pushed outside Braid, the moment a run of lines was written, and that moment in the session. */
+.bl.outside { --c: var(--faint); }
+.moment { margin: 14px 0; padding: 12px 14px; border: 1px solid var(--line); border-left: 3px solid var(--c, var(--line-strong)); border-radius: var(--r-sm, 6px); display: grid; gap: 8px; }
+.ev.ev-focus { outline: 2px solid var(--i4); outline-offset: -2px; background: rgb(251 191 36 / 0.12); }
