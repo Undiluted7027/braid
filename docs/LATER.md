@@ -83,7 +83,7 @@ Three independent reviews were run with steps 1 to 4 done: Codex on GPT-6 Astra 
    - Open: a rename still shows as delete plus edit and cannot be reconciled in the UI.
    - Open: an open reconciliation shows on the project page only as a chip and one activity line (the "needs you" view in item 4).
    - Open: the state sent to the UI still carries full file contents for every open reconciliation; settled ones now carry only trunk's version and the result.
-4. **First ten minutes.** Done locally on October 4, 2026; not yet deployed.
+4. **First ten minutes.** Done and deployed on October 4, 2026.
    - Done: the launcher is built into one file and served by the instance at `/braid.mjs`. "Add an agent" shows `curl` plus `node braid.mjs join ...`, which was copied from the UI and run as written. `braid init` now pushes into a project that was created empty instead of failing, and the CLI's help describes each command.
    - Done: "Clone trunk" makes a clone command with a read token that lasts an hour; an empty project gets a push command the same way.
    - Done: the home page says what Braid is in four steps, rows show the slug and path, every page has its own title and an `h1`, and the graph has a caption and can be used from the keyboard.
@@ -117,6 +117,23 @@ Also from the reviews:
 - The 5 to 10 minute demo video.
 - A public source repository and a pass over the run instructions once deployed.
 
+## Interface overhaul (October 4, 2026)
+
+The interface was redone twice on this day. The first pass (navy shell, Instrument Sans, tabs on attempts) was judged not enough; its diff is not in the tree. What is there now follows `DESIGN.md` in the repository root, which records the measured references and every value.
+
+- **Look.** Light, neutral and hairline-ruled, with Geist and Geist Mono self-hosted from npm packages (so Braid's preview of itself shows the real fonts). Buttons are ink; the eight intent colours and the three status colours are the only colour. The loom, agent sessions, commands and run output are the one dark surface in both themes. Panels that ask for a decision (Needs you, an open reconciliation, forms, dialogs, the reason card in Why) have an ink border and a hard offset shadow.
+- **Drawings.** All inline SVG made of the loom's parts (`Graphics.tsx`): the labelled scene on the home page, one diagram per how-it-works step, a small loom on each project card and each intent drawn from its real attempts, and a drawing for every empty, loading and failed area. One icon set (`Kit.tsx`) replaces the text glyphs.
+- **Home.** What Braid is beside the scene, then projects (each card shows its attempts, open intents, attempts in progress and open conflicts), then how it works. The new-project form says what a valid name is before it is refused.
+- **Project page.** A visible title with four counts, the Needs-you list, the loom, intents as ruled groups (each attempt is a row: who, status, summary or what it is doing now, and its signals), and a side column with Trunk, who can read the project, and Activity. Trunk's own run is now readable here, with its steps and output; before, a failing trunk could be seen only as a tag in the top bar.
+- **Intent page.** Goal and "Done when" side by side, the intent's strands against trunk, then the reconciliation if one is open, then attempts two abreast (landed first, then in progress, then closed). Tabs follow the keyboard pattern (arrows, Home, End). Disabled actions say why next to the button: nothing pushed, or what a resolution still needs.
+- **Reconciliation.** Ways to hand it to the model or the agent come first; each conflict is a fieldset that counts answered conflicts and marks the chosen starting point.
+- **Why.** Files, code and reason in three columns; each run of lines is labelled once with its intent; trunk history is a vertical trunk with a node per commit. On a phone the reason stays at the bottom of the screen while the code scrolls.
+- **Asking first.** Browser `confirm` and `prompt` boxes are replaced by one dialog (`ask` in `Kit.tsx`) that names the consequence and the action.
+- **Fixed on the way.** A visitor could see "Run again" on checks and the whole reconciliation editor; both are now read-only for them. Error messages from the server start with a capital. A closed attempt no longer shows a pulsing "queued" dot on Checks.
+- **Checked.** Every page at 1440 and 390 px in light and dark; the visitor view; the sign-in and confirmation dialogs; an empty project, empty trunk, missing project and missing intent; and, by altering the state in the browser, a failed run with output, a failing trunk, a landing waiting in the queue, a hosted agent running, and an unanswered question. The journey (create a project, open, edit and abandon an intent, make a push command, delete the project) was walked by mouse and by keyboard.
+- **Not checked.** A reverted landing, a failed merge with trunk, and the "resolving" state of a reconciliation were read in code only. No hosted agent was started, so a live session was seen only with altered state.
+- **Open.** The Why view does not draw a line from the selected code to its reason. The home page fetches each listed project's full state to draw its card; a summary read would be lighter with many projects. The launcher's help text (`cli/braid.mjs`) was not revisited.
+
 ## Not built yet
 
 - **Previews for apps with a backend.** A built preview is static files; nothing runs the app's server.
@@ -135,7 +152,6 @@ Recorded on October 4, 2026, when Braid's own UI became previewable (`preview.ap
 ## Not verified yet
 
 - **The one-sided confirmation in the UI.** The guard itself is verified through the API and the agent tool; nobody has clicked through the confirmation.
-- **Item 4 on the deployed instance.** The public view, the sign-in dialog, the served launcher and the phone layout have only run locally.
 - **A landing interrupted between the push and its record.** Handled in code, never forced to happen. (An interrupted run did happen, during a deploy on October 4: it was reported as "could not run" and ran again when asked.)
 - **The region editor on the deployed instance.** It was used in Chrome locally; on the deployed instance resolutions went through the API, the model and a hosted agent.
 - **On the deployed instance: landing refused while a hosted agent is still working.** It ran locally; on the deployed instance my request arrived before the agent had pushed anything, so it was refused for having no commits instead.
@@ -153,6 +169,7 @@ Checked on October 4, 2026:
 - Item 1 on the deployed instance, in a separate project (`dep-item1`, since deleted): a landing asked for before verification finished waited and landed by itself; an attempt that passed alone and failed when merged with trunk was refused with trunk untouched, and Claude Code, brought back, merged trunk, fixed it and it landed; a landing was refused for the wrong commit and when the attempt moved after the request; an attempt that removed the test script and added its own `braid.json` still had the test run; on a failing trunk a bystander was refused and a fix landed; a landed attempt's tools were refused; creating a project named after an existing repository was refused. The existing `braid` project loaded after the schema change.
 - Item 2 on the deployed instance, in a separate project (`dep-item2`, since deleted): an answer, a message and an intent edit all reached the agent's next tool response; feedback on a ready attempt sent it back and dropped its queued landing; abandon and reopen; a landing reverted with a later landing kept; hosted Codex, sent back with a note, came back, made the change, recorded how, and it landed. Also the item 1 checks that had only run locally: a resolved conflict was verified as a merge before it landed, a landing was cancelled, "Land now" landed without waiting, and abandoning an attempt stopped its running agent.
 - Item 3 on the deployed instance, in two separate projects (since deleted): Claude resolved two conflicts in a 68 kB, 4,000-line file in 25 seconds with every other line kept; a wrong number of replacements and one side at every conflict were refused; with npm and with pnpm, two attempts each added a dependency and the second landed with `package.json` merged by key, the lockfile regenerated in six seconds and the frozen install passing; hosted Claude Code, brought back to a conflict, answered with one replacement for the one line and it landed with both attributes.
+- Item 4 on the deployed instance, in a separate public project (`dep-item4`, since deleted): a visitor could list and read it live (state, files, history, a keyed preview) and was refused every write, export, credential and agent start, and the private `braid` project; the sign-in dialog rejected a wrong token and opened the full view with the right one; the join command copied from the UI created and cloned an attempt using the served launcher; the clone command form cloned `braid`'s trunk with a read token that could not push; the starter project's tests ran on trunk; and the home, project, intent and Why pages were 390 px wide at 390 px.
 - Deployed at https://braid.undiluted7027.workers.dev: the push-event Workflow (a push with no `checkpoint` updated the attempt), sandbox runs and their isolation on Cloudflare's microVM, sign-in, the live socket, both kinds of preview, `ready` refused on a failed commit, and the forced-landing confirmation.
 
 The `braid` project now lives on the deployed instance. It was moved there with its intents, decisions, landings and sessions; the local instance has forgotten it.

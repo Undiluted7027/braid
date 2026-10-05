@@ -1,13 +1,16 @@
-import { RunChip, runFor } from "./Verify";
+import { RunChip, runFor, Verification } from "./Verify";
 import { useState, type FormEvent } from "react";
 import type { Attempt, Intent, State } from "../shared/types";
-import { api, ago, intentColor, short, useNow } from "./api";
-import { Link, useAction, useSignedIn as useMe, useTitle } from "./App";
+import { api, ago, short, useNow } from "./api";
+import { Agent, IntentId, Link, useAction, useSignedIn as useMe, useTitle } from "./App";
 import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
+import { Empty, MiniLoom } from "./Graphics";
+import { ask, Command, Icon, Notice, type IconName } from "./Kit";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
+/** The two ways to put an agent on an intent: Braid runs it in a sandbox, or you run it where you like. */
 export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentId: number; hosting: State["project"]["hosting"] }) {
 	const [agent, setAgent] = useState("claude-code");
 	const start = useAction();
@@ -15,27 +18,30 @@ export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentI
 	const me = useMe();
 	// The launcher is one file served by this instance, so nothing has to be installed or published.
 	const cmd = `curl -fsSLO ${location.origin}/braid.mjs\nnode braid.mjs join ${location.origin}/p/${slug} --intent ${intentId} --agent ${agent}${agent === "agent" ? "" : " --run"}`;
-	const [copied, setCopied] = useState(false);
 	return (
 		<div className="join">
-			{hosting.available && <>
-				<p className="small">Run an agent here, in a sandbox on Cloudflare. It gets a fresh fork of trunk, Braid's tools, and network access to this project and its model only.</p>
-				<div className="row">
-					<button className="primary" disabled={start.busy || !hosting.claude} onClick={() => run("claude")}>Run Claude Code</button>
-					<button className="primary" disabled={start.busy || !hosting.codex} onClick={() => run("codex")}>Run Codex</button>
-					{start.busy && <span className="dim small">Starting…</span>}
-					{(!hosting.claude || !hosting.codex) && <span className="dim small">{!hosting.claude && !hosting.codex ? "No model credentials are set on this instance." : `No credentials for ${hosting.claude ? "Codex" : "Claude Code"}.`}</span>}
+			{hosting.available && (
+				<div className="join-way">
+					<h4><Icon name="sandbox" />Run an agent here</h4>
+					<p className="dim">Braid starts it in a sandbox on Cloudflare with a fresh fork of trunk, Braid's tools, and network access to this project and its model only.</p>
+					<div className="row">
+						<button className="primary" disabled={start.busy || !hosting.claude} onClick={() => run("claude")}>Run Claude Code</button>
+						<button className="primary" disabled={start.busy || !hosting.codex} onClick={() => run("codex")}>Run Codex</button>
+						{start.busy && <span className="dim" role="status">Starting the sandbox…</span>}
+					</div>
+					{(!hosting.claude || !hosting.codex) && <p className="hint">{!hosting.claude && !hosting.codex ? "Neither can start: no model credentials are set on this instance." : `${hosting.claude ? "Codex" : "Claude Code"} cannot start: this instance has no credentials for it.`}</p>}
+					{start.error && <Notice>{start.error}</Notice>}
 				</div>
-				{start.error && <p className="error">{start.error}</p>}
-				<p className="small join-or">Or run one yourself:</p>
-			</>}
-			<p className="small">Run this where the agent should work (needs Node 22.18 or newer and git). It forks trunk into a new Artifacts repo, clones it, connects the agent to Braid over MCP{agent === "agent" ? ", and prints the directory to start your agent in" : ", and starts it"}.{me?.protected ? <> Set <code>BRAID_ADMIN_TOKEN</code> to this instance's admin token first.</> : ""}</p>
-			<div className="row">
-				<select value={agent} onChange={(e) => setAgent(e.target.value)} aria-label="Agent">
-					<option value="claude-code">Claude Code</option><option value="codex">Codex</option><option value="agent">Other</option>
-				</select>
-				<code className="cmd multi">{cmd}</code>
-				<button onClick={() => { navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>{copied ? "Copied" : "Copy"}</button>
+			)}
+			<div className="join-way">
+				<h4><Icon name="terminal" />{hosting.available ? "Or run one yourself" : "Run an agent yourself"}</h4>
+				<p className="dim">Run this where the agent should work. It forks trunk into a new Artifacts repository, clones it, connects the agent to Braid over MCP{agent === "agent" ? ", and prints the directory to start your agent in" : ", and starts it"}. Needs Node 22.18 or newer and git.{me?.protected ? <> Set <code>BRAID_ADMIN_TOKEN</code> to this instance's admin token first.</> : ""}</p>
+				<label className="inline">Agent
+					<select value={agent} onChange={(e) => setAgent(e.target.value)}>
+						<option value="claude-code">Claude Code</option><option value="codex">Codex</option><option value="agent">Another agent</option>
+					</select>
+				</label>
+				<Command text={cmd} label="Copy command" />
 			</div>
 		</div>
 	);
@@ -44,28 +50,11 @@ export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentI
 /** Where Braid itself is running the agent, and how that is going. */
 export function HostedChip({ a }: { a: Attempt }) {
 	if (!a.hosted) return null;
-	const going = a.hosted === "starting" || a.hosted === "running";
-	return <span className={`chip ${a.hosted === "failed" ? "conflict" : "quiet"}`} title={a.hostedDetail || "Braid runs this agent in a sandbox on Cloudflare"}>{going ? `sandbox ${a.hosted}` : `sandbox ${a.hosted}`}</span>;
+	return <span className={`chip ${a.hosted === "failed" ? "conflict" : a.hosted === "running" || a.hosted === "starting" ? "working" : "quiet"}`} title={a.hostedDetail || "Braid runs this agent in a sandbox on Cloudflare"}>sandbox {a.hosted}</span>;
 }
 
-/** A command with a button that copies it. */
-function Command({ text, label }: { text: string; label: string }) {
-	const [copied, setCopied] = useState(false);
-	const [error, setError] = useState(false);
-	const copy = async () => {
-		setError(false);
-		try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { setError(true); }
-	};
-	return (
-		<>
-			<div className="row"><code className="cmd multi">{text}</code><button onClick={copy} aria-label={label}>{copied ? "Copied" : "Copy"}</button></div>
-			{error && <p className="error" role="alert">Could not copy. Select the text above.</p>}
-		</>
-	);
-}
-
-/** Cloning needs a credential, so the command is made on request with a read token that lasts an hour. */
-function TrunkRemote({ state }: { state: State }) {
+/** Trunk itself: where it is, how its last run went, and how to clone it (or fill it, when it is empty). */
+function Trunk({ state }: { state: State }) {
 	const { slug, remote, branch, head } = state.project;
 	const [cmd, setCmd] = useState<string | null>(null);
 	const act = useAction();
@@ -74,43 +63,60 @@ function TrunkRemote({ state }: { state: State }) {
 		const auth = `git -c http.extraHeader="Authorization: Bearer ${c.gitToken}"`;
 		setCmd(push ? `${auth} push ${c.remote} HEAD:refs/heads/${c.branch}` : `${auth} clone ${c.remote} ${slug}`);
 	});
+	const run = runFor(state, "trunk");
 	return (
-		<section className="card">
-			<h2>{head ? "Clone trunk" : "Push a repository"}</h2>
-			<p className="small dim">{head ? <>Trunk is a git repository on Cloudflare Artifacts, branch <span className="mono">{branch}</span>.</> : "Trunk is empty. Run the command in the repository whose HEAD should become trunk."}</p>
-			<p className="mono small remote">{remote}</p>
-			{!state.viewer && !cmd && <button disabled={act.busy} onClick={() => make(!head)}>{act.busy ? "Making…" : head ? "Make a clone command" : "Make a push command"}</button>}
-			{cmd && <><Command text={cmd} label="Copy the command" /><p className="small dim">It carries a {head ? "read token that works for an hour" : "write token that works for 15 minutes"}. Do not share it.</p></>}
-			{act.error && <p className="error">{act.error}</p>}
+		<section className="panel side-panel" id="trunk" aria-labelledby="trunk-h">
+			<h2 id="trunk-h" className="label">Trunk</h2>
+			{head ? <>
+				<p>The branch <span className="mono">{branch}</span> of a git repository on Cloudflare Artifacts, at <span className="mono">{short(head)}</span>.</p>
+				<details className="disclose" open={run?.status === "fail" && run.sha === head}>
+					<summary>Braid's run of this commit <RunChip run={run} head={head} /></summary>
+					<Verification slug={slug} refName="trunk" run={run} head={head} readOnly={!!state.viewer} />
+				</details>
+			</> : <p>Trunk is empty. Run the push command in the repository whose HEAD should become trunk.</p>}
+			<p className="mono remote" title="Trunk's git remote">{remote}</p>
+			{!state.viewer && !cmd && <button disabled={act.busy} onClick={() => make(!head)}><Icon name={head ? "copy" : "push"} />{act.busy ? "Making the command…" : head ? "Make a clone command" : "Make a push command"}</button>}
+			{cmd && <><Command text={cmd} label="Copy command" /><p className="hint">It carries a {head ? "read token that works for an hour" : "write token that works for 15 minutes"}. Do not share it.</p></>}
+			{act.error && <Notice>{act.error}</Notice>}
 		</section>
 	);
 }
 
+type Need = { key: string; tone: string; icon: IconName; label: string; text: string; to: string };
 /** Everything in the project that is waiting for a person, most urgent first. Each item goes to where it is handled. */
-function NeedsYou({ state }: { state: State }) {
+function needs(state: State): Need[] {
 	const slug = state.project.slug, to = (intentId: number) => `/p/${slug}/i/${intentId}`;
 	const live = state.attempts.filter((a) => LIVE.has(a.status));
-	const items: { key: string; tone: string; label: string; text: string; to: string }[] = [];
+	const items: Need[] = [];
 	const trunkRun = runFor(state, "trunk");
-	if (trunkRun?.sha === state.project.head && trunkRun.status === "fail") items.push({ key: "trunk", tone: "conflict", label: "trunk is failing", text: `Verification of ${short(state.project.head)} failed (${trunkRun.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}). Only an attempt that fixes it will land.`, to: `/p/${slug}` });
+	if (trunkRun?.sha === state.project.head && trunkRun.status === "fail") items.push({ key: "trunk", tone: "conflict", icon: "warning", label: "trunk is failing", text: `Braid's run of ${short(state.project.head)} failed (${trunkRun.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}). Only an attempt that fixes it will land.`, to: "#trunk" });
 	for (const r of state.reconciliations.filter((r) => r.status === "open")) {
 		const a = state.attempts.find((x) => x.id === r.attemptId);
-		if (a && LIVE.has(a.status)) items.push({ key: `r${r.id}`, tone: "conflict", label: "conflict to resolve", text: `Landing ${a.agent}'s attempt ${a.id} collided with trunk on ${r.conflicts.map((c) => c.path).join(", ")}.`, to: to(r.intentId) });
+		if (a && LIVE.has(a.status)) items.push({ key: `r${r.id}`, tone: "conflict", icon: "conflict", label: "conflict to resolve", text: `Landing ${a.agent}'s attempt ${a.id} collided with trunk on ${r.conflicts.map((c) => c.path).join(", ")}.`, to: to(r.intentId) });
 	}
 	for (const a of live) {
 		const asked = state.decisions.filter((d) => d.attemptId === a.id && d.kind === "question");
 		const answered = new Set(state.decisions.filter((d) => d.attemptId === a.id && d.kind === "answer").map((d) => d.title.replace(/^Answer: /, "")));
-		for (const q of asked.filter((q) => !answered.has(q.title))) items.push({ key: `q${q.id}`, tone: "touch", label: "question", text: `${a.agent} asks: ${q.title}`, to: to(a.intentId) });
+		for (const q of asked.filter((q) => !answered.has(q.title))) items.push({ key: `q${q.id}`, tone: "touch", icon: "question", label: "question for you", text: `${a.agent} asks: ${q.title}`, to: to(a.intentId) });
 		const run = runFor(state, a.id), queued = state.queue.some((q) => q.attemptId === a.id);
-		if (run?.sha === a.headSha && run.status === "fail") items.push({ key: `f${a.id}`, tone: "conflict", label: "checks failed", text: `${a.agent}'s attempt ${a.id} failed ${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}.`, to: to(a.intentId) });
-		else if (a.hosted === "failed") items.push({ key: `h${a.id}`, tone: "conflict", label: "agent failed", text: `${a.agent} on attempt ${a.id}: ${a.hostedDetail}`, to: to(a.intentId) });
-		else if (a.status === "ready" && !queued) items.push({ key: `l${a.id}`, tone: "ready", label: "ready to review", text: `${a.agent}'s attempt ${a.id}: ${a.summary || "marked ready"}`, to: to(a.intentId) });
+		if (run?.sha === a.headSha && run.status === "fail") items.push({ key: `f${a.id}`, tone: "conflict", icon: "x", label: "checks failed", text: `${a.agent}'s attempt ${a.id} failed ${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}.`, to: to(a.intentId) });
+		else if (a.hosted === "failed") items.push({ key: `h${a.id}`, tone: "conflict", icon: "agent", label: "agent failed", text: `${a.agent} on attempt ${a.id}: ${a.hostedDetail}`, to: to(a.intentId) });
+		else if (a.status === "ready" && !queued) items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "ready to review", text: `${a.agent}'s attempt ${a.id}: ${a.summary || "marked ready"}`, to: to(a.intentId) });
 	}
+	return items;
+}
+
+function NeedsYou({ items }: { items: Need[] }) {
 	if (!items.length) return null;
 	return (
-		<section className="needs" aria-label="Needs you">
-			<h2>Needs you <span className="count">{items.length}</span></h2>
-			<ul>{items.map((i) => <li key={i.key}><Link to={i.to}><span className={`chip ${i.tone}`}>{i.label}</span><span className="needs-text">{i.text}</span></Link></li>)}</ul>
+		<section className="panel decide needs" aria-labelledby="needs-h">
+			<h2 id="needs-h"><span className="count solid">{items.length}</span>{items.length === 1 ? "One thing needs you" : "Things that need you"}</h2>
+			<ul>
+				{items.map((i) => {
+					const inner = <><span className={`chip ${i.tone}`}><Icon name={i.icon} size={12} />{i.label}</span><span className="needs-text">{i.text}</span><Icon name="arrow" className="go" /></>;
+					return <li key={i.key}>{i.to.startsWith("#") ? <a href={i.to}>{inner}</a> : <Link to={i.to}>{inner}</Link>}</li>;
+				})}
+			</ul>
 		</section>
 	);
 }
@@ -119,16 +125,17 @@ function NeedsYou({ state }: { state: State }) {
 function Visibility({ state }: { state: State }) {
 	const act = useAction();
 	const { slug, public: open } = state.project;
-	const toggle = () => {
-		if (!open && !window.confirm("Anyone with the link will be able to read this project without signing in: its intents, code, decisions, agent sessions and previews. They cannot change anything.\n\nMake it public?")) return;
-		act.run(() => api("POST", `/p/${slug}/public`, { public: !open, by: "human" }));
-	};
+	const toggle = () => act.run(async () => {
+		if (!open && await ask({ title: "Make this project public?", body: <p>Anyone with the link will be able to read it without signing in: its intents, code, decisions, agent sessions and previews. They cannot change anything.</p>, confirm: "Make it public" }) === null) return;
+		await api("POST", `/p/${slug}/public`, { public: !open, by: "human" });
+	});
 	return (
-		<section className="card">
-			<h2>Who can read this</h2>
-			<p className="small">{open ? <>Anyone with the link, without signing in: <span className="mono">{location.origin}/p/{slug}</span></> : "Only people with the admin token."}</p>
+		<section className="panel side-panel" aria-labelledby="vis-h">
+			<h2 id="vis-h" className="label">Who can read this</h2>
+			<p className="row"><Icon name={open ? "globe" : "lock"} />{open ? "Anyone with the link, without signing in." : "Only people with the admin token."}</p>
+			{open && <p className="mono remote">{location.origin}/p/{slug}</p>}
 			<button disabled={act.busy} onClick={toggle}>{open ? "Make it private" : "Make it public (read-only)"}</button>
-			{act.error && <p className="error">{act.error}</p>}
+			{act.error && <Notice>{act.error}</Notice>}
 		</section>
 	);
 }
@@ -136,111 +143,142 @@ function Visibility({ state }: { state: State }) {
 function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const mine = state.overlaps.filter((o) => o.a === a.id || o.b === a.id);
 	const conflicts = new Set(mine.filter((o) => o.severity === "conflict").map((o) => (o.a === a.id ? o.b : o.a)));
-	const touches = new Set(mine.filter((o) => o.severity !== "conflict").map((o) => (o.a === a.id ? o.b : o.a)));
+	const touches = new Set(mine.filter((o) => o.severity !== "conflict").map((o) => (o.a === a.id ? o.b : o.a)).filter((id) => !conflicts.has(id)));
 	const decisions = state.decisions.filter((d) => d.attemptId === a.id).length;
 	const now = useNow(a.id, a.now);
+	const going = LIVE.has(a.status);
+	const queued = state.queue.some((q) => q.attemptId === a.id);
 	return (
-		<div className={`attempt-row ${a.status}`}>
-			<span className="mono dim">{a.id}</span>
-			<strong>{a.agent}</strong>
-			<span className={`chip ${a.status}`}>{a.status}</span>
-			<HostedChip a={a} />
-			<span className="dim small">{a.files.length} file{a.files.length === 1 ? "" : "s"} · {decisions} decision{decisions === 1 ? "" : "s"}</span>
-			<span className="spacer" />
-			{LIVE.has(a.status) && <RunChip run={runFor(state, a.id)} head={a.headSha} />}
-			{LIVE.has(a.status) && a.behind > 0 && <span className="chip quiet" title="Landings on trunk since this attempt's base">{a.behind} behind</span>}
-			{LIVE.has(a.status) && a.trunkConflicts.length > 0 && <span className="chip conflict">conflicts with trunk</span>}
-			{conflicts.size > 0 && <span className="chip conflict">will conflict with {[...conflicts].join(", ")}</span>}
-			{touches.size > 0 && <span className="chip touch">overlaps {[...touches].join(", ")}</span>}
-			{a.status === "working" && now && <p className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</p>}
-		</div>
+		<li className={`attempt-row ${a.status}`}>
+			<span className="who"><Agent name={a.agent} kind={a.kind} /><span className="mono id" title={`Attempt ${a.id}`}>{a.id}</span></span>
+			<span className="state"><span className={`chip ${a.status}`}>{queued ? "landing" : a.status}</span><HostedChip a={a} /></span>
+			<span className="what">
+				{a.status === "working" && now ? <span className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</span>
+					: <span className="summary">{a.summary || (a.headSha === a.baseSha ? "Nothing pushed yet." : "No summary yet.")}</span>}
+				<span className="facts">{a.files.length} file{a.files.length === 1 ? "" : "s"} changed · {decisions} decision{decisions === 1 ? "" : "s"} recorded</span>
+			</span>
+			<span className="signals">
+				{going && <RunChip run={runFor(state, a.id)} head={a.headSha} />}
+				{going && a.behind > 0 && <span className="chip quiet" title="Changes that landed on trunk after this attempt forked from it">{a.behind} behind trunk</span>}
+				{going && a.trunkConflicts.length > 0 && <span className="chip conflict" title={a.trunkConflicts.join(", ")}>conflicts with trunk</span>}
+				{conflicts.size > 0 && <span className="chip conflict">will conflict with {[...conflicts].join(", ")}</span>}
+				{touches.size > 0 && <span className="chip touch">same files as {[...touches].join(", ")}</span>}
+			</span>
+		</li>
 	);
 }
 
 function IntentCard({ intent, state }: { intent: Intent; state: State }) {
 	const attempts = state.attempts.filter((a) => a.intentId === intent.id);
 	const [joining, setJoining] = useState(false);
+	const to = `/p/${state.project.slug}/i/${intent.id}`;
 	return (
-		<section className={`card intent ${intent.status}`} style={{ borderLeftColor: intentColor(intent.id) }}>
-			<div className="row">
-				<Link to={`/p/${state.project.slug}/i/${intent.id}`} className="intent-title">
-					<span className="mono" style={{ color: intentColor(intent.id) }}>I{intent.id}</span> {intent.title}
-				</Link>
-				<span className="spacer" />
-				{intent.status === "landed" ? <span className="chip landed">landed {short(intent.landedSha!)}</span> : <span className={`chip ${intent.status}`}>{intent.status}</span>}
-			</div>
-			<p className="goal">{intent.goal}</p>
-			{attempts.map((a) => <AttemptRow key={a.id} a={a} state={state} />)}
-			{intent.status === "open" && (
-				<div className="row actions">
-					{!state.viewer && <button onClick={() => setJoining(!joining)}>{joining ? "Close" : "Add an agent"}</button>}
-					{attempts.length > 0 && <Link to={`/p/${state.project.slug}/i/${intent.id}`} className="button">{attempts.length > 1 ? `Compare ${attempts.length} attempts` : "Review"}</Link>}
+		<section className={`panel intent ${intent.status}`} aria-label={`Intent ${intent.id}: ${intent.title}`}>
+			<div className="intent-top">
+				<div className="intent-line">
+					<Link to={to} className="intent-title"><IntentId id={intent.id} /><span>{intent.title}</span></Link>
+					{intent.status === "landed" ? <span className="chip landed">landed <span className="mono">{short(intent.landedSha!)}</span></span> : <span className={`chip ${intent.status}`}>{intent.status}</span>}
 				</div>
-			)}
+				<p className="goal">{intent.goal}</p>
+				{attempts.length > 0 && <MiniLoom state={state} intentId={intent.id} className="spark" />}
+			</div>
+			{attempts.length > 0 && <ul className="attempts">{attempts.map((a) => <AttemptRow key={a.id} a={a} state={state} />)}</ul>}
+			<div className="intent-foot">
+				{attempts.length === 0 && <span className="dim">{intent.status === "open" ? "No agent has attempted this yet." : "Closed without an attempt."}</span>}
+				{attempts.length > 0 && <Link to={to} className="button"><Icon name="arrow" />{intent.status !== "open" ? "Open" : attempts.length > 1 ? `Compare ${attempts.length} attempts` : "Review the attempt"}</Link>}
+				{intent.status === "open" && !state.viewer && <button onClick={() => setJoining(!joining)} aria-expanded={joining}><Icon name={joining ? "x" : "plus"} />{joining ? "Close" : "Add an agent"}</button>}
+			</div>
 			{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} hosting={state.project.hosting} />}
 		</section>
 	);
 }
 
-function NewIntent({ slug }: { slug: string }) {
-	const [open, setOpen] = useState(false);
+function NewIntent({ slug, close }: { slug: string; close: () => void }) {
 	const [f, setF] = useState({ title: "", goal: "", acceptance: "" });
 	const create = useAction();
 	const submit = async (e: FormEvent) => {
 		e.preventDefault();
-		if (await create.run(() => api("POST", `/p/${slug}/intents`, { ...f, by: "human" }))) { setF({ title: "", goal: "", acceptance: "" }); setOpen(false); }
+		if (await create.run(() => api("POST", `/p/${slug}/intents`, { ...f, by: "human" }))) close();
 	};
-	if (!open) return <button className="primary" onClick={() => setOpen(true)}>New intent</button>;
 	return (
-		<form className="card form" onSubmit={submit}>
-			<h2>New intent</h2>
+		<form className="panel decide form" onSubmit={submit}>
+			<h3>New intent</h3>
+			<p className="dim">A goal, stated once. It replaces the issue, the branch and the pull request; agents read it as their brief.</p>
 			<label>Title<input value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })} placeholder="Add a dark mode" required autoFocus /></label>
 			<label>Goal<textarea value={f.goal} onChange={(e) => setF({ ...f, goal: e.target.value })} placeholder="What should be true when this is done, and for whom" required rows={2} /></label>
-			<label>Acceptance<textarea value={f.acceptance} onChange={(e) => setF({ ...f, acceptance: e.target.value })} placeholder="How a reviewer can tell it is done" rows={2} /></label>
-			{create.error && <p className="error">{create.error}</p>}
-			<div className="row"><button className="primary" disabled={create.busy}>Open intent</button><button type="button" onClick={() => setOpen(false)}>Cancel</button></div>
+			<label>Done when <span className="optional">optional</span><textarea value={f.acceptance} onChange={(e) => setF({ ...f, acceptance: e.target.value })} placeholder="How a reviewer can tell it is done" rows={2} /></label>
+			{create.error && <Notice>{create.error}</Notice>}
+			<div className="row"><button className="primary" disabled={create.busy}>{create.busy ? "Opening…" : "Open intent"}</button><button type="button" onClick={close}>Cancel</button></div>
 		</form>
 	);
 }
 
-const ICON: Record<string, string> = { land: "●", conflict: "✕", overlap: "≈", why: "¶", push: "↑", claim: "◌", ready: "✓", reconcile: "⚯", message: "✉", intent: "＋", attempt: "→", check: "✓", project: "＊" };
+const ICON: Record<string, IconName> = { land: "land", conflict: "conflict", overlap: "overlap", why: "decision", push: "push", claim: "claim", ready: "check", reconcile: "reconcile", message: "message", intent: "intent", attempt: "fork", check: "check", project: "dot", feedback: "feedback", revert: "undo" };
 
 export function ProjectPage({ state }: { state: State }) {
 	const open = state.intents.filter((i) => i.status === "open"), done = state.intents.filter((i) => i.status !== "open");
 	const me = useMe();
-	const [shown, setShown] = useState(30);
+	const [shown, setShown] = useState(20);
+	const [adding, setAdding] = useState(false);
 	useTitle(state.project.name);
+	const items = needs(state);
+	const live = state.attempts.filter((a) => LIVE.has(a.status)).length;
+	const landed = state.landings.filter((l) => !l.revertOf && !l.revertedBy).length;
 	return (
 		<main className="page">
-			<h1 className="sr-only">{state.project.name}: work in progress</h1>
-			{state.project.description && <p className="dim project-desc">{state.project.description}</p>}
-			{!state.project.head && <p className="warn">Trunk is empty. Push a repository into it (see "Push a repository") before starting attempts.</p>}
-			<NeedsYou state={state} />
+			<header className="phead">
+				<div>
+					<h1>{state.project.name}{state.project.public && <span className="chip quiet"><Icon name="globe" size={12} />public</span>}</h1>
+					{state.project.description && <p className="lede">{state.project.description}</p>}
+				</div>
+				<dl className="stats">
+					<div><dt>Open intents</dt><dd>{open.length}</dd></div>
+					<div><dt>Attempts in progress</dt><dd>{live}</dd></div>
+					<div><dt>Landed on trunk</dt><dd>{landed}</dd></div>
+					<div className={items.length ? "hot" : ""}><dt>Need you</dt><dd>{items.length}</dd></div>
+				</dl>
+			</header>
+			{!state.project.head && <Notice tone="warn">Trunk is empty. Push a repository into it before starting attempts: <a href="#trunk">make a push command</a>.</Notice>}
+			<NeedsYou items={items} />
 			<Braid state={state} />
 			<div className="columns">
 				<div className="col-main">
-					<div className="row section-head"><h2>Intents</h2><span className="spacer" />{!state.viewer && <NewIntent slug={state.project.slug} />}</div>
-					{state.intents.length === 0 && <p className="dim">An intent is a goal, stated once. Agents attempt it; you choose what lands.</p>}
+					<div className="section-head">
+						<h2>Intents{state.intents.length > 0 && <span className="count">{open.length} open</span>}</h2>
+						{!state.viewer && !adding && <button className="primary" onClick={() => setAdding(true)}><Icon name="plus" />New intent</button>}
+					</div>
+					{adding && <NewIntent slug={state.project.slug} close={() => setAdding(false)} />}
+					{state.intents.length === 0 && !adding && (
+						<Empty title="No intents yet">
+							<p>An intent is a goal, stated once. Agents attempt it; you choose what lands.</p>
+							{!state.viewer && <p><button className="primary" onClick={() => setAdding(true)}><Icon name="plus" />New intent</button></p>}
+						</Empty>
+					)}
+					{state.intents.length > 0 && open.length === 0 && !adding && <Empty kind="done" title="Nothing open">{!state.viewer && <p>Every intent has landed or been closed. <button className="link" onClick={() => setAdding(true)}>Open a new one</button></p>}</Empty>}
 					{open.map((i) => <IntentCard key={i.id} intent={i} state={state} />)}
-					{done.length > 0 && <h3 className="dim">Closed</h3>}
+					{done.length > 0 && <h3 className="label closed-label">Closed <span className="count">{done.length}</span></h3>}
 					{done.map((i) => <IntentCard key={i.id} intent={i} state={state} />)}
-					{!state.viewer && <DeleteProject state={state} />}
 				</div>
 				<aside className="col-side">
-					<TrunkRemote state={state} />
+					<Trunk state={state} />
 					{!state.viewer && me?.protected && <Visibility state={state} />}
-					<h2>Activity</h2>
-					<ol className="activity">
-						{state.activity.slice(0, shown).map((e) => (
-							<li key={e.id} className={e.kind}>
-								<span className="icon" aria-hidden="true">{ICON[e.kind] ?? "·"}</span>
-								<span>{e.intentId ? <Link to={`/p/${state.project.slug}/i/${e.intentId}`}>{e.text}</Link> : e.text} <span className="dim small">{ago(e.at)}</span></span>
-							</li>
-						))}
-					</ol>
-					{state.activity.length > shown && <button onClick={() => setShown(shown + 60)}>Show older activity</button>}
+					<section className="panel side-panel" aria-labelledby="act-h">
+						<h2 id="act-h" className="label">Activity</h2>
+						{state.activity.length === 0 && <p className="dim">Nothing has happened yet.</p>}
+						<ol className="activity">
+							{state.activity.slice(0, shown).map((e) => (
+								<li key={e.id} className={e.kind}>
+									<Icon name={ICON[e.kind] ?? "dot"} />
+									<span className="act-text">{e.intentId ? <Link to={`/p/${state.project.slug}/i/${e.intentId}`}>{e.text}</Link> : e.text}</span>
+									<time className="act-time" dateTime={new Date(e.at).toISOString()} title={new Date(e.at).toLocaleString()}>{ago(e.at).replace(" ago", "")}</time>
+								</li>
+							))}
+						</ol>
+						{state.activity.length > shown && <button onClick={() => setShown(shown + 60)}>Show older activity ({state.activity.length - shown} more)</button>}
+					</section>
 				</aside>
 			</div>
+			{!state.viewer && <DeleteProject state={state} />}
 		</main>
 	);
 }

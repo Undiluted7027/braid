@@ -33,7 +33,11 @@ export async function api<T = any>(method: string, path: string, body?: unknown)
 	if (res.status === 401 && await signIn()) res = await send();
 	if (res.status === 401) throw new Error("Sign in with this instance's admin token to do that.");
 	const data = await res.json().catch(() => ({}));
-	if (!res.ok) throw new Error((data as any).error ?? `${res.status} ${res.statusText}`);
+	if (!res.ok) {
+		// The server's messages start lower-case; shown on their own they read better as sentences.
+		const said = (data as any).error as string | undefined;
+		throw new Error(said ? said[0].toUpperCase() + said.slice(1) : `The server answered ${res.status} ${res.statusText}.`);
+	}
 	return data as T;
 }
 
@@ -105,9 +109,9 @@ export function ago(at: number) {
 	return `${Math.round(s / 86400)}d ago`;
 }
 
-// One hue per intent, reused everywhere an intent appears (strands, chips, blame).
-const HUES = ["#c2410c", "#0f766e", "#6d28d9", "#b45309", "#be185d", "#1d4ed8", "#4d7c0f", "#0e7490"];
-export const intentColor = (id: number) => HUES[(id - 1) % HUES.length];
+// One hue per intent, reused everywhere an intent appears (strands, labels, blame). The hues are
+// CSS variables, so the same intent is a deeper shade on white and a brighter one on night surfaces.
+export const intentColor = (id: number) => `var(--i${((id - 1) % 8) + 1})`;
 
 export function navigate(to: string) {
 	history.pushState(null, "", to);
@@ -130,4 +134,16 @@ export function useNow(attemptId: string, initial: { kind: string; tool: string 
 	useEffect(() => setNow(initial ?? null), [attemptId, initial?.at]);
 	useEffect(() => onSession(attemptId, (events) => setNow(events[events.length - 1])), [attemptId]);
 	return now;
+}
+
+/** Whether the window is phone-width, for drawings that have to be laid out differently there. */
+export function useNarrow(max = 640) {
+	const query = `(max-width: ${max}px)`;
+	const [narrow, setNarrow] = useState(() => window.matchMedia(query).matches);
+	useEffect(() => {
+		const m = window.matchMedia(query), on = () => setNarrow(m.matches);
+		m.addEventListener("change", on);
+		return () => m.removeEventListener("change", on);
+	}, [query]);
+	return narrow;
 }
