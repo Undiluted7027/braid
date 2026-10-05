@@ -148,6 +148,10 @@ Rules: `fill="none"` unless it is a node; `vector-effect: non-scaling-stroke` on
 
 One set drawn for Braid: 16px grid, 1.5px stroke, round caps and joins, `currentColor`. It replaces the text glyphs now used as icons (`→`, `¶`, `≈`, `✓`, `×`, `▸`). Needed: land, fork, conflict, overlap, decision, assumption, question, rejected, feedback, check pass, check fail, running, file, folder, copy, external, chevron, close, agent, sandbox, clock.
 
+### Cards on the loom
+
+Anything drawn on the loom (a strand, a landing, a revert, a commit pushed outside Braid, a tie, the start of trunk) opens a card on hover, keyboard focus or tap. The card belongs to the dark surface in both themes: `#161616` fill, 1px `#444444` border, 6px radius, 340px wide, 13/18 text, and the one soft shadow in the product (`0 12px 32px -8px` at 55% black), because it floats over content. Hover opens after 160ms (70ms when moving from one thing to the next) and closes 180ms after the pointer leaves both the thing and the card. It sits 12px below its anchor, or above when there is no room, and never leaves the window. Under 640px it is a sheet pinned to the bottom with a close button. Pointer targets are 16px wide for lines and 26px across for nodes.
+
 ### Where graphics go
 
 - **Home hero**: a labelled loom scene on the light canvas beside the headline (seven of twelve columns), replacing the small corner drawing: five attempts at four intents, one predicted conflict, one mergeable overlap, two landings, on a dot grid. Phones get a simpler three-strand version without labels.

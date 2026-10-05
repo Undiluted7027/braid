@@ -3,6 +3,7 @@
 import { useId } from "react";
 import type { Attempt, State } from "../shared/types";
 import { intentColor } from "./api";
+import { useLoomCards } from "./LoomCard";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
@@ -119,8 +120,10 @@ export function StepArt({ step }: { step: 1 | 2 | 3 | 4 }) {
  * A project's attempts in one glance: the loom with no words. With `intentId`, only that intent's strands,
  * still placed on the whole project's timeline so their position against trunk is true.
  */
-export function MiniLoom({ state, intentId, className = "" }: { state: Pick<State, "attempts" | "landings">; intentId?: number; className?: string }) {
+export function MiniLoom({ state, intentId, className = "" }: { state: State; intentId?: number; className?: string }) {
 	const W = 320, T = 7, C = 8;
+	// Pointing at a strand or a landing shows the same card as on the full loom. Hover only: these drawings sit inside links and summaries.
+	const cards = useLoomCards(state);
 	const all = state.attempts.filter((a) => a.status !== "abandoned");
 	const shown = all.filter((a) => intentId === undefined || a.intentId === intentId).sort((a, b) => a.intentId - b.intentId || a.createdAt - b.createdAt);
 	const landingOf = new Map(state.landings.filter((l) => !l.revertOf && !l.revertedBy).map((l) => [l.attemptId, l]));
@@ -132,6 +135,7 @@ export function MiniLoom({ state, intentId, className = "" }: { state: Pick<Stat
 	const landed = shown.filter((a) => landingOf.has(a.id)).length, live = shown.filter((a) => LIVE.has(a.status)).length;
 	const label = shown.length ? `${shown.length} attempt${shown.length === 1 ? "" : "s"}: ${landed} landed, ${live} in progress` : "No attempts yet";
 	return (
+		<>
 		<svg className={`mini-loom ${className}`} viewBox={`0 0 ${W} ${Math.max(H, 26)}`} role="img" aria-label={label}>
 			<line x1="4" y1={T} x2={W - 4} y2={T} className="g-trunk" />
 			<circle cx="8" cy={T} r="2.5" className="g-seed" />
@@ -141,12 +145,18 @@ export function MiniLoom({ state, intentId, className = "" }: { state: Pick<Stat
 				const x1 = l ? Math.max(x(l.at) + 8, x0 + 2 * C + 6) : going ? W - 14 : Math.max(x(end(a)), x0 + 2 * C + 6);
 				return (
 					<g key={a.id} style={{ ["--c" as string]: intentColor(a.intentId) }}>
-						<path d={strand(x0, x1, T, y, C, !!l)} className={`g-strand ${!l && !going ? "faded" : ""}`} />
-						{l ? <circle cx={x1} cy={T} r="3.5" className="g-node" /> : going && <circle cx={x1} cy={y} r="3" className={`g-node ${a.status === "working" ? "pulse" : ""}`} />}
+						<g {...cards.bind({ kind: "attempt", id: a.id }, { point: true, hoverOnly: true })} className={cards.openKey === `a:${a.id}` ? "on" : ""}>
+							<path d={strand(x0, x1, T, y, C, !!l)} className="hit" />
+							<path d={strand(x0, x1, T, y, C, !!l)} className={`g-strand ${!l && !going ? "faded" : ""}`} />
+							{!l && going && <circle cx={x1} cy={y} r="3" className={`g-node ${a.status === "working" ? "pulse" : ""}`} />}
+						</g>
+						{l && <g {...cards.bind({ kind: "landing", sha: l.sha }, { hoverOnly: true })}><circle cx={x1} cy={T} r="8" className="hit" /><circle cx={x1} cy={T} r="3.5" className="g-node" /></g>}
 					</g>
 				);
 			})}
 		</svg>
+		{cards.card}
+		</>
 	);
 }
 
