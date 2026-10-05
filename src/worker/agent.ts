@@ -277,7 +277,7 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 		}
 		// Not awaited to completion: the script outlives this call and the alarm follows it through its files.
 		await container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", TASK, ...argv], { cwd: REPO, env: { HOME: "/root", CI: "true", ...TRUST, ...agentEnv }, stdout: "ignore", stderr: "ignore" });
-		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : job.task === "respond" ? ", to act on a person's note" : ", to fix failed verification"}` }], "running");
+		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : job.task === "respond" ? ", to act on a person's note" : ", to fix failed verification"}` }], "running", job.kind === "selftest" ? undefined : model);
 	}
 
 	/** Read what the agent has printed since last time and pass it on as session events. */

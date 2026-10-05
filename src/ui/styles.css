@@ -176,8 +176,9 @@ label.inline > select { margin-top: 0; }
 .agent { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
 .agent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-mark { width: 22px; height: 22px; border-radius: var(--r-sm); display: inline-grid; place-items: center; font: 600 10px/1 var(--mono); color: #fff; background: var(--faint); flex: none; }
-.agent-mark.claude { background: #c2622d; }
-.agent-mark.codex { background: #0f8f70; }
+.agent-brand { flex: none; display: block; }
+.agent-brand.codex { color: var(--ink); }
+.agent-name.mono { font-weight: 500; font-size: 0.92em; }
 .intent-id { font: 600 12px/1 var(--mono); padding: 4px 6px; border-radius: var(--r-sm); color: #fff; background: var(--c, var(--muted)); flex: none; }
 @media (prefers-color-scheme: dark) { .intent-id { color: #0a0a0a; } }
 .night .intent-id, .braid .intent-id { color: #0a0a0a; }

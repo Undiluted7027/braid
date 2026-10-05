@@ -153,7 +153,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "reconciliations" && rest[2] === "auto") return Response.json(await p.resolveWithModel(Number(rest[1])));
 		if (rest[0] === "push") return Response.json((await p.onPush(String(b.repo))) ?? { ok: true });
 		// Session events from an agent's launcher, authenticated by the attempt token.
-		if (rest[0] === "session") return Response.json(await p.ingest((request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), b.events));
+		if (rest[0] === "session") return Response.json(await p.ingest((request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), b.events, b.model));
 		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
 		if (rest[0] === "clone-credentials") return Response.json(await p.cloneCredentials());
 		if (rest[0] === "public") {

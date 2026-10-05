@@ -315,7 +315,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 		<section className={`panel attempt ${a.status}`} aria-label={`Attempt ${a.id} by ${a.agent}`}>
 			<header className="attempt-head">
 				<div className="attempt-top">
-					<h2><Agent name={a.agent} kind={a.kind} /><span className="id">attempt <span className="mono">{a.id}</span></span></h2>
+					<h2><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="id">attempt <span className="mono">{a.id}</span></span></h2>
 					<span className={`chip ${a.status}`}>{a.status}</span>
 					<HostedChip a={a} />
 					<span className="spacer" />

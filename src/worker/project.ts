@@ -95,6 +95,14 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN reverted_by TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN revert_of TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE registry ADD COLUMN public INTEGER DEFAULT 0"); } catch {}
+		try {
+			this.sql.exec("ALTER TABLE attempts ADD COLUMN model TEXT");
+			// Attempts from before the column existed: a hosted agent's first session line names its model.
+			for (const e of this.rows<{ attempt_id: string; text: string }>("SELECT attempt_id, text FROM session WHERE kind = 'system' AND text LIKE '%started on attempt%' ORDER BY id")) {
+				const model = /\(([\w.:-]+)\)/.exec(e.text)?.[1];
+				if (model) this.sql.exec("UPDATE attempts SET model = ? WHERE id = ? AND model IS NULL", model, e.attempt_id);
+			}
+		} catch {}
 	}
 
 	// ── storage helpers ──────────────────────────────────────────────────────
@@ -122,7 +130,7 @@ export class Project extends DurableObject<BraidEnv> {
 		id: r.id, intentId: r.intent_id, agent: r.agent, kind: r.kind, repo: r.repo, remote: r.remote, baseSha: r.base_sha, headSha: r.head_sha,
 		status: r.status, summary: r.summary, files: JSON.parse(r.files), claims: JSON.parse(r.claims), behind: r.behind,
 		trunkConflicts: JSON.parse(r.trunk_conflicts), checks: JSON.parse(r.checks), createdAt: r.created_at, updatedAt: r.updated_at,
-		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "",
+		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "", model: r.model ?? null,
 	});
 	private toDecision = (r: any): Decision => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, agent: r.agent, kind: r.kind, title: r.title, body: r.body,
@@ -697,8 +705,9 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	/** Session events from a hosted agent, read from its output by the host. */
-	async hostedEvents(attemptId: string, events: { kind: string; tool?: string | null; text: string }[], state?: "running") {
+	async hostedEvents(attemptId: string, events: { kind: string; tool?: string | null; text: string }[], state?: "running", model?: string) {
 		if (state) this.sql.exec("UPDATE attempts SET hosted = ? WHERE id = ? AND hosted = 'starting'", state, attemptId);
+		if (model) this.setModel(attemptId, model);
 		this.addEvents(attemptId, events);
 		if (state) this.broadcast();
 	}
@@ -851,9 +860,17 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	/** Session events streamed by the agent's launcher (see cli/braid.mjs). */
-	async ingest(token: string, events: { kind: string; tool?: string | null; text: string; at?: number }[]) {
+	/** Which model an attempt's agent is running on. A model name is a short plain word; anything else is ignored. */
+	private setModel(attemptId: string, model: unknown) {
+		if (typeof model !== "string" || !/^[\w.:\/-]{2,80}$/.test(model)) return;
+		this.sql.exec("UPDATE attempts SET model = ? WHERE id = ? AND (model IS NULL OR model != ?)", model, attemptId, model);
+		this.broadcast();
+	}
+
+	async ingest(token: string, events: { kind: string; tool?: string | null; text: string; at?: number }[], model?: unknown) {
 		const row = this.rows<{ id: string }>("SELECT id FROM attempts WHERE token = ?", token)[0];
 		if (!row) throw new BraidError("unknown agent token", 401);
+		if (model) this.setModel(row.id, model);
 		this.addEvents(row.id, Array.isArray(events) ? events : []);
 		return { ok: true };
 	}

@@ -4,6 +4,7 @@ import type { State } from "../shared/types";
 import { api, ago, navigate, signIn, tryToken, useAsync, useProject, useSignedIn } from "./api";
 export { useSignedIn };
 import { Empty, HeroLoom, MiniLoom, StepArt } from "./Graphics";
+import { BRANDS } from "./brands";
 import { IntentPage } from "./Intent";
 import { AskHost, Corners, Icon, Notice } from "./Kit";
 import { ProjectPage } from "./Project";
@@ -43,11 +44,23 @@ export function Mark({ size = 22 }: { size?: number }) {
 export function IntentId({ id }: { id: number }) {
 	return <span className="intent-id" style={{ ["--c" as string]: `var(--i${((id - 1) % 8) + 1})` }}>I{id}</span>;
 }
-/** An agent's name with a square of its initials, coloured by which agent it is. */
-export function Agent({ name, kind }: { name: string; kind?: string }) {
-	const which = kind === "claude" || /claude/i.test(name) ? "claude" : kind === "codex" || /codex/i.test(name) ? "codex" : "";
-	const initials = which === "claude" ? "CC" : which === "codex" ? "CX" : name.replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase();
-	return <span className="agent"><span className={`agent-mark ${which}`} aria-hidden="true">{initials}</span><span className="agent-name">{name}</span></span>;
+/**
+ * Who made an attempt. Claude Code and Codex are shown by their own marks, named on hover and to
+ * screen readers; any other agent gets a square with its initials. The text beside the mark is the
+ * model the agent ran on when Braid knows it, and the agent's name otherwise.
+ */
+export function Agent({ name, kind, model }: { name: string; kind?: string; model?: string | null }) {
+	const which = kind === "claude" || /claude/i.test(name) ? "claude" : kind === "codex" || /codex/i.test(name) ? "codex" : null;
+	const brand = which && BRANDS[which];
+	const product = brand ? brand.label : name;
+	return (
+		<span className="agent" title={model ? `${product} (${name}) on ${model}` : brand ? `${product} (${name}); the model was not reported` : name}>
+			{brand
+				? <svg className={`agent-brand ${which}`} viewBox="0 0 24 24" width="20" height="20" role="img" aria-label={brand.label} style={brand.color ? { color: brand.color } : undefined}><title>{brand.label}</title><path d={brand.path} fill="currentColor" /></svg>
+				: <span className="agent-mark" aria-hidden="true">{name.replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase()}</span>}
+			<span className={`agent-name ${model ? "mono" : ""}`}>{model ?? name}</span>
+		</span>
+	);
 }
 
 /** The page's name in the tab and in history. */

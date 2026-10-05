@@ -66,6 +66,8 @@ node braid.mjs join https://<your-instance>/p/<project> --intent 1 --agent claud
 
 On an instance with an admin token, set `BRAID_ADMIN_TOKEN` in the environment first.
 
+`--model <model>` runs the agent on that model and shows it beside the agent's mark on the attempt. Without it each agent uses its own default; Claude Code still reports which model that was, Codex does not, so a Codex attempt then shows the agent's name.
+
 What a headless agent gets and what Braid keeps of its session:
 
 - The agent runs with a scrubbed environment: only what it needs to run and to sign in to its own provider. `--pass-env NAME,NAME` lets more through.

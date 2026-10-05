@@ -18,6 +18,8 @@ export interface Intent {
 export interface FileChange { path: string; status: "added" | "modified" | "deleted"; base: string | null; head: string | null }
 export interface Check { name: string; status: "pass" | "fail"; detail: string; at: number }
 export interface Attempt {
+	/** The model the agent ran on, when Braid was told: it starts hosted agents itself, and the launcher reads it from the agent's output. */
+	model: string | null;
 	id: string;
 	intentId: number;
 	agent: string;

@@ -3,7 +3,7 @@
 //
 //   braid init <braid-url> --name <slug> [--from <dir>] [--description <text>]
 //       Create a project whose trunk is the HEAD of a local git repository (default: this one).
-//   braid join <project-url> --intent <n> [--agent <name>] [--dir <path>] [--run]
+//   braid join <project-url> --intent <n> [--agent <name>] [--model <model>] [--dir <path>] [--run]
 //       Fork trunk into a new attempt, clone it, and wire the agent to Braid over MCP.
 //       --run starts the agent headless right away (claude or codex, from --agent). It runs
 //       unattended with shell access, so use it on code you trust. It gets a scrubbed environment
@@ -82,6 +82,9 @@ async function joinCommand() {
 	if (!slug || !intent) fail("usage: braid join <project-url> --intent <n> [--agent <name>] [--dir <path>] [--run]");
 	const admin = flag("token", process.env.BRAID_ADMIN_TOKEN);
 
+	// Checked before anything is created, so a mistyped flag does not leave an empty attempt behind.
+	const asked = typeof flag("model") === "string" ? String(flag("model")) : null;
+	if (asked && !/^[\w.:\/-]{2,80}$/.test(asked)) fail(`--model "${asked}" does not look like a model name`);
 	const res = await fetch(`${url.origin}/api/p/${slug}/intents/${intent}/join`, {
 		method: "POST",
 		headers: { "content-type": "application/json", ...(admin ? { authorization: `Bearer ${admin}` } : {}) },
@@ -89,6 +92,9 @@ async function joinCommand() {
 	});
 	const joined = await res.json();
 	if (!res.ok) fail(joined.error ?? `join failed (${res.status})`);
+	// --model is handed to the agent and written on the attempt, so reviewers see what ran. Codex does not say
+	// which model it used, so this is the only way Braid learns it for a Codex started here.
+	const report = (body) => fetch(`${url.origin}/api/p/${slug}/session`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${joined.agentToken}` }, body: JSON.stringify(body) });
 
 	// The command agents without MCP use; absolute, so it works from any attempt directory.
 	const self = resolve(process.argv[1]);
@@ -123,7 +129,10 @@ Tools: ${TOOLS.join(", ")}.
 
 	console.log(`Attempt ${joined.attemptId} on I${joined.intentId} is ready in ${dir}`);
 	if (!flag("run")) {
-		console.log(`\nStart your agent there:\n  cd ${dir}\n  claude "Read BRAID.md and do the work"        # Claude Code picks up .mcp.json\n  codex "Read BRAID.md and do the work"         # Codex and others: tools are shell commands, see BRAID.md`);
+		const m = asked ? ` --model ${asked}` : "";
+		// Nothing will read the agent's output here, so the model named on the command line is recorded now.
+		if (asked) await report({ events: [], model: asked }).catch(() => {});
+		console.log(`\nStart your agent there:\n  cd ${dir}\n  claude${m} "Read BRAID.md and do the work"        # Claude Code picks up .mcp.json\n  codex${m} "Read BRAID.md and do the work"         # Codex and others: tools are shell commands, see BRAID.md`);
 		return;
 	}
 	const env = { ...agentEnv(String(flag("pass-env", "")).split(",")), BRAID_AGENT_TOKEN: joined.agentToken };
@@ -133,26 +142,24 @@ Tools: ${TOOLS.join(", ")}.
 	const clean = (e) => ({ ...e, text: clip(redact(e.text, secrets), e.kind === "say" ? 4000 : 1500) });
 	const [cmd, args] = agent.startsWith("codex")
 		? // Codex's workspace sandbox keeps .git read-only by default, which blocks commits; open it for this attempt.
-		["codex", ["exec", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "-c", `sandbox_workspace_write.writable_roots=["${join(dir, ".git")}"]`, "-c", `mcp_servers.braid.url="${joined.mcpUrl}"`, "-c", `mcp_servers.braid.bearer_token_env_var="BRAID_AGENT_TOKEN"`,
+		["codex", ["exec", ...(asked ? ["--model", asked] : []), "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "-c", `sandbox_workspace_write.writable_roots=["${join(dir, ".git")}"]`, "-c", `mcp_servers.braid.url="${joined.mcpUrl}"`, "-c", `mcp_servers.braid.bearer_token_env_var="BRAID_AGENT_TOKEN"`,
 			// Headless Codex cannot answer approval prompts, so without this every Braid tool call is refused.
 			"-c", `mcp_servers.braid.default_tools_approval_mode="approve"`, "--json", PROMPT]]
-		: ["claude", ["-p", PROMPT, "--output-format", "stream-json", "--verbose", "--mcp-config", ".mcp.json", "--permission-mode", "acceptEdits", "--allowedTools", "mcp__braid", "Bash", "Read", "Edit", "Write", "Glob", "Grep"]];
+		: ["claude", ["-p", PROMPT, ...(asked ? ["--model", asked] : []), "--output-format", "stream-json", "--verbose", "--mcp-config", ".mcp.json", "--permission-mode", "acceptEdits", "--allowedTools", "mcp__braid", "Bash", "Read", "Edit", "Write", "Glob", "Grep"]];
 	console.log(`Starting ${cmd} headless…\n`);
 	// No stdin: `codex exec` otherwise waits for piped input forever when not attached to a terminal.
 	const child = spawn(cmd, args, { cwd: dir, env, stdio: ["ignore", "pipe", "inherit"] });
 
 	// Both CLIs emit one JSON event per line. Turn each into session events, show them here, and stream them to Braid.
 	const toEvents = agent.startsWith("codex") ? codexEvents : claudeEvents;
+	// The model shown on the attempt: the one asked for, or the one the agent says it is running on.
+	let model = asked;
 	let queue = [], sending = Promise.resolve();
 	const flush = () => {
 		if (!queue.length) return sending;
 		const events = queue;
 		queue = [];
-		sending = sending.then(() => fetch(`${url.origin}/api/p/${slug}/session`, {
-			method: "POST",
-			headers: { "content-type": "application/json", authorization: `Bearer ${joined.agentToken}` },
-			body: JSON.stringify({ events }),
-		})).catch(() => {}); // a dropped batch must not stop the agent
+		sending = sending.then(() => report({ events, ...(model ? { model } : {}) })).catch(() => {}); // a dropped batch must not stop the agent
 		return sending;
 	};
 	const timer = setInterval(flush, 700);
@@ -163,7 +170,7 @@ Tools: ${TOOLS.join(", ")}.
 		}
 		if (queue.length >= 25) flush();
 	};
-	emit([{ kind: "system", text: `${cmd} started on attempt ${joined.attemptId}` }]);
+	emit([{ kind: "system", text: `${cmd} started on attempt ${joined.attemptId}${asked ? ` (${asked})` : ""}` }]);
 	let buffer = "";
 	child.stdout.on("data", (chunk) => {
 		buffer += chunk;
@@ -173,6 +180,9 @@ Tools: ${TOOLS.join(", ")}.
 			if (!line.trim()) continue;
 			let event;
 			try { event = JSON.parse(line); } catch { emit([{ kind: "system", text: line }]); continue; }
+			// Claude Code names its model when it starts and on every message; Codex does when its event carries one.
+			const said = event.model ?? event.message?.model;
+			if (typeof said === "string" && said !== "<synthetic>") model = said;
 			emit(toEvents(event));
 		}
 	});
@@ -231,9 +241,10 @@ else if (command === "auth") {
 } else {
 	console.log(`braid: put a coding agent to work on an intent.
 
-  braid join <project-url> --intent <n> [--agent claude-code|codex|<name>] [--run]
+  braid join <project-url> --intent <n> [--agent claude-code|codex|<name>] [--model <model>] [--run]
       Start an attempt: fork trunk, clone it here, and connect the agent to Braid.
       --run starts Claude Code or Codex headless in it. --dir <path> chooses the directory.
+      --model <model> runs the agent on that model and shows it on the attempt.
       --pass-env NAME,NAME lets more of your environment through to the agent.
   braid init <braid-url> --name <project> [--from <dir>] [--description <text>]
       Make a local git repository the trunk of a project (creates the project if needed).

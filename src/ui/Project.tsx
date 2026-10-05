@@ -150,7 +150,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const queued = state.queue.some((q) => q.attemptId === a.id);
 	return (
 		<li className={`attempt-row ${a.status}`}>
-			<span className="who"><Agent name={a.agent} kind={a.kind} /><span className="mono id" title={`Attempt ${a.id}`}>{a.id}</span></span>
+			<span className="who"><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="mono id" title={`Attempt ${a.id}`}>{a.id}</span></span>
 			<span className="state"><span className={`chip ${a.status}`}>{queued ? "landing" : a.status}</span><HostedChip a={a} /></span>
 			<span className="what">
 				{a.status === "working" && now ? <span className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</span>
