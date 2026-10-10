@@ -14,6 +14,28 @@ export interface Intent {
 	createdAt: number;
 	landedSha: string | null;
 	landedAttempt: string | null;
+	/** "Done when" as separate things to check. Every attempt at the intent is reviewed against these. */
+	criteria: string[];
+}
+/** Something about an attempt a person should look at whatever a reviewer says. Raised from the diff and the session, with no model. */
+export interface Flag {
+	kind: "tests-deleted" | "tests-changed" | "checks" | "lockfile" | "outside-claims" | "history" | "destructive";
+	text: string; paths: string[];
+}
+/** One criterion as the reviewer found it. `basis`: judged from the diff (with lines as evidence), or from the project's checks having passed. */
+export interface CriterionVerdict { text: string; verdict: "met" | "not_met" | "unclear"; basis: "diff" | "checks"; why: string; evidence: { path: string; line: number | null }[] }
+/**
+ * A reviewer's reading of one commit of an attempt against its intent's criteria. `verdict`: "approve" (every
+ * criterion met, nothing for a person to weigh), "changes" (something specific the agent could change, in `changes`),
+ * or "person". A review is for the commit in `sha`; once the attempt has another head it is about an older one.
+ */
+export interface Review {
+	id: number; attemptId: string; intentId: number; sha: string;
+	status: "running" | "done" | "failed";
+	verdict: "approve" | "changes" | "person" | null;
+	criteria: CriterionVerdict[]; summary: string; concerns: string[]; changes: string;
+	/** The model that reviewed. */
+	by: string; error: string | null; at: number; finishedAt: number | null;
 }
 export interface FileChange { path: string; status: "added" | "modified" | "deleted"; base: string | null; head: string | null }
 export interface Check { name: string; status: "pass" | "fail"; detail: string; at: number }
@@ -32,6 +54,14 @@ export interface Attempt {
 	summary: string;
 	files: FileChange[];
 	claims: string[];
+	flags: Flag[];
+	/** Under a project that lands by itself: why this attempt has not been landed, in words. Empty when that does not apply. */
+	held: string;
+	/**
+	 * What kind of thing is holding it. "checks" and "review" are things Braid is waiting for and will act on by itself;
+	 * every other kind needs a person. Empty when `held` is.
+	 */
+	heldFor: "" | "checks" | "review" | "checks-failed" | "review-failed" | "no-reviewer" | "flags" | "question" | "choice" | "landing" | "reviewer" | "person";
 	/** Landings on trunk since this attempt's base. */
 	behind: number;
 	/** Paths that would conflict with trunk if this landed now. */
@@ -119,6 +149,13 @@ export interface ProjectInfo { slug: string; name: string; description: string; 
 	hosting: { available: boolean; claude: boolean; codex: boolean; via: string };
 	/** Anyone with the link may read this project without signing in. */
 	public: boolean;
+	/**
+	 * How the project is run, from trunk's braid.json. `landing`: "auto" lands an attempt without a person once it is ready,
+	 * its checks pass, its review finds every criterion met and nothing is flagged. `review`: attempts are reviewed when marked ready.
+	 * `conflicts`: "auto" sends a conflict to the agent and then the model before a person.
+	 * `reviewers`: the models this instance can review with. With two, an attempt is read by one from a different maker than its agent.
+	 */
+	policy: { landing: "person" | "auto"; review: boolean; conflicts: "person" | "auto"; reviewers: string[] };
 }
 /** One command run in the sandbox for a commit. `tail` is the end of its output. */
 export interface RunStep { name: string; command: string; status: "running" | "pass" | "fail"; exitCode: number | null; ms: number; tail: string }
@@ -151,6 +188,8 @@ export interface State {
 	reconciliations: Reconciliation[];
 	landings: Landing[];
 	activity: Activity[];
+	/** The latest review of each attempt. */
+	reviews: Review[];
 	/** How things asked for turned out, newest first. A request only answers "queued"; this is where its result shows. */
 	outcomes: Outcome[];
 	/** Work Braid gave up on after several tries. Each can be tried again. */

@@ -7,6 +7,9 @@ import { asText, assemble, diffTrees, GENERATED, listTree, markedView, merge3, m
 import { claimMatches, claimOverlaps, fileOverlaps, risen, strongest } from "./overlap.ts";
 import { CANDIDATE, chain, commitFiles, prepare, promoteFrom, revert, seed, type ChainStep } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
+import { diffFlags, sessionFlags } from "./flags.ts";
+import { criteriaOf, settle, type ReviewInput } from "./review.ts";
+import { reviewAttempt, reviewerFor, reviewerName, reviewers, type Reviewer } from "./reviewer";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
 import { drain, Log, type Effect, type Executor, type NewEffect, type NewEvent } from "./log.ts";
@@ -15,11 +18,11 @@ import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Intent, JoinResult, Landing, LandOutcome, LineOrigin, Outcome, Overlap, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
+	Flag, Intent, JoinResult, Landing, LandOutcome, LineOrigin, Outcome, Overlap, Review, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
-	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string; HOSTED_MAX?: string; SPARE_FORKS?: string;
+	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string; HOSTED_MAX?: string; SPARE_FORKS?: string; BRAID_REVIEW_MODEL?: string; BRAID_REVIEW_OPENAI_MODEL?: string;
 };
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
@@ -42,7 +45,7 @@ const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
 const MAX_RESULT_TEXT = 800;
 const MAX_EVENTS = 20_000;
-const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "outcomes"];
+const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "outcomes", "reviews"];
 /** How long one alarm keeps taking new effects before handing over to the next. An alarm may run for fifteen minutes. */
 const DRAIN_MS = 8 * 60_000;
 const now = () => Date.now();
@@ -117,6 +120,11 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE registry ADD COLUMN public INTEGER DEFAULT 0"); } catch {}
 		try { this.sql.exec("ALTER TABLE outcomes ADD COLUMN sha TEXT DEFAULT ''"); } catch {}
 		try { this.sql.exec("ALTER TABLE queue ADD COLUMN combined TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN flags TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN held TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN held_for TEXT"); } catch {}
+		this.sql.exec(`CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT, intent_id INTEGER, sha TEXT, status TEXT, verdict TEXT,
+			criteria TEXT, summary TEXT, concerns TEXT, changes TEXT, by TEXT, error TEXT, at INTEGER, finished_at INTEGER)`);
 		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN auto TEXT"); } catch {}
 		try {
 			this.sql.exec("ALTER TABLE queue ADD COLUMN batch_id INTEGER");
@@ -163,13 +171,22 @@ export class Project extends DurableObject<BraidEnv> {
 
 	private toIntent = (r: any): Intent => ({
 		id: r.id, title: r.title, goal: r.goal, acceptance: r.acceptance, status: r.status, createdBy: r.created_by,
-		createdAt: r.created_at, landedSha: r.landed_sha, landedAttempt: r.landed_attempt,
+		createdAt: r.created_at, landedSha: r.landed_sha, landedAttempt: r.landed_attempt, criteria: criteriaOf(r),
 	});
+	private toReview = (r: any): Review => ({
+		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, sha: r.sha, status: r.status, verdict: r.verdict ?? null, criteria: JSON.parse(r.criteria || "[]"),
+		summary: r.summary ?? "", concerns: JSON.parse(r.concerns || "[]"), changes: r.changes ?? "", by: r.by ?? "", error: r.error ?? null, at: r.at, finishedAt: r.finished_at ?? null,
+	});
+	/** The latest review of an attempt, whatever commit it was for. */
+	private reviewOf(attemptId: string): Review | null {
+		const r = this.rows("SELECT * FROM reviews WHERE attempt_id = ? ORDER BY id DESC LIMIT 1", attemptId)[0];
+		return r ? this.toReview(r) : null;
+	}
 	private toAttempt = (r: any): Attempt => ({
 		id: r.id, intentId: r.intent_id, agent: r.agent, kind: r.kind, repo: r.repo, remote: r.remote, baseSha: r.base_sha, headSha: r.head_sha,
 		status: r.status, summary: r.summary, files: JSON.parse(r.files), claims: JSON.parse(r.claims), behind: r.behind,
 		trunkConflicts: JSON.parse(r.trunk_conflicts), checks: JSON.parse(r.checks), createdAt: r.created_at, updatedAt: r.updated_at,
-		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "", model: r.model ?? null,
+		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "", model: r.model ?? null, flags: JSON.parse(r.flags || "[]"), held: r.held ?? "", heldFor: r.held ? r.held_for ?? "person" : "",
 	});
 	private toDecision = (r: any): Decision => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, agent: r.agent, kind: r.kind, title: r.title, body: r.body,
@@ -246,6 +263,10 @@ export class Project extends DurableObject<BraidEnv> {
 	private removeEffect(repo: string): NewEffect { return { id: `repo.remove:${repo}`, type: "repo.remove", lane: "spares", data: { repo } }; }
 	/** Move the landing queue, if anything is in it. */
 	private advanceEffect(): NewEffect[] { return this.rows("SELECT 1 FROM queue LIMIT 1").length ? [{ id: "queue.advance", type: "queue.advance", lane: "landing" }] : []; }
+	/** Have the reviewer read an attempt's current commit against its intent's criteria. */
+	private reviewEffect(attemptId: string, again = false): NewEffect { return { id: `review.run:${attemptId}`, type: "review.run", lane: `review:${attemptId}`, data: { attemptId, again } }; }
+	/** See whether the project's landing policy has something to do for an attempt. */
+	private considerEffect(attemptId: string): NewEffect { return { id: `policy.consider:${attemptId}`, type: "policy.consider", lane: `policy:${attemptId}`, data: { attemptId } }; }
 	private stopEffect(attemptId: string, why: string): NewEffect { return { id: `agent.stop:${attemptId}`, type: "agent.stop", lane: `agent:${attemptId}`, data: { attemptId, why } }; }
 
 	/** Each kind of effect checks what is true before it acts, so one that runs twice does no harm. */
@@ -278,6 +299,8 @@ export class Project extends DurableObject<BraidEnv> {
 		"landing.revert": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doRevert(effect.data.sha, effect.data.by, effect.data.reason); } },
 		"model.reconcile": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doModelReconcile(effect.data.reconId); } },
 		"agent.start": { replaySafe: true, run: async (effect, ctx) => { if (this.trunk) await this.doStartAgent(effect.data.attemptId, effect.data.kind, effect.data.task, ctx.willRetry); } },
+		"review.run": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doReview(effect.data.attemptId, !!effect.data.again); } },
+		"policy.consider": { replaySafe: true, run: async (effect) => { if (this.trunk) { await this.policy(); this.consider(effect.data.attemptId); } } },
 		"agent.stop": { replaySafe: true, run: async (effect) => { await this.agentHost(effect.data.attemptId)?.stop(effect.data.why); } },
 		"fork.spare": { replaySafe: true, run: () => this.keepSpares() },
 		"repo.remove": { replaySafe: true, run: async (effect) => { await this.host.remove(effect.data.repo).catch((e) => { if (!/not.?found|does not exist/i.test(String(e?.message ?? e))) throw e; }); } },
@@ -378,7 +401,7 @@ export class Project extends DurableObject<BraidEnv> {
 	 * Create the trunk repo. `starter` seeds a small demo app, `import` copies an existing
 	 * git repository, and `empty` waits for a first push (see trunkCredentials).
 	 */
-	async init(input: { slug: string; name: string; description: string; source?: "starter" | "empty" | "import"; url?: string; branch?: string }) {
+	async init(input: { slug: string; name: string; description: string; source?: "starter" | "empty" | "import"; url?: string; branch?: string; review?: boolean }) {
 		if (this.trunk) throw new BraidError("project already exists", 409);
 		const repo = `${input.slug}--trunk`;
 		// Never clear a repository of that name first: the Artifacts namespace can be shared with another
@@ -418,6 +441,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.setMeta("remote", remote);
 		this.setMeta("branch", branch);
 		this.setMeta("head", head);
+		if (input.review === false) this.setMeta("review", "off");
 		this.note("project", "braid", head ? `Project created with trunk ${repo} at ${short(head)}` : `Project created with an empty trunk ${repo}; waiting for a first push`);
 		if (head) this.log.commit({ effects: [this.runEffect("trunk"), this.spareEffect()] });
 	}
@@ -433,6 +457,14 @@ export class Project extends DurableObject<BraidEnv> {
 		return { public: on };
 	}
 	async isPublic() { return this.meta("public") === "1"; }
+
+	/** Turn reviews of attempts on or off for this project, whatever trunk's braid.json says. Off is for projects where calling a model is not wanted. */
+	async setReview(on: boolean, by = "human") {
+		this.requireProject();
+		this.setMeta("review", on ? "" : "off");
+		this.note("project", by, on ? "Attempts are reviewed when they are marked ready" : "Attempts are no longer reviewed by a model");
+		return { review: on };
+	}
 
 	/** A read credential for trunk that lasts an hour, for cloning it. */
 	async cloneCredentials() {
@@ -496,10 +528,12 @@ export class Project extends DurableObject<BraidEnv> {
 
 	async state(): Promise<State> {
 		this.requireProject();
+		const { landing, review } = ((await this.policy().catch(() => null))?.config ?? {}) as { landing?: any; review?: unknown };
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
 				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env), public: this.meta("public") === "1",
+				policy: { landing: landing?.policy === "auto" ? "auto" : "person", review: review !== false && this.meta("review") !== "off" && !!reviewerName(this.env), reviewers: reviewers(this.env).map((r) => r.model), conflicts: landing?.conflicts === "auto" ? "auto" : "person" },
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
 			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note, batch: q.batch_id ?? null })),
@@ -519,6 +553,7 @@ export class Project extends DurableObject<BraidEnv> {
 			activity: this.rows<any>("SELECT * FROM activity ORDER BY id DESC LIMIT 200").map((r): Activity => ({
 				id: r.id, at: r.at, kind: r.kind, actor: r.actor, text: r.text, intentId: r.intent_id, attemptId: r.attempt_id,
 			})),
+			reviews: this.rows("SELECT * FROM reviews WHERE id IN (SELECT MAX(id) FROM reviews GROUP BY attempt_id) ORDER BY id").map(this.toReview),
 			outcomes: this.rows<any>("SELECT * FROM outcomes ORDER BY id DESC LIMIT 80").map((r): Outcome => ({
 				id: r.id, kind: r.kind, outcome: r.outcome, text: r.text, attemptId: r.attempt_id, intentId: r.intent_id, by: r.by, ref: r.ref, sha: r.sha ?? "", at: r.at,
 			})),
@@ -716,6 +751,7 @@ export class Project extends DurableObject<BraidEnv> {
 			try { await this.rehost(a.id, "respond"); broughtBack = true; } catch (e) { couldNot = splitError(e).message; }
 		}
 		if (kind === "feedback") this.log.commit({ effects: this.advanceEffect() });
+		if (kind === "answer") this.log.commit({ effects: [this.considerEffect(a.id)] });
 		this.broadcast();
 		return { ok: true, broughtBack, ...(couldNot ? { couldNot } : {}) };
 	}
@@ -726,6 +762,11 @@ export class Project extends DurableObject<BraidEnv> {
 		// It can no longer collide with anyone.
 		if (this.rows("SELECT 1 FROM overlaps WHERE a = ? OR b = ? LIMIT 1", id, id).length) this.log.commit({ events: [{ type: "overlaps.changed", attemptId: id, data: { overlaps: [] } }] });
 		this.log.cancel({ lane: `repo:${id}` }, "the attempt is over");
+		this.log.cancel({ lane: `review:${id}` }, "the attempt is over");
+		// With this one over, another attempt at the intent may be the only one left, which is when the policy may land it.
+		const intentId = this.rows<{ intent_id: number }>("SELECT intent_id FROM attempts WHERE id = ?", id)[0]?.intent_id;
+		const others = this.rows<{ id: string }>("SELECT id FROM attempts WHERE intent_id = ? AND id != ? AND status = 'ready'", intentId ?? -1, id);
+		if (others.length) this.log.commit({ effects: others.map((o) => this.considerEffect(o.id)) });
 		const hosted = this.rows<{ hosted: string | null }>("SELECT hosted FROM attempts WHERE id = ?", id)[0]?.hosted;
 		// A stop that fails is tried again by the worker: an agent left running costs money.
 		if (hosted === "starting" || hosted === "running") this.log.commit({ effects: [this.stopEffect(id, "the attempt is over")] });
@@ -795,7 +836,7 @@ export class Project extends DurableObject<BraidEnv> {
 		const trunkLog = await this.trunkLog(), trunkHead = trunkLog[0], combining = await this.combining();
 		const head = (await this.host.log(a.repo, this.branch, 1))[0];
 		if (!head || !trunkHead) return;
-		let git: Observed | null = null;
+		let git: Observed | null = null, scripts: { base: Record<string, string>; head: Record<string, string> } | null | undefined, rewrote = false;
 		if (head.hash !== a.headSha || row.trunk_seen !== trunkHead.hash) {
 			const base = (await mergeBase(this.host, a.repo, head.hash, trunkLog.map((c) => c.hash))) ?? a.baseSha;
 			const baseTree = (await this.host.readCommit(a.repo, base))?.treeHash ?? null;
@@ -811,17 +852,33 @@ export class Project extends DurableObject<BraidEnv> {
 				}
 			}
 			git = { baseSha: base, headSha: head.hash, files, behind, trunkConflicts, trunkSeen: trunkHead.hash };
+			// What a check runs can be changed in package.json without touching a test: compare its scripts.
+			const pkg = files.find((f) => f.path === "package.json" && f.status === "modified");
+			const read = async (hash: string | null) => { try { return (JSON.parse((await this.text(a.repo, hash)) ?? "{}").scripts ?? {}) as Record<string, string>; } catch { return {}; } };
+			if (pkg) scripts = { base: await read(pkg.base), head: await read(pkg.head) };
+			// A head the previous one cannot be reached from was pushed over it.
+			if (head.hash !== a.headSha && a.headSha !== a.baseSha) rewrote = !(await this.host.log(a.repo, this.branch, 200)).some((c) => c.hash === a.headSha);
 			a = { ...a, ...git };
 		}
 		const order = new Map(trunkLog.map((c, i) => [c.hash, i]));
 		const others = this.attempts().filter((o) => o.id !== id && LIVE.has(o.status) && o.intentId !== a.intentId);
 		const shared: Overlap[] = [];
 		for (const o of others) shared.push(...await fileOverlaps(a, o, order, (repo, hash) => this.text(repo, hash), combining));
-		this.recordObserved(id, row.head_sha, git, shared, new Map(others.map((o) => [o.id, o.headSha])));
+		this.recordObserved(id, row.head_sha, git, shared, new Map(others.map((o) => [o.id, o.headSha])), scripts, rewrote);
+	}
+
+	/** The flags for an attempt as it stands. Those that need a file read (changed scripts) or a moment in time (history pushed over) are carried over when not worked out afresh. */
+	private flagsFor(a: Attempt, scripts?: { base: Record<string, string>; head: Record<string, string> } | null, rewrote = false): Flag[] {
+		const fresh = diffFlags(a.files, a.claims, scripts ?? null);
+		const kept = a.flags.filter((f) => f.kind === "history" || (scripts === undefined && f.kind === "checks" && f.paths.length === 1 && f.paths[0] === "package.json" && a.files.some((x) => x.path === "package.json")));
+		const session = sessionFlags(this.rows<{ kind: string; text: string }>("SELECT kind, text FROM session WHERE attempt_id = ? AND kind = 'tool' ORDER BY id", a.id));
+		const history: Flag[] = rewrote && !kept.some((f) => f.kind === "history") ? [{ kind: "history", text: "Pushed over its own earlier commits, so what was looked at before may be gone", paths: [] }] : [];
+		const seen = new Set<string>();
+		return [...fresh, ...kept, ...history, ...session].filter((f) => { const k = `${f.kind}|${f.text}`; return seen.has(k) ? false : (seen.add(k), true); });
 	}
 
 	/** Write down what a reading found. No awaiting here: it is decided against what is true now, which may have moved during the reading. */
-	private recordObserved(id: string, started: string, git: Observed | null, shared: Overlap[], compared: Map<string, string>) {
+	private recordObserved(id: string, started: string, git: Observed | null, shared: Overlap[], compared: Map<string, string>, scripts?: { base: Record<string, string>; head: Record<string, string> } | null, rewrote = false) {
 		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", id)[0];
 		if (!row || !LIVE.has(row.status)) return;
 		// Another reading of this attempt was written down meanwhile: this one compared an older commit. Read again.
@@ -841,6 +898,10 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		// Every new commit of an attempt is verified in a sandbox.
 		if (a.headSha !== a.baseSha && this.latestRun(id)?.sha !== a.headSha) effects.push(this.runEffect(id));
+		const flags = this.flagsFor(a, git ? scripts ?? null : undefined, rewrote);
+		if (json(flags) !== json(before.flags)) events.push({ type: "attempt.flagged", attemptId: id, intentId: a.intentId, data: { flags } });
+		// A commit pushed to an attempt that is marked ready is a new thing to review.
+		if (git && git.headSha !== before.headSha && a.status === "ready") effects.push(this.reviewEffect(id));
 		const live = new Map(this.attempts().filter((o) => LIVE.has(o.status)).map((o) => [o.id, o]));
 		live.set(id, a);
 		const others = [...live.values()].filter((o) => o.id !== id && o.intentId !== a.intentId);
@@ -1103,8 +1164,8 @@ export class Project extends DurableObject<BraidEnv> {
 				note: "Braid ran this commit in a clean sandbox and these steps failed. Fix them, push, and checkpoint again.",
 			});
 		}
-		// A result can be what a landing was waiting for.
-		this.log.commit({ effects: this.advanceEffect() });
+		// A result can be what a landing was waiting for, or what the landing policy was waiting for.
+		this.log.commit({ effects: [...this.advanceEffect(), ...(a && !merged && LIVE.has(a.status) ? [this.considerEffect(a.id), ...(a.status === "ready" && a.headSha === run.sha ? [this.reviewEffect(a.id)] : [])] : [])] });
 	}
 
 	/** Lockfiles a sandbox regenerated for a merge: kept as a resolution, for exactly the two commits it was made from. */
@@ -1138,6 +1199,117 @@ export class Project extends DurableObject<BraidEnv> {
 				...(merged.status === "fail" ? { note: "Your commit passes alone but fails once merged with trunk. Merge trunk into your attempt (`sync`), fix it, push, and checkpoint." } : {}),
 			} } : {}),
 		};
+	}
+
+	// ── review: a reading of an attempt against its intent, and a policy that may act on it ──
+
+	/** The model that reviews. A field, so a test can put a stand-in here. */
+	reviewer: (env: BraidEnv, input: ReviewInput, pick?: Reviewer | null) => Promise<Awaited<ReturnType<typeof reviewAttempt>>> = reviewAttempt;
+
+	/** What an agent is told about the review of its current commit. */
+	private reviewFor(a: Attempt) {
+		const r = this.reviewOf(a.id);
+		if (!r || r.sha !== a.headSha) return { status: "not reviewed" };
+		if (r.status !== "done") return { status: r.status === "running" ? "being reviewed" : "the review could not be made" };
+		return {
+			status: "reviewed", verdict: r.verdict, summary: r.summary,
+			criteria: r.criteria.map((c, i) => ({ n: i + 1, criterion: c.text, verdict: c.verdict, why: c.why })),
+			...(r.concerns.length ? { concerns: r.concerns } : {}), ...(r.changes ? { changes_asked_for: r.changes } : {}),
+		};
+	}
+
+	/** Ask for an attempt's current commit to be reviewed (again). */
+	async review(attemptId: string) {
+		this.requireProject();
+		const a = this.attempt(attemptId);
+		if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`);
+		if (a.headSha === a.baseSha) throw new BraidError(`attempt ${a.id} has no commits to review`);
+		if (!reviewerName(this.env)) throw new BraidError("this Braid instance has no model to review with", 501);
+		this.log.commit({ effects: [this.reviewEffect(a.id, true)] });
+		return { queued: true };
+	}
+
+	private async doReview(attemptId: string, again: boolean) {
+		const config = (await this.policy()).config as { review?: unknown; reviewer?: unknown } | null;
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", attemptId)[0];
+		if (!row || !LIVE.has(row.status) || row.head_sha === row.base_sha || !reviewerName(this.env)) return;
+		if (!again && (config?.review === false || this.meta("review") === "off" || row.status !== "ready")) return;
+		const a = this.toAttempt(row), intent = this.intent(a.intentId), last = this.reviewOf(a.id);
+		if (!again && last?.sha === a.headSha && last.status === "done") return;
+		// The reviewer is shown what the checks found, so it waits for them. Their result asks for the review again.
+		const checked = this.latestRun(a.id);
+		if (!again && this.env.RUNNER && (!checked || checked.sha !== a.headSha || checked.status === "queued" || checked.status === "running")) return;
+		// By default, a model from a different maker than the agent that wrote the attempt.
+		const pick = reviewerFor(this.env, a.kind, config?.reviewer);
+		const id = this.rows<{ id: number }>("INSERT INTO reviews (attempt_id, intent_id, sha, status, by, at) VALUES (?, ?, ?, 'running', ?, ?) RETURNING id", a.id, a.intentId, a.headSha, pick?.model ?? "", now())[0].id;
+		this.broadcast();
+		try {
+			const files = await this.diff(a.id);
+			const input: ReviewInput = {
+				intent, criteria: intent.criteria, agent: a.agent, summary: a.summary, files, flags: a.flags, run: this.latestRun(a.id)?.sha === a.headSha ? this.latestRun(a.id) : null,
+				decisions: this.decisionsFor(a.id).filter((d) => d.agent !== "braid" && d.kind !== "feedback" && d.kind !== "answer"),
+			};
+			const answer = await this.reviewer(this.env, input, pick);
+			const kept = settle(answer, intent.criteria, files, input.run?.status === "pass");
+			this.sql.exec("UPDATE reviews SET status = 'done', verdict = ?, criteria = ?, summary = ?, concerns = ?, changes = ?, by = ?, finished_at = ? WHERE id = ?",
+				kept.verdict, json(kept.criteria), redact(kept.summary), json(kept.concerns.map((c) => redact(c))), redact(kept.changes), answer.model, now(), id);
+			const met = kept.criteria.filter((c) => c.verdict === "met").length;
+			this.log.commit({
+				events: [this.noted("review", answer.model, `Reviewed attempt ${a.id} at ${short(a.headSha)}: ${kept.verdict === "approve" ? "every criterion met" : kept.verdict === "changes" ? "changes asked for" : "left to a person"} (${met} of ${kept.criteria.length} criteria met)`, a.intentId, a.id)],
+				effects: [this.considerEffect(a.id)],
+			});
+		} catch (e) {
+			// Not tried again by itself: a person can ask for the review again.
+			const said = splitError(e).message;
+			this.sql.exec("UPDATE reviews SET status = 'failed', error = ?, finished_at = ? WHERE id = ?", said.slice(0, 500), now(), id);
+			this.log.commit({ events: [this.noted("review", "braid", `Attempt ${a.id} could not be reviewed: ${said}`, a.intentId, a.id)], effects: [this.considerEffect(a.id)] });
+		}
+		this.broadcast();
+	}
+
+	/**
+	 * The landing policy, for one attempt. A project that sets `"landing": { "policy": "auto" }` in trunk's
+	 * braid.json has an attempt landed without a person when its agent marked it ready, its checks passed,
+	 * the review found every criterion met, nothing is flagged, no question is open, and it is the only live
+	 * attempt at its intent. The landing goes through the queue like anyone's. When the reviewer asks for changes
+	 * the attempt is sent back with them, twice at most. Whatever stops it is written on the attempt.
+	 * Nothing is awaited here: it decides from what is recorded.
+	 */
+	private consider(attemptId: string) {
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", attemptId)[0];
+		if (!row) return;
+		const a = this.toAttempt(row), auto = this.policyAt?.policy.config?.landing?.policy === "auto";
+		const hold = (why: string, kind: Attempt["heldFor"] = "") => { if (a.held !== why || a.heldFor !== kind) { this.sql.exec("UPDATE attempts SET held = ?, held_for = ? WHERE id = ?", why, kind, a.id); this.broadcast(); } };
+		if (!auto || !LIVE.has(a.status) || a.status !== "ready" || this.intent(a.intentId).status !== "open") return hold("");
+		if (this.rows("SELECT 1 FROM queue WHERE attempt_id = ?", a.id).length) return hold("");
+		const run = this.env.RUNNER ? this.latestRun(a.id) : null;
+		if (this.env.RUNNER && (!run || run.sha !== a.headSha || run.status === "queued" || run.status === "running")) return hold("Waiting for its checks.", "checks");
+		if (run && run.status !== "pass") return hold(run.status === "fail" ? `Its checks failed (${this.failedSteps(run)}).` : "Its checks could not be run.", "checks-failed");
+		const review = this.reviewOf(a.id);
+		if (!reviewerName(this.env)) return hold("This instance has no model to review with, so a person lands it.", "no-reviewer");
+		if (!review || review.sha !== a.headSha || review.status === "running") return hold("Waiting for its review.", "review");
+		if (review.status === "failed") return hold(`It could not be reviewed: ${review.error}`, "review-failed");
+		if (a.flags.length) return hold(`Flagged for a person: ${a.flags.map((f) => f.text.toLowerCase()).join("; ")}.`, "flags");
+		const asked = this.decisionsFor(a.id);
+		if (asked.some((q) => q.kind === "question" && !asked.some((d) => d.kind === "answer" && d.title === `Answer: ${q.title}`))) return hold("It asked a question that has no answer yet.", "question");
+		if (this.rows("SELECT 1 FROM attempts WHERE intent_id = ? AND id != ? AND status IN ('working', 'ready', 'conflicted')", a.intentId, a.id).length) return hold("Another attempt at this intent is still going: a person chooses between them.", "choice");
+		const tried = this.rows<any>("SELECT * FROM outcomes WHERE kind = 'landing' AND attempt_id = ? AND sha = ? ORDER BY id DESC LIMIT 1", a.id, a.headSha)[0];
+		if (tried && tried.outcome !== "landed") return hold(`Its landing was ${tried.outcome === "conflict" ? "stopped by a conflict" : tried.outcome}: ${tried.text}`, "landing");
+		if (review.verdict === "approve") {
+			hold("");
+			this.note("land", "policy", `Landing attempt ${a.id} by this project's policy: its checks passed, ${review.by} found every criterion met, and nothing is flagged`, a.intentId, a.id);
+			void this.land(a.id, "policy", false, a.headSha).catch((e) => hold(`Its landing could not be asked for: ${splitError(e).message}`, "landing"));
+			return;
+		}
+		if (review.verdict === "changes") {
+			const rounds = asked.filter((d) => d.kind === "feedback" && d.agent === "reviewer").length;
+			if (rounds >= 2) return hold("The reviewer asked for changes twice and is still not satisfied.", "reviewer");
+			hold("");
+			void this.respond(a.id, { kind: "feedback", body: review.changes, by: "reviewer", bringBack: a.kind === "claude" || a.kind === "codex" }).catch((e) => console.error("send back", a.id, e));
+			return;
+		}
+		const open = review.criteria.find((c) => c.verdict !== "met");
+		hold(`The reviewer left it to a person: ${open ? `"${open.text}" is ${open.verdict === "unclear" ? "not shown to be met" : "not met"}. ${open.why}` : review.summary}`, "reviewer");
 	}
 
 	// ── sessions: the record of what each agent actually did ─────────────────
@@ -1246,6 +1418,7 @@ export class Project extends DurableObject<BraidEnv> {
 				const next = strongest([...kept, ...[...live.values()].filter((o) => o.id !== me.id).flatMap((o) => claimOverlaps(me, o))]);
 				this.log.commit({ events: [
 					{ type: "attempt.claimed", attemptId: me.id, intentId: me.intentId, actor: me.agent, data: { claims: me.claims } },
+					{ type: "attempt.flagged", attemptId: me.id, intentId: me.intentId, data: { flags: this.flagsFor(me) } },
 					this.noted("claim", me.agent, `${me.agent} plans to change ${paths.join(", ")}${args.reason ? `: ${args.reason}` : ""}`, me.intentId, me.id),
 					...this.overlapEvents(me, next, live),
 				] });
@@ -1269,7 +1442,7 @@ export class Project extends DurableObject<BraidEnv> {
 				if (args.summary) { a.summary = redact(String(args.summary)); this.saveAttempt(a); }
 				return {
 					head: a.headSha, changed: a.files.map((f) => `${f.status} ${f.path}`), behind_trunk_by: a.behind,
-					would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a),
+					would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a), review: this.reviewFor(a),
 					...(fresh ? {} : { note: STALE_NOTE }),
 				};
 			}
@@ -1309,8 +1482,9 @@ export class Project extends DurableObject<BraidEnv> {
 				if (a.status === "working") a.status = "ready";
 				if (args.summary) a.summary = redact(String(args.summary));
 				this.saveAttempt(a);
-				this.note("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id);
-				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a), ...(fresh ? {} : { note: STALE_NOTE }) };
+				this.log.commit({ events: [this.noted("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id)], effects: [this.reviewEffect(a.id), this.considerEffect(a.id)] });
+				this.broadcast();
+				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a), review: this.reviewFor(a), ...(fresh ? {} : { note: STALE_NOTE }) };
 			}
 			case "reconciliation": {
 				const r = this.openRecon(me.id);
@@ -1369,7 +1543,7 @@ export class Project extends DurableObject<BraidEnv> {
 			`# Braid brief: attempt ${a.id} on intent I${intent.id}`,
 			`**${intent.title}**`,
 			`Goal: ${intent.goal}`,
-			intent.acceptance ? `Acceptance: ${intent.acceptance}` : "",
+			intent.acceptance ? `Done when (your attempt is reviewed against each of these):\n${intent.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : "",
 			"",
 			"You are one of several agents working in this project at the same time. Your working copy is a private fork of trunk.",
 			"Other agents cannot see your files, only what you tell Braid and what you push. Protocol:",
@@ -1408,7 +1582,9 @@ export class Project extends DurableObject<BraidEnv> {
 			const against = [...new Set(recon.conflicts.flatMap((c) => c.trunkWhy.map((w) => `I${w.intentId}`)))];
 			lines.push("", `Reconciled${against.length ? ` with ${against.join(", ")}` : ""} by ${recon.resolvedBy}: ${recon.rationale.replace(/\s+/g, " ")}`);
 		}
-		lines.push("", `Braid-Intent: ${intent.id}`, `Braid-Attempt: ${a.id}`, `Braid-Agent: ${a.agent}`);
+		const review = this.reviewOf(a.id), reviewed = review?.status === "done" && review.sha === a.headSha ? review : null;
+		if (reviewed) lines.push("", `Reviewed by ${reviewed.by}: ${reviewed.verdict === "approve" ? "every criterion met" : reviewed.verdict === "changes" ? "changes asked for" : "left to a person"}. ${reviewed.summary.replace(/\s+/g, " ")}`);
+		lines.push("", `Braid-Intent: ${intent.id}`, `Braid-Attempt: ${a.id}`, `Braid-Agent: ${a.agent}`, ...(reviewed ? [`Braid-Reviewed-By: ${reviewed.by}`] : []));
 		return lines.join("\n");
 	}
 
@@ -1480,7 +1656,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (!this.held(entry)) return;
 		this.unqueue(entry);
 		const a = this.attempt(entry.attempt_id);
-		this.log.commit({ events: [this.noted("land", "braid", `Attempt ${a.id} was not landed: ${why}`, a.intentId, a.id), this.settled("landing", "refused", why, a, String(entry.by), "", a.headSha)] });
+		this.log.commit({ events: [this.noted("land", "braid", `Attempt ${a.id} was not landed: ${why}`, a.intentId, a.id), this.settled("landing", "refused", why, a, String(entry.by), "", a.headSha)], effects: [this.considerEffect(a.id)] });
 	}
 
 	/** What can be told about a queued landing without reading anything: whether it can be merged now. */
@@ -2289,7 +2465,7 @@ function describeCall(tool: string, args: Record<string, any>): string {
 }
 
 /** Requests that may carry an Idempotency-Key. */
-const KEYED = new Set(["createIntent", "join", "hostAgent", "rehost", "respond", "revertLanding", "land", "cancelLanding", "resolve", "resolveWithModel", "abandonIntent", "abandonAttempt", "restoreAttempt", "editIntent", "stopHosted"]);
+const KEYED = new Set(["createIntent", "join", "hostAgent", "rehost", "respond", "revertLanding", "land", "cancelLanding", "resolve", "resolveWithModel", "abandonIntent", "abandonAttempt", "restoreAttempt", "editIntent", "stopHosted", "review"]);
 type Resolutions = { recon: Reconciliation | null; map: Map<string, string> };
 type Observed = Pick<Attempt, "baseSha" | "headSha" | "files" | "behind" | "trunkConflicts"> & { trunkSeen: string };
 const STALE_NOTE = "Braid has not finished reading your latest push, so this is what it knew before. Anything new arrives in heads_up on your next call.";

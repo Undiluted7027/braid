@@ -94,7 +94,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 			if (!SLUG.test(slug)) return Response.json({ error: "slug must be 3-40 characters: lowercase letters, digits, single hyphens" }, { status: 400 });
 			await registry.registerProject(slug, String(b.name || slug), String(b.description ?? ""));
 			try {
-				await project(env, slug).init({ slug, name: String(b.name || slug), description: String(b.description ?? ""), source: b.source, url: b.url, branch: b.branch });
+				await project(env, slug).init({ slug, name: String(b.name || slug), description: String(b.description ?? ""), source: b.source, url: b.url, branch: b.branch, review: b.review });
 			} catch (e) {
 				await registry.unregisterProject(slug);
 				throw e;
@@ -151,6 +151,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "landings" && rest[2] === "revert") return Response.json(await once("revertLanding", rest[1], b.by, String(b.reason ?? "")));
 		if (rest[0] === "intents" && rest[2] === "abandon") return Response.json(await once("abandonIntent", Number(rest[1]), b.by));
 		if (rest[0] === "attempts" && rest[2] === "land") return Response.json(await once("land", rest[1], b.by, !!b.force, typeof b.sha === "string" ? b.sha : undefined));
+		if (rest[0] === "attempts" && rest[2] === "review") return Response.json(await once("review", rest[1]));
 		if (rest[0] === "attempts" && rest[2] === "cancel-landing") return Response.json(await once("cancelLanding", rest[1], b.by));
 		if (rest[0] === "runs") return Response.json(await p.verify(String(b.ref ?? "trunk"), true));
 		if (rest[0] === "attempts" && rest[2] === "abandon") return Response.json(await once("abandonAttempt", rest[1], b.by));
@@ -161,6 +162,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "session") return Response.json(await p.ingest((request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), b.events, b.model));
 		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
 		if (rest[0] === "clone-credentials") return Response.json(await p.cloneCredentials());
+		if (rest[0] === "review") return Response.json(await p.setReview(b.review === true, b.by));
 		if (rest[0] === "public") {
 			const made = await p.setPublic(b.public === true, b.by);
 			await registry.markPublic(slug, made.public);

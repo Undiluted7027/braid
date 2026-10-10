@@ -8,7 +8,8 @@ import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Command, Icon, Notice, type IconName } from "./Kit";
-import { landingVerdict, neverStarted, reason, stuckOf, stuckWords } from "./Later";
+import { landingVerdict, neverStarted, reason, sentence, stuckOf, stuckWords } from "./Later";
+import { currentReview, flagsOf, PolicyPanel, policyOf, reviewTag, tally } from "./Review";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
@@ -93,6 +94,7 @@ function needs(state: State): Need[] {
 	const slug = state.project.slug, to = (intentId: number) => `/p/${slug}/i/${intentId}`;
 	const live = state.attempts.filter((a) => LIVE.has(a.status));
 	const items: Need[] = [];
+	const auto = policyOf(state).landing === "auto";
 	const trunkRun = runFor(state, "trunk");
 	if (trunkRun?.sha === state.project.head && trunkRun.status === "fail") items.push({ key: "trunk", tone: "conflict", icon: "warning", label: "trunk is failing", text: `Braid's run of ${short(state.project.head)} failed (${trunkRun.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}). Only an attempt that fixes it will land.`, to: "#trunk" });
 	// Work Braid gave up on comes first: until it is tried again, other things here may not move.
@@ -112,7 +114,17 @@ function needs(state: State): Need[] {
 		if (verdict?.outcome === "refused") items.push({ key: `n${verdict.id}`, tone: "conflict", icon: "land", label: "landing refused", text: `${a.agent}'s attempt ${a.id} did not land. ${reason(verdict.text)}`, to: to(a.intentId) });
 		if (run?.sha === a.headSha && run.status === "fail") items.push({ key: `f${a.id}`, tone: "conflict", icon: "x", label: "checks failed", text: `${a.agent}'s attempt ${a.id} failed ${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}.`, to: to(a.intentId) });
 		else if (a.hosted === "failed") items.push({ key: `h${a.id}`, tone: "conflict", icon: "agent", label: neverStarted(a) ? "agent did not start" : "agent failed", text: neverStarted(a) ? `Braid could not start ${a.agent} on attempt ${a.id}. ${neverStarted(a)}` : `${a.agent} on attempt ${a.id}: ${a.hostedDetail}`, to: to(a.intentId) });
-		else if (a.status === "ready" && !queued && verdict?.outcome !== "refused") items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "ready to review", text: `${a.agent}'s attempt ${a.id}: ${a.summary || "marked ready"}`, to: to(a.intentId) });
+		else if (a.status === "ready" && !queued && verdict?.outcome !== "refused") {
+			const who = `${a.agent}'s attempt ${a.id}`, flags = flagsOf(a), rv = currentReview(state, a), held = auto ? a.held ?? "" : "";
+			// Under a policy that lands by itself, an attempt it is about to land, or is still waiting on checks or a review for, is not a person's yet.
+			if (auto && (!held || a.heldFor === "checks" || a.heldFor === "review")) continue;
+			if (flags.length) items.push({ key: `g${a.id}`, tone: "touch", icon: "warning", label: "flagged for you", text: `${who}: ${sentence(flags[0].text)}${flags.length > 1 ? ` And ${flags.length - 1} more.` : ""}`, to: to(a.intentId) });
+			else if (auto) items.push({ key: `p${a.id}`, tone: "touch", icon: "agent", label: a.heldFor === "choice" ? "pick an attempt" : a.heldFor === "review-failed" ? "review failed" : a.heldFor === "reviewer" ? "reviewer: your call" : a.heldFor === "question" ? "question waiting" : a.heldFor === "landing" ? "landing stopped" : a.heldFor === "checks-failed" ? "checks failed" : "not landed by braid", text: `${who} was not landed by Braid. ${sentence(held)}`, to: to(a.intentId) });
+			else if (rv?.verdict === "approve") items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "review passed", text: `${who} meets ${tally(rv).of === 1 ? "its criterion" : `all ${tally(rv).of} criteria`}. ${a.summary || rv.summary}`, to: to(a.intentId) });
+			else if (rv?.verdict === "changes") items.push({ key: `l${a.id}`, tone: "touch", icon: "search", label: "changes asked", text: `${who}: the reviewer asks for changes. ${rv.changes || rv.summary}`, to: to(a.intentId) });
+			else if (rv?.verdict === "person") items.push({ key: `l${a.id}`, tone: "touch", icon: "search", label: "reviewer: your call", text: `${who}: ${rv.summary || "the reviewer leaves it to a person."}`, to: to(a.intentId) });
+			else items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "ready to review", text: `${who}: ${a.summary || "marked ready"}`, to: to(a.intentId) });
+		}
 	}
 	return items;
 }
@@ -186,6 +198,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const queued = state.queue.find((q) => q.attemptId === a.id);
 	const batch = batchFor(state, a.id)?.batch;
 	const verdict = landingVerdict(state, a);
+	const flags = going ? flagsOf(a) : [], tag = reviewTag(state, a);
 	return (
 		<li className={`attempt-row ${a.status}`}>
 			<span className="who"><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="mono id" title={`Attempt ${a.id}`}>{a.id}</span></span>
@@ -194,8 +207,11 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 				{a.status === "working" && now ? <span className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</span>
 					: <span className="summary">{a.summary || (a.headSha === a.baseSha ? "Nothing pushed yet." : "No summary yet.")}</span>}
 				<span className="facts">{a.files.length} file{a.files.length === 1 ? "" : "s"} changed · {decisions} decision{decisions === 1 ? "" : "s"} recorded</span>
+				{going && !queued && policyOf(state).landing === "auto" && a.held && <span className="facts held-line"><Icon name={a.heldFor === "checks" || a.heldFor === "review" ? "clock" : "agent"} size={12} />{a.heldFor === "checks" || a.heldFor === "review" ? "Braid lands it by itself: " : "Not landed by Braid: "}{sentence(a.held).replace(/^./, (c) => c.toLowerCase())}</span>}
 			</span>
 			<span className="signals">
+				{flags.length > 0 && <span className="chip flagged" title={flags.map((f) => f.text).join(" ")}><Icon name="warning" size={12} />{flags.length} flag{flags.length === 1 ? "" : "s"}</span>}
+				{tag && going && <span className={`chip ${tag.tone}`} title={tag.title}>{tag.text}</span>}
 				{verdict?.outcome === "refused" && <span className="chip conflict" title={reason(verdict.text)}>landing refused</span>}
 				{going && <RunChip run={runFor(state, a.id)} head={a.headSha} />}
 				{going && a.behind > 0 && <span className="chip quiet" title="Changes that landed on trunk after this attempt forked from it">{a.behind} behind trunk</span>}
@@ -300,6 +316,7 @@ export function ProjectPage({ state }: { state: State }) {
 					{done.map((i) => <IntentCard key={i.id} intent={i} state={state} />)}
 				</div>
 				<aside className="col-side">
+					<PolicyPanel state={state} />
 					<Trunk state={state} />
 					{!state.viewer && me?.protected && <Visibility state={state} />}
 					<section className="panel side-panel" aria-labelledby="act-h">
@@ -309,7 +326,7 @@ export function ProjectPage({ state }: { state: State }) {
 							{state.activity.slice(0, shown).map((e) => (
 								<li key={e.id} className={e.kind}>
 									<Icon name={ICON[e.kind] ?? "dot"} />
-									<span className="act-text">{e.intentId ? <Link to={`/p/${state.project.slug}/i/${e.intentId}`}>{e.text}</Link> : e.text}</span>
+									<span className="act-text">{e.intentId ? <Link to={`/p/${state.project.slug}/i/${e.intentId}`}>{e.text}</Link> : e.text}{e.actor === "policy" && <span className="act-by" title="Braid did this itself, under this project's landing policy"> by Braid's policy</span>}{e.actor === "reviewer" && <span className="act-by" title="Done by the reviewer, a model"> by the reviewer</span>}</span>
 									<time className="act-time" dateTime={new Date(e.at).toISOString()} title={new Date(e.at).toLocaleString()}>{ago(e.at).replace(" ago", "")}</time>
 								</li>
 							))}

@@ -9,6 +9,7 @@ import { Agent, IntentId, Link } from "./App";
 import { Icon, type IconName } from "./Kit";
 import { batchFor, batchWords, queueLabel } from "./Batch";
 import { landingVerdict, neverStarted, reason } from "./Later";
+import { flagsOf, policyOf, reviewTag } from "./Review";
 import { runFor } from "./Verify";
 
 export type CardTarget =
@@ -25,7 +26,7 @@ const when = (at: number) => new Date(at).toLocaleString([], { dateStyle: "mediu
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const STATUS: Record<Attempt["status"], string> = {
 	working: "The agent is working on it",
-	ready: "Ready for you to review",
+	ready: "Marked ready by its agent",
 	conflicted: "Collided with trunk when it tried to land",
 	landed: "Landed on trunk",
 	superseded: "Set aside: another attempt landed for this intent",
@@ -66,7 +67,7 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 	const landing = state.landings.find((l) => l.attemptId === a.id && !l.revertOf);
 	const queued = state.queue.find((q) => q.attemptId === a.id), inBatch = batchFor(state, a.id);
 	const last = landingVerdict(state, a), refused = last?.outcome === "refused" ? last : null;
-	const run = checks(state, a);
+	const run = checks(state, a), tag = reviewTag(state, a);
 	const mine = state.overlaps.filter((o) => o.a === a.id || o.b === a.id);
 	const other = (o: Overlap) => (o.a === a.id ? o.b : o.a);
 	const clash = [...new Set(mine.filter((o) => o.severity === "conflict").map(other))];
@@ -80,6 +81,9 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 			{a.status === "working" && now && <p className="lc-now"><span className="lc-label">Right now</span><span className="mono">{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 120)}</span></p>}
 			{a.summary && <p className="lc-summary">{a.summary}</p>}
 			<ul className="lc-facts">
+				{going && flagsOf(a).length > 0 && <Fact icon="warning" tone="warn">Braid flagged {plural(flagsOf(a).length, "thing")} for a person: {flagsOf(a)[0].text}</Fact>}
+				{going && tag && <Fact icon="search" tone={tag.tone === "pass" ? "good" : tag.tone === "conflict" ? "bad" : tag.tone === "touch" ? "warn" : ""}>Review: {tag.title}</Fact>}
+				{going && policyOf(state).landing === "auto" && a.held && <Fact icon="clock">{a.heldFor === "checks" || a.heldFor === "review" ? "Braid lands it by itself. " : "Not landed by Braid. "}{a.held}</Fact>}
 				<Fact icon="changes">{a.files.length ? `${plural(a.files.length, "file")} changed` : "No files changed yet"} · {plural(decisions.length, "decision")} recorded</Fact>
 				{asking.length > 0 && <Fact icon="question" tone="warn">Asks you: {asking[0].title}{asking.length > 1 ? ` (and ${asking.length - 1} more)` : ""}</Fact>}
 				{(going || a.status === "landed") && <Fact icon={run.icon} tone={run.tone}>{run.text}</Fact>}
@@ -104,6 +108,7 @@ function LandingCard({ state, sha }: { state: State; sha: string }) {
 	const intent = state.intents.find((i) => i.id === l.intentId);
 	const a = state.attempts.find((x) => x.id === l.attemptId);
 	const recon = state.reconciliations.find((r) => r.attemptId === l.attemptId && r.status === "resolved");
+	const byPolicy = !l.revertOf && (state.outcomes ?? []).some((o) => o.kind === "landing" && o.outcome === "landed" && o.ref === l.sha && o.by === "policy");
 	const undone = l.revertedBy ? state.landings.find((x) => x.sha === l.revertedBy) : null;
 	const why = l.files[0] ? `/p/${slug}/why?path=${encodeURIComponent(l.files[0])}` : null;
 	return (
@@ -116,6 +121,7 @@ function LandingCard({ state, sha }: { state: State; sha: string }) {
 				<Fact icon="clock"><time dateTime={new Date(l.at).toISOString()}>{ago(l.at)}</time> · {when(l.at)}</Fact>
 				<Fact icon={l.revertOf ? "undo" : "land"}>Commit <span className="mono">{short(l.sha)}</span>{l.revertOf && <> undoes landing <span className="mono">{short(l.revertOf)}</span>; the intent opened again</>}</Fact>
 				{!l.revertOf && l.files.length > 0 && <Fact icon="file"><span className="mono">{l.files.slice(0, 3).join(", ")}</span>{l.files.length > 3 ? ` and ${l.files.length - 3} more` : ""}</Fact>}
+				{byPolicy && <Fact icon="strands">Braid landed it by itself, under this project's policy: its checks passed, the review found every criterion met and nothing was flagged</Fact>}
 				{l.reconciled && <Fact icon="reconcile" tone="warn">Went through a reconciliation{recon ? `, resolved by ${recon.resolvedBy}` : ""}: it collided with trunk and both sides were kept</Fact>}
 				{l.revertedBy && <Fact icon="undo" tone="bad">Taken back out{undone ? ` ${ago(undone.at)}` : ""} as <span className="mono">{short(l.revertedBy)}</span></Fact>}
 			</ul>

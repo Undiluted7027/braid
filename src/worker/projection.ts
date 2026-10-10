@@ -51,6 +51,9 @@ export function applyEvent(sql: Sql, e: BraidEvent) {
 		case "outcome.recorded":
 			sql.exec("INSERT INTO outcomes (kind, outcome, text, attempt_id, intent_id, by, ref, sha, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", e.data.kind, e.data.outcome, e.data.text, e.attemptId, e.intentId, e.actor, e.data.ref ?? "", e.data.sha ?? "", e.at);
 			break;
+		case "attempt.flagged":
+			sql.exec("UPDATE attempts SET flags = ? WHERE id = ?", JSON.stringify(e.data.flags), e.attemptId);
+			break;
 		// An event this version does not know changes nothing here: it was written by a newer one.
 	}
 }

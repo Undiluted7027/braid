@@ -652,3 +652,200 @@ test("without the setting, a conflict waits for a person and nobody is started",
 	const s = await w.state();
 	assert.deepEqual([s.reconciliations[0].status, s.reconciliations[0].auto, w.agents.length], ["open", null, 0]);
 });
+
+// ── review, flags and the landing policy ─────────────────────────────────────
+
+/** A project that reviews attempts with a stand-in reviewer. `answer(input)` is what it says; by default every criterion is met. */
+async function reviewed(t, titles, landing, answer) {
+	const { w, intents } = await withApp(t, titles, landing ? { landing } : null, { ANTHROPIC_API_KEY: "k" });
+	const asked = [];
+	const approve = (input) => ({ verdict: "approve", summary: "Does what the intent asks.", concerns: [], changes: "", criteria: input.criteria.map((_, i) => ({ n: i + 1, verdict: "met", basis: "diff", why: "The diff shows it.", evidence: [{ path: input.files[0].path, line: 1 }] })) });
+	w.project.reviewer = async (_env, input, pick) => { asked.push({ ...input, pick }); return { ...(answer ? answer(input, approve, asked.length) : approve(input)), model: "stand-in" }; };
+	return { w, intents, asked, approve };
+}
+/** Push, have it read and verified, then have the agent claim what it changed and mark the attempt ready, as a real one would. */
+async function finished(w, intent, name, files, { claim = Object.keys(files), status = "pass" } = {}) {
+	const a = await agent(w, intent, name);
+	if (claim.length) await w.tool(a, "claim", { paths: claim });
+	a.sha = work(w, a, files);
+	await w.project.onPush(a.repo); await w.settle();
+	if (status) { await w.finish(a.attemptId, status); await w.settle(); }
+	const said = w.tool(a, "ready", { summary: `${name} is done` });
+	await w.settle(); await said; await w.settle();
+	return a;
+}
+const row = async (w, a) => (await w.state()).attempts.find((x) => x.id === a.attemptId);
+
+test("an attempt marked ready is reviewed against the intent's criteria, and the agent can read the review", async (t) => {
+	const { w, asked } = await reviewed(t, []);
+	const intent = await w.project.createIntent({ title: "Notes", goal: "Add notes.", acceptance: "- There is a notes file\n- It says hello" });
+	const a = await finished(w, intent, "ana", { "notes.md": "hello\n" });
+	const s = await w.state(), review = s.reviews[0];
+	assert.deepEqual([s.intents[0].criteria, s.project.policy], [["There is a notes file", "It says hello"], { landing: "person", review: true, conflicts: "person", reviewers: ["claude-opus-5-5"] }]);
+	assert.deepEqual([review.attemptId, review.sha, review.status, review.verdict, review.by, review.criteria.map((c) => [c.text, c.verdict, c.evidence])],
+		[a.attemptId, a.sha, "done", "approve", "stand-in", [["There is a notes file", "met", [{ path: "notes.md", line: 1 }]], ["It says hello", "met", [{ path: "notes.md", line: 1 }]]]]);
+	assert.deepEqual(review.criteria.map((c) => c.basis), ["diff", "diff"]);
+	// What the reviewer was shown: the criteria, the diff, the check result, and the agent's own decisions only.
+	assert.deepEqual([asked.length, asked[0].criteria, asked[0].files.map((f) => f.path), asked[0].run.status], [1, s.intents[0].criteria, ["notes.md"], "pass"]);
+	const told = w.tool(a, "checkpoint"); await w.settle();
+	assert.deepEqual((await told).review.criteria.map((c) => [c.n, c.verdict]), [[1, "met"], [2, "met"]]);
+	// Nothing lands by itself unless the project asks for that.
+	assert.deepEqual([(await row(w, a)).status, s.queue.length, (await row(w, a)).held], ["ready", 0, ""]);
+	assert.match(s.attempts[0].flags.map((f) => f.kind).join(), /^$/);
+});
+
+test("with the policy on, an attempt that is ready, passes, is approved and has nothing flagged lands by itself", async (t) => {
+	const { w, intents } = await reviewed(t, ["One"], { policy: "auto" });
+	const a = await finished(w, intents[0], "ana", { "notes.md": "hello\n" });
+	const s = await w.state();
+	assert.deepEqual([(await row(w, a)).status, s.landings.length, s.outcomes[0].by, s.outcomes[0].outcome], ["landed", 1, "policy", "landed"]);
+	assert.match(s.activity.map((x) => x.text).join("\n"), /Landing attempt 1\.1 by this project's policy: its checks passed, stand-in found every criterion met, and nothing is flagged/);
+	const message = w.git(`${w.root}/p--trunk.git`, "log", "-1", "--format=%B", "refs/heads/main");
+	assert.match(message, /Reviewed by stand-in: every criterion met\. Does what the intent asks\./);
+	assert.match(message, /Braid-Agent: ana\nBraid-Reviewed-By: stand-in/);
+});
+
+test("the policy waits for checks and for the review, and a failed check or review stops it with the reason", async (t) => {
+	const { w, intents } = await reviewed(t, ["One", "Two"], { policy: "auto" }, (input, approve, n) => { if (n === 2) throw new Error("[502] the model declined to review this attempt"); return approve(input); });
+	const a = await finished(w, intents[0], "ana", { "a.md": "a\n" }, { status: null });
+	assert.deepEqual([(await row(w, a)).status, (await row(w, a)).held, (await row(w, a)).heldFor], ["ready", "Waiting for its checks.", "checks"]);
+	await w.finish(a.attemptId, "fail"); await w.settle();
+	assert.deepEqual([(await row(w, a)).status, (await row(w, a)).held], ["ready", "Its checks failed (test)."]);
+	const b = await finished(w, intents[1], "ben", { "b.md": "b\n" });
+	const s = await w.state();
+	assert.deepEqual([(await row(w, b)).status, (await row(w, b)).held, s.reviews.find((r) => r.attemptId === b.attemptId).status], ["ready", "It could not be reviewed: the model declined to review this attempt", "failed"]);
+	// A person asks for the review again; this time it is made, and the attempt lands.
+	await w.project.review(b.attemptId); await w.settle();
+	assert.equal((await row(w, b)).status, "landed");
+});
+
+test("a flag always needs a person, whatever the review says", async (t) => {
+	const { w, intents } = await reviewed(t, ["Change the test", "Loosen the checks", "Wander"], { policy: "auto" });
+	const a = await finished(w, intents[0], "ana", { "test/app.test.js": "// rewritten\n" });
+	const b = await finished(w, intents[1], "ben", { "package.json": JSON.stringify({ name: "tally", private: true, scripts: { test: "true" } }, null, "\t") + "\n" });
+	const c = await finished(w, intents[2], "cy", { "c.md": "c\n", "README.md": "also this\n" }, { claim: ["c.md"] });
+	const s = await w.state(), of = (x) => s.attempts.find((y) => y.id === x.attemptId);
+	assert.deepEqual([a, b, c].map((x) => [of(x).status, of(x).flags.map((f) => f.kind)]), [["ready", ["tests-changed"]], ["ready", ["checks"]], ["ready", ["outside-claims"]]]);
+	assert.match(of(b).flags[0].text, /Changed or removed the package\.json script test/);
+	assert.match(of(a).held, /^Flagged for a person: changed tests that were already there\.$/);
+	assert.deepEqual([a, b, c].map((x) => of(x).heldFor), ["flags", "flags", "flags"]);
+	assert.deepEqual([s.reviews.map((r) => r.verdict), s.landings.length], [["approve", "approve", "approve"], 0]);
+	// A person can still land it.
+	assert.ok((await land(w, c.attemptId)).landed);
+});
+
+test("history pushed over and destructive commands in the session are flagged", async (t) => {
+	const { w, intents } = await reviewed(t, ["One"], { policy: "auto" });
+	const a = await agent(w, intents[0], "ana");
+	await w.tool(a, "claim", { paths: ["a.md"] });
+	work(w, a, { "a.md": "one\n" }); await w.project.onPush(a.repo); await w.settle();
+	w.git(a.dir, "commit", "--quiet", "--amend", "-m", "rewritten"); w.git(a.dir, "push", "--quiet", "--force", "origin", "HEAD:main");
+	await w.project.ingest(a.agentToken, [{ kind: "tool", tool: "Bash", text: "git push --force origin HEAD:main" }]);
+	await w.project.onPush(a.repo); await w.settle();
+	assert.deepEqual((await row(w, a)).flags.map((f) => f.kind), ["history", "destructive"]);
+});
+
+test("when the reviewer asks for changes the attempt is sent back with them, twice at most, then it waits for a person", async (t) => {
+	const { w, intents, asked } = await reviewed(t, ["One"], { policy: "auto" }, (input, approve) => ({ ...approve(input), verdict: "changes", changes: "Say hello in the notes.", criteria: [{ n: 1, verdict: "not_met", basis: "diff", why: "No greeting.", evidence: [] }] }));
+	const a = await finished(w, intents[0], "ana", { "notes.md": "one\n" });
+	let s = await w.state();
+	assert.deepEqual([(await row(w, a)).status, s.decisions.filter((d) => d.kind === "feedback").map((d) => [d.agent, d.body])], ["working", [["reviewer", "Say hello in the notes."]]]);
+	const heard = w.tool(a, "brief"); await w.settle();
+	assert.ok((await heard).heads_up.some((h) => h.kind === "feedback" && h.from === "reviewer" && h.body === "Say hello in the notes."));
+	for (const text of ["two\n", "three\n"]) {
+		a.sha = work(w, a, { "notes.md": text }); await w.project.onPush(a.repo); await w.settle(); await w.finish(a.attemptId, "pass"); await w.settle();
+		const said = w.tool(a, "ready", { summary: "again" }); await w.settle(); await said; await w.settle();
+	}
+	s = await w.state();
+	assert.deepEqual([asked.length, s.decisions.filter((d) => d.kind === "feedback").length, (await row(w, a)).status, (await row(w, a)).held], [3, 2, "ready", "The reviewer asked for changes twice and is still not satisfied."]);
+});
+
+test("the reviewer leaving it to a person, or approving with a criterion not shown, holds the attempt with the reason", async (t) => {
+	const { w, intents } = await reviewed(t, [], { policy: "auto" }, (input, approve) => ({ ...approve(input), criteria: [approve(input).criteria[0], { n: 2, verdict: "met", basis: "diff", why: "I am sure it does.", evidence: [] }] }));
+	const intent = await w.project.createIntent({ title: "Notes", goal: "Add notes.", acceptance: "There is a notes file\nIt survives a reload" });
+	const a = await finished(w, intent, "ana", { "notes.md": "hello\n" });
+	const s = await w.state();
+	assert.deepEqual([s.reviews[0].verdict, s.reviews[0].criteria.map((c) => c.verdict), (await row(w, a)).status], ["person", ["met", "unclear"], "ready"]);
+	assert.match((await row(w, a)).held, /^The reviewer left it to a person: "It survives a reload" is not shown to be met\. I am sure it does\.$/);
+});
+
+test("the policy never chooses between two attempts at one intent; when one is dropped the other lands", async (t) => {
+	const { w, intents } = await reviewed(t, ["Shared"], { policy: "auto" });
+	// The second attempt is already under way when the first is finished.
+	const b = await agent(w, intents[0], "ben");
+	const a = await finished(w, intents[0], "ana", { "a.md": "a\n" });
+	assert.match((await row(w, a)).held, /Another attempt at this intent is still going/);
+	await w.tool(b, "claim", { paths: ["b.md"] });
+	b.sha = work(w, b, { "b.md": "b\n" }); await w.project.onPush(b.repo); await w.settle(); await w.finish(b.attemptId, "pass"); await w.settle();
+	const said = w.tool(b, "ready", { summary: "done" }); await w.settle(); await said; await w.settle();
+	assert.deepEqual([(await row(w, a)).status, (await row(w, b)).status], ["ready", "ready"]);
+	assert.match((await row(w, b)).held, /Another attempt at this intent is still going: a person chooses between them\./);
+	await w.project.abandonAttempt(a.attemptId); await w.settle();
+	assert.equal((await row(w, b)).status, "landed");
+});
+
+test("a landing the policy asked for that is refused is not asked for again, and says why", async (t) => {
+	const { w, intents } = await reviewed(t, ["Mover", "One"], { policy: "auto" });
+	// Both start from the same trunk; the first lands, so the second has to be merged and its merge run.
+	const b = await agent(w, intents[1], "ben");
+	const a = await finished(w, intents[0], "ana", { "a.md": "a\n" });
+	assert.equal((await row(w, a)).status, "landed");
+	await w.tool(b, "claim", { paths: ["b.md"] });
+	b.sha = work(w, b, { "b.md": "b\n" }); await w.project.onPush(b.repo); await w.settle(); await w.finish(b.attemptId, "pass"); await w.settle();
+	const said = w.tool(b, "ready", { summary: "done" }); await w.settle(); await said; await w.settle();
+	assert.equal((await standing(w, b.attemptId)).queued, "verifying");
+	await w.finish(await mergeRef(w, b.attemptId), "fail"); await w.settle();
+	const s = await w.state();
+	assert.deepEqual([(await row(w, b)).status, s.queue.length, s.outcomes.filter((o) => o.attemptId === b.attemptId).map((o) => [o.by, o.outcome])], ["ready", 0, [["policy", "refused"]]]);
+	assert.match((await row(w, b)).held, /^Its landing was refused: attempt 2\.1 passes on its own but failed verification when merged with trunk/);
+});
+
+test("a commit pushed to a ready attempt is reviewed again, and a project can turn reviews off", async (t) => {
+	const { w, intents, asked } = await reviewed(t, ["One", "Two"]);
+	const a = await finished(w, intents[0], "ana", { "a.md": "a\n" });
+	a.sha = work(w, a, { "a.md": "a again\n" }); await w.project.onPush(a.repo); await w.settle();
+	assert.equal(asked.length, 1, "the review waits for the new commit's checks");
+	await w.finish(a.attemptId, "pass"); await w.settle();
+	assert.deepEqual([asked.length, (await w.state()).reviews[0].sha], [2, a.sha]);
+	await w.project.setReview(false);
+	await finished(w, intents[1], "ben", { "b.md": "b\n" });
+	assert.deepEqual([asked.length, (await w.state()).project.policy.review], [2, false]);
+});
+
+test("without a model to review with, nothing is reviewed and a project that lands by itself says a person must", async (t) => {
+	const { w, intents } = await withApp(t, ["One"], { landing: { policy: "auto" } });
+	const a = await finished(w, intents[0], "ana", { "a.md": "a\n" });
+	const s = await w.state();
+	assert.deepEqual([s.reviews.length, s.project.policy, (await row(w, a)).status, (await row(w, a)).held], [0, { landing: "auto", review: false, conflicts: "person", reviewers: [] }, "ready", "This instance has no model to review with, so a person lands it."]);
+});
+
+test("a criterion about the checks is met by the checks having passed, not by the reviewer saying so", async (t) => {
+	const answer = (input, approve) => ({ ...approve(input), criteria: [approve(input).criteria[0], { n: 2, verdict: "met", basis: "checks", why: "The checks pass.", evidence: [] }] });
+	const { w } = await reviewed(t, [], { policy: "auto" }, answer);
+	const make = () => w.project.createIntent({ title: "Notes", goal: "Add notes.", acceptance: "There is a notes file\nThe existing tests still pass" });
+	// Checks passed: the criterion is met on that basis and the attempt lands.
+	const a = await finished(w, await make(), "ana", { "a.md": "a\n" });
+	const s = await w.state();
+	assert.deepEqual([s.reviews[0].criteria.map((c) => [c.verdict, c.basis]), (await row(w, a)).status], [[["met", "diff"], ["met", "checks"]], "landed"]);
+});
+
+test("an attempt is reviewed by a model from a different maker than its agent, unless the project names one", async (t) => {
+	const { reviewerFor, reviewers } = await import("../src/worker/reviewer.ts");
+	const both = { ANTHROPIC_API_KEY: "a", OPENAI_API_KEY: "o" };
+	assert.deepEqual(reviewers(both).map((r) => r.provider), ["claude", "openai"]);
+	assert.deepEqual([reviewerFor(both, "claude").provider, reviewerFor(both, "codex").provider, reviewerFor(both, "agent").provider], ["openai", "claude", "claude"]);
+	assert.deepEqual([reviewerFor(both, "claude", "claude").provider, reviewerFor(both, "codex", "openai").provider], ["claude", "openai"]);
+	// With one provider there is no choice; with none there is no review.
+	assert.deepEqual([reviewerFor({ ANTHROPIC_API_KEY: "a" }, "claude").provider, reviewerFor({ OPENAI_API_KEY: "o" }, "codex").provider, reviewerFor({}, "claude"), reviewerFor({ AI: {} }, "claude")], ["claude", "openai", null, null]);
+	// And the project object hands that choice to the reviewer.
+	const { w, intents, asked } = await reviewed(t, ["One", "Two"]);
+	w.project.env.OPENAI_API_KEY = "o";
+	const a = await agent(w, intents[0], "claude-code"), b = await agent(w, intents[1], "codex");
+	w.db.prepare("UPDATE attempts SET kind = 'claude' WHERE id = ?").run(a.attemptId); w.db.prepare("UPDATE attempts SET kind = 'codex' WHERE id = ?").run(b.attemptId);
+	for (const x of [a, b]) {
+		await w.tool(x, "claim", { paths: ["x.md", "y.md"] });
+		x.sha = work(w, x, { [x === a ? "x.md" : "y.md"]: "x\n" }); await w.project.onPush(x.repo); await w.settle(); await w.finish(x.attemptId, "pass"); await w.settle();
+		const said = w.tool(x, "ready", { summary: "done" }); await w.settle(); await said; await w.settle();
+	}
+	assert.deepEqual(asked.map((i) => [i.agent, i.pick.provider]), [["claude-code", "openai"], ["codex", "claude"]]);
+});

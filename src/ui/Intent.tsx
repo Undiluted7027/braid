@@ -9,6 +9,7 @@ import { Empty, MiniLoom } from "./Graphics";
 import { ask, Icon, Notice, Tabs, type IconName, type Tab } from "./Kit";
 import { forceable, landingVerdict, modelVerdict, neverStarted, outcomesOf, reason, revertVerdict, sentence, useAsked } from "./Later";
 import { HostedChip, JoinCommand } from "./Project";
+import { CriteriaTable, FlagBox, flagsOf, Held, policyOf, ReviewPanel, reviewOf, reviewTag } from "./Review";
 import { Session } from "./Session";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
@@ -28,11 +29,13 @@ export function Why({ decisions, empty = "No decisions recorded.", answer }: { d
 				const person = d.kind === "feedback" || d.kind === "answer";
 				// Braid records a few things itself (keeping both sides' additions at a landing, a revert). They sit among the agent's decisions and must not read as the agent's.
 				const braid = d.agent === "braid";
+				// Under a policy that lands by itself, the reviewer's request for changes is sent to the agent as feedback. It is a model's, not a person's.
+				const reviewer = d.agent === "reviewer";
 				return (
-					<li key={d.id} className={`${d.kind} ${person ? "from-person" : ""} ${braid ? "from-braid" : ""}`}>
-						<span className={`kind ${braid ? "by-braid" : d.kind}`}><Icon name={braid ? "strands" : KIND[d.kind][0]} size={12} />{braid ? "Braid" : KIND[d.kind][1]}</span>
+					<li key={d.id} className={`${d.kind} ${person && !reviewer ? "from-person" : ""} ${braid ? "from-braid" : ""} ${reviewer ? "from-reviewer" : ""}`}>
+						<span className={`kind ${braid ? "by-braid" : reviewer ? "by-reviewer" : d.kind}`}><Icon name={braid ? "strands" : reviewer ? "search" : KIND[d.kind][0]} size={12} />{braid ? "Braid" : reviewer ? "Reviewer" : KIND[d.kind][1]}</span>
 						<div className="d-body">
-							<strong>{d.title}</strong>{person && <span className="dim"> · from {d.agent}</span>}{braid && <span className="dim"> · done by Braid, not the agent</span>}
+							<strong>{d.title}</strong>{person && !reviewer && <span className="dim"> · from {d.agent}</span>}{braid && <span className="dim"> · done by Braid, not the agent</span>}{reviewer && <span className="dim"> · sent back by the reviewer, a model, not by a person</span>}
 							{d.body && <p>{d.body}</p>}
 							{d.files.length > 0 && <p className="d-files">{d.files.map((f) => <span key={f} className="mono"><Icon name="file" size={12} />{f}</span>)}</p>}
 							{answer && d.kind === "question" && !answered.has(d.title) && <AnswerBox send={(body) => answer(d, body)} />}
@@ -288,7 +291,7 @@ function EditIntent({ intent, slug, done }: { intent: Intent; slug: string; done
 	);
 }
 
-type TabId = "changes" | "checks" | "why" | "session" | "preview";
+type TabId = "review" | "changes" | "checks" | "why" | "session" | "preview";
 
 function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLand: boolean }) {
 	const slug = state.project.slug;
@@ -297,7 +300,11 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	// A link from the Why page names an attempt and a moment in its session: open there.
 	const asked = new URLSearchParams(location.search);
 	const focus = asked.get("attempt") === a.id && asked.get("event") ? Number(asked.get("event")) : undefined;
-	const [tab, setTab] = useState<TabId>(focus ? "session" : "changes");
+	// The review is what a person reads first; the diff second. With no review there is nothing to read first but the diff.
+	const review = reviewOf(state, a), flags = flagsOf(a), tag = reviewTag(state, a);
+	const [tab, setTab] = useState<TabId>(focus ? "session" : review ? "review" : "changes");
+	// A line of the diff the reviewer pointed at: going there opens the Changes tab at that line.
+	const [cite, setCite] = useState<{ path: string; line: number | null; n: number } | null>(null);
 	const card = useRef<HTMLElement>(null);
 	useEffect(() => { if (focus) card.current?.scrollIntoView({ block: "start" }); }, []);
 	const key = state.previewKeys?.[a.id];
@@ -353,7 +360,9 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const byId = new Map(state.attempts.map((x) => [x.id, x]));
 	const collisions = state.overlaps.filter((o) => o.a === a.id || o.b === a.id).map((o) => ({ ...o, other: byId.get(o.a === a.id ? o.b : o.a)! })).filter((o) => o.other);
 	const checkState = mergeFailed ? "fail" : run && run.sha === a.headSha ? run.status : going ? "queued" : null;
+	const intent = state.intents.find((i) => i.id === a.intentId)!;
 	const tabs: Tab<TabId>[] = [
+		{ id: "review", label: "Review", icon: "search", badge: <>{tag && <span className={`n ${tag.tone}`} title={tag.title}>{review?.status === "done" && review.sha === a.headSha ? tag.text.split(" · ")[1] : tag.text}</span>}{flags.length > 0 && <span className="n flagged" title="Flagged by Braid for a person">{flags.length} flag{flags.length === 1 ? "" : "s"}</span>}</> },
 		{ id: "changes", label: "Changes", icon: "changes", badge: diff ? <span className="n">{diff.length}</span> : null },
 		{ id: "checks", label: "Checks", icon: "check", badge: <>{!nothingPushed && checkState && <span className={`dot ${checkState}`} title={run ? `Braid's run: ${run.status}` : "Not run yet"} />}{collisions.length > 0 && <span className="n warn" title="Collisions with other attempts">{collisions.length}</span>}</> },
 		{ id: "why", label: "Why", icon: "decision", badge: unanswered ? <span className="n ask" title="The agent asked a question">asks</span> : decisions.length > 0 ? <span className="n">{decisions.length}</span> : null },
@@ -362,7 +371,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	];
 
 	return (
-		<section ref={card} className={`panel attempt ${a.status}`} aria-label={`Attempt ${a.id} by ${a.agent}`}>
+		<section ref={card} id={`attempt-${a.id}`} className={`panel attempt ${a.status}`} aria-label={`Attempt ${a.id} by ${a.agent}`}>
 			<header className="attempt-head">
 				<div className="attempt-top">
 					<h2><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="id">attempt <span className="mono">{a.id}</span></span></h2>
@@ -429,12 +438,19 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				{!state.viewer && going && failing && !queued && !hostedGoing && state.project.hosting[a.kind === "codex" ? "codex" : "claude"] && (
 					<p className="row"><button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/rehost`, { task: "fix" }))}><Icon name="agent" />Have {a.agent} fix {failing}</button></p>
 				)}
+				{going && <FlagBox a={a} />}
+				<Held state={state} a={a} />
 				{going && a.status !== "conflicted" && a.trunkConflicts.length > 0 && <Notice tone="warn" small>Landing now would conflict with trunk on <span className="mono">{a.trunkConflicts.join(", ")}</span>. Braid will open a reconciliation so you can resolve it.</Notice>}
 			</header>
 
 			<Tabs tabs={tabs} value={tab} onChange={setTab} label={`Attempt ${a.id}`} idBase={`a${a.id}`} />
 
 			<div className="tabpanel" role="tabpanel" id={`a${a.id}-panel`} aria-labelledby={`a${a.id}-tab-${tab}`}>
+				{tab === "review" && <>
+					{!going && <FlagBox a={a} />}
+					<ReviewPanel state={state} a={a} intent={intent} toChecks={() => setTab("checks")} onCite={(path, line) => { setCite({ path, line, n: Date.now() }); setTab("changes"); }} />
+				</>}
+
 				{tab === "changes" && <>
 					{diffError && <Notice>{diffError}</Notice>}
 					{!diff && !diffError && <Empty kind="loading" title="Loading the changes…" />}
@@ -442,7 +458,8 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 						? <Empty title="Nothing pushed yet"><p>The files this attempt changes against trunk appear here once the agent pushes.</p></Empty>
 						: <Empty title="Nothing was pushed"><p>This attempt ended without changing any file.</p></Empty>)}
 					{diff && diff.length > 0 && <p className="panel-lede">What this attempt changes, against the trunk commit it forked from.</p>}
-					{diff?.map((f) => <FileDiff key={f.path + (f.head ?? "")} file={f} open={diff.length <= 3} />)}
+					{cite && diff && <p className="cite-note" role="status"><Icon name="search" size={14} /><span>{diff.some((f) => f.path === cite.path) ? <>The reviewer pointed at <span className="mono">{cite.path}{cite.line ? `:${cite.line}` : ""}</span>. {cite.line ? "That line is marked below." : "That file is open below."}</> : <>The reviewer pointed at <span className="mono">{cite.path}</span>, which this attempt does not change, so it is not in the diff.</>}</span><button className="link" onClick={() => setTab("review")}>Back to the review</button></p>}
+					{diff?.map((f) => <FileDiff key={f.path + (f.head ?? "")} file={f} open={diff.length <= 3} cite={cite?.path === f.path ? cite : undefined} />)}
 				</>}
 
 				{tab === "checks" && <>
@@ -554,9 +571,9 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 				{editing ? <EditIntent intent={intent} slug={slug} done={() => setEditing(false)} /> : (
 					<div className="brief">
 						<div><span className="label">Goal</span><p className="goal">{intent.goal}</p></div>
-						{intent.acceptance && <div><span className="label">Done when</span><p className="goal">{intent.acceptance}</p></div>}
 					</div>
 				)}
+				{!editing && <CriteriaTable state={state} intent={intent} attempts={attempts} />}
 				{reverts.map((r) => <Notice key={r.sha} tone="warn" small>A landing of this intent was taken back out of trunk as <span className="mono">{short(r.sha)}</span> by {r.agent}, {ago(r.at)}. The reason is in that attempt's decisions.</Notice>)}
 				{landing && (
 					<div className="landed-note">
@@ -571,7 +588,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 				{attempts.length > 0 && <div className="ihead-loom"><span className="label">This intent against trunk</span><MiniLoom state={state} intentId={intent.id} /></div>}
 			</header>
 			{recons.filter((r) => r.status !== "resolved").map((r) => <ReconPanel key={r.id} r={r} state={state} />)}
-			<div className="section-head"><h2>Attempts{attempts.length > 0 && <span className="count">{attempts.length}</span>}</h2>{attempts.length > 1 && <span className="dim">Each is one agent's try at this goal. Compare them, then land one.</span>}</div>
+			<div className="section-head"><h2>Attempts{attempts.length > 0 && <span className="count">{attempts.length}</span>}</h2>{attempts.length > 1 && <span className="dim">Each is one agent's try at this goal. Compare them, then land one.{policyOf(state).landing === "auto" && liveCount > 1 ? " Braid does not choose between attempts: with more than one going, a person lands." : ""}</span>}</div>
 			{attempts.length === 0 && (
 				<Empty title="No attempts yet">
 					<p>{open ? "Add an agent to start one. Add several to compare approaches." : "This intent was closed before any agent attempted it."}</p>
