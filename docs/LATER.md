@@ -4,6 +4,8 @@ Features and gaps to pick up after the core is solid. The build plan below is in
 
 ## Build plan
 
+What to build next, and the assessment behind it (the brief question by question, a 40-agent run, ACP, authentication, and what to take from T3 Code), is in [DIRECTION.md](DIRECTION.md), written October 9, 2026. This file stays the record of what was built and checked.
+
 As of October 3, 2026 the core loop works locally on a toy project. Submission is due October 14. This is what to build with the time, in order.
 
 **Decided: the demo subject is Braid building itself.** Braid's own repository becomes a Braid project, and agents develop Braid through Braid. That gives a real codebase with a build, a typecheck and tests, and it is the most convincing story to show.

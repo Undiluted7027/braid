@@ -343,6 +343,20 @@ label.inline > select { margin-top: 0; }
 .braid .ring { fill: none; stroke-width: 1.5; }
 .braid .lane-name { font: 500 12.5px var(--sans); fill: var(--night-ink); }
 .braid .lane-name tspan:first-child { font-family: var(--mono); }
+.braid .lane-agent { overflow: hidden; }
+.braid .lane-agents { display: flex; justify-content: flex-end; align-items: center; width: 100%; height: 22px; overflow: hidden; }
+.braid .lane-agent-state { --agent-state: var(--night-muted); width: 18px; height: 20px; display: inline-grid; place-items: center; flex: none; }
+.braid .lane-agent-state + .lane-agent-state { margin-left: 5px; }
+.braid .lane-agent-state.working { --agent-state: #6cb2ff; }
+.braid .lane-agent-state.ready, .braid .lane-agent-state.landed { --agent-state: #4ade80; }
+.braid .lane-agent-state.conflicted { --agent-state: #ff8f8f; }
+.braid .lane-agent .agent { width: 18px; height: 20px; color: var(--night-ink); flex: none; }
+.braid .lane-agent .agent-name { display: none; }
+.braid .lane-agent .agent-brand { width: 16px; height: 16px; }
+.braid .lane-agent .agent-brand { filter: drop-shadow(0 0 1.5px color-mix(in srgb, var(--agent-state) 45%, transparent)); }
+.braid .lane-agent .agent-brand path { stroke: var(--agent-state); stroke-width: 0.65; stroke-linejoin: round; paint-order: stroke fill; }
+.braid .lane-agent .agent-brand.codex { color: var(--night-ink); }
+.braid .lane-agent .agent-mark { width: 18px; height: 18px; color: var(--night); background: var(--night-muted); box-shadow: 0 0 0 0.5px var(--agent-state), 0 0 3px color-mix(in srgb, var(--agent-state) 35%, transparent); }
 .braid .lane-status { font: 500 10.5px var(--mono); letter-spacing: 0.04em; text-transform: uppercase; fill: var(--night-muted); }
 .braid .lane-status.conflicted { fill: #ff8f8f; }
 .braid .lane-status.ready, .braid .lane-status.landed { fill: #4ade80; }

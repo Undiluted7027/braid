@@ -2,6 +2,7 @@
 // landed) rejoining it. Vertical ties between strands are overlaps Braid has detected.
 // Everything drawn here explains itself in a card when pointed at, focused or tapped (LoomCard.tsx).
 import type { Attempt, Overlap, State, TrunkCommit } from "../shared/types";
+import { Agent } from "./App";
 import { api, intentColor, navigate, useAsync, useNarrow } from "./api";
 import { describe, useLoomCards, type CardTarget } from "./LoomCard";
 
@@ -19,6 +20,8 @@ export function Braid({ state }: { state: State }) {
 	const outside = (history ?? []).filter((c) => c.kind === "outside");
 	const cards = useLoomCards(state, history);
 	const strands = state.attempts.filter((a) => a.status !== "abandoned").sort((a, b) => a.intentId - b.intentId || a.createdAt - b.createdAt);
+	const attemptsByIntent = new Map<number, Attempt[]>();
+	for (const a of strands) attemptsByIntent.set(a.intentId, [...(attemptsByIntent.get(a.intentId) ?? []), a]);
 	const landingOf = new Map(state.landings.filter((l) => !l.revertOf).map((l) => [l.attemptId, l]));
 	const reverts = state.landings.filter((l) => l.revertOf);
 	const end = (a: Attempt) => landingOf.get(a.id)?.at ?? a.updatedAt;
@@ -30,8 +33,9 @@ export function Braid({ state }: { state: State }) {
 	const x = (t: number) => GUTTER + PAD + STEP + times.findIndex((v) => v >= t) * STEP;
 	const xNow = GUTTER + PAD + STEP + Math.max(times.length, 2) * STEP + 90;
 	const width = xNow + PAD + 70;
-	const lane = new Map(strands.map((a, i) => [a.id, TRUNK_Y + 44 + i * LANE]));
-	const height = TRUNK_Y + 44 + Math.max(strands.length, 1) * LANE + 6;
+	const laneByIntent = new Map([...attemptsByIntent.keys()].map((intentId, i) => [intentId, TRUNK_Y + 44 + i * LANE]));
+	const lane = new Map(strands.map((a) => [a.id, laneByIntent.get(a.intentId)!]));
+	const height = TRUNK_Y + 44 + Math.max(attemptsByIntent.size, 1) * LANE + 6;
 
 	// Strongest overlap per pair of attempts.
 	const ties = new Map<string, Overlap & { paths: string[] }>();
@@ -70,6 +74,27 @@ export function Braid({ state }: { state: State }) {
 					<circle cx={GUTTER + PAD} cy={TRUNK_Y} r={4} className="seed node-dot" />
 					<text x={GUTTER + PAD} y={TRUNK_Y - 12} className="node-label" textAnchor="middle">start</text>
 				</g>
+				{[...attemptsByIntent].map(([intentId, attempts]) => {
+					const y = laneByIntent.get(intentId)!;
+					const latest = attempts[attempts.length - 1];
+					return (
+						<g key={intentId} className="lane-label">
+							<text x={18} y={y + 4} className="lane-name">
+								<tspan style={{ fill: intentColor(intentId) }} fontWeight={700}>I{intentId}</tspan>
+							</text>
+							<foreignObject x={46} y={y - 11} width={narrow ? GUTTER - 54 : GUTTER - 126} height={22} className="lane-agent">
+								<span className="lane-agents">
+									{attempts.map((a) => (
+										<span key={a.id} className={`lane-agent-state ${a.status}`} title={`${a.agent}: ${a.status}`}>
+											<Agent name={a.agent} kind={a.kind} model={a.model} />
+										</span>
+									))}
+								</span>
+							</foreignObject>
+							{!narrow && <text x={GUTTER - 10} y={y + 4} className={`lane-status ${latest.status}`} textAnchor="end">{latest.status}</text>}
+						</g>
+					);
+				})}
 
 				{strands.map((a) => {
 					const y = lane.get(a.id)!, color = intentColor(a.intentId), landed = landingOf.get(a.id);
@@ -81,15 +106,11 @@ export function Braid({ state }: { state: State }) {
 					const liveEnd = !landed && LIVE.has(a.status);
 					return (
 						<g key={a.id} className={`strand ${a.status} ${cards.openKey === `a:${a.id}` ? "on" : ""}`} {...goes({ kind: "attempt", id: a.id }, `/p/${slug}/i/${a.intentId}`, true)}>
-							<text x={18} y={y + 4} className="lane-name" {...(liveEnd ? {} : { "data-anchor": true })}>
-								<tspan style={{ fill: color }} fontWeight={700}>I{a.intentId}</tspan>
-								<tspan dx={6}>{narrow && a.agent.length > 10 ? `${a.agent.slice(0, 9)}…` : a.agent}</tspan>
-							</text>
-							{!narrow && <text x={GUTTER - 10} y={y + 4} className={`lane-status ${a.status}`} textAnchor="end">{a.status}</text>}
 							<path d={out + back} className="hit" />
 							<path d={out + back} style={{ stroke: color }} strokeOpacity={faded ? 0.3 : 1} strokeDasharray={faded ? "4 4" : undefined} className="strand-line" />
 							{a.files.length > 0 && LIVE.has(a.status) && <text x={x1 + 12} y={y + 4} className="node-label">{narrow ? a.status : `${a.files.length} file${a.files.length === 1 ? "" : "s"}`}</text>}
 							{liveEnd && <circle data-anchor cx={x1} cy={y} r={5} style={{ fill: color }} className={a.status === "working" ? "pulse" : ""} />}
+							{!liveEnd && <circle data-anchor cx={x1} cy={y} r={1} fill="transparent" />}
 							{!landed && !LIVE.has(a.status) && <text x={x1 + 6} y={y + 4} className="node-label">{a.status}</text>}
 						</g>
 					);
