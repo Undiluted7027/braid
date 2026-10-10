@@ -11,7 +11,7 @@ const dir = "/repo";
 type Author = { name: string; email: string };
 
 /** A merge that is ready but has not moved anything: `push` puts it on trunk, `stage` parks it on the attempt's repository to be verified first. */
-export interface Prepared { ok: true; sha: string; parentSha: string; attemptSha: string; reconciled: string[]; push(): Promise<void>; stage(writeToken: string): Promise<void> }
+export interface Prepared { ok: true; sha: string; parentSha: string; attemptSha: string; reconciled: string[]; combined: string[]; push(): Promise<void>; stage(writeToken: string): Promise<void> }
 export type LandResult =
 	| Prepared
 	| { ok: false; reason: "conflict"; trunkSha: string; attemptSha: string; conflicts: MergeConflict[] }
@@ -32,6 +32,15 @@ export interface LandInput {
 	resolutions: Map<string, string>;
 	/** The commits this landing was decided on. If either side has moved, nothing is merged. */
 	expect?: { trunk?: string; attempt?: string };
+	/** Keep both sides where both only added lines at the same place (see mergeTrees). Only for merges that will be run before they land. */
+	combining?: boolean;
+}
+
+/** The landing message with a line saying which files had both sides' additions kept, put before the trailers. */
+export function withCombined(message: string, paths: string[]): string {
+	if (!paths.length) return message;
+	const line = `Combined: trunk and this attempt both added lines at the same place in ${paths.join(", ")}; both were kept, trunk's first.`;
+	return /\n\nBraid-Intent:/.test(message) ? message.replace(/\n\nBraid-Intent:/, `\n\n${line}\n\nBraid-Intent:`) : `${message.trimEnd()}\n\n${line}`;
 }
 
 /** Merge an attempt into trunk as one landing commit (parents: trunk head, attempt head), without pushing it anywhere yet. */
@@ -54,18 +63,18 @@ export async function prepare(input: LandInput): Promise<LandResult> {
 
 	const treeOf = async (oid: string) => (await git.readCommit({ fs, dir, oid })).commit.tree;
 	const baseSha = ((await git.findMergeBase({ fs, dir, oids: [trunkSha, attemptSha] })) as string[])[0];
-	const merged = await mergeTrees(repo, baseSha ? await treeOf(baseSha) : null, await treeOf(trunkSha), await treeOf(attemptSha), input.resolutions);
+	const merged = await mergeTrees(repo, baseSha ? await treeOf(baseSha) : null, await treeOf(trunkSha), await treeOf(attemptSha), input.resolutions, input.combining);
 	if (merged.conflicts.length) return { ok: false, reason: "conflict", trunkSha, attemptSha, conflicts: merged.conflicts };
 
 	const who = { ...input.author, timestamp: Math.floor(Date.now() / 1000), timezoneOffset: 0 };
-	const sha = await git.writeCommit({ fs, dir, commit: { message: `${input.message.trimEnd()}\n`, tree: merged.tree, parent: [trunkSha, attemptSha], author: who, committer: who } });
+	const sha = await git.writeCommit({ fs, dir, commit: { message: `${withCombined(input.message, merged.combined).trimEnd()}\n`, tree: merged.tree, parent: [trunkSha, attemptSha], author: who, committer: who } });
 	const send = async (url: string, token: string, ref: string, force: boolean) => {
 		await git.writeRef({ fs, dir, ref: `refs/heads/${ref}`, value: sha, force: true });
 		const push = await git.push({ fs, http, dir, url, ref, force, onAuth: gitAuth(token) });
 		if (!push.ok) throw new Error(`push of ${ref} rejected: ${JSON.stringify(push.refs)}`);
 	};
 	return {
-		ok: true, sha, parentSha: trunkSha, attemptSha, reconciled: merged.reconciled,
+		ok: true, sha, parentSha: trunkSha, attemptSha, reconciled: merged.reconciled, combined: merged.combined,
 		push: () => send(input.trunk.remote, input.trunk.token, branch, false),
 		stage: (writeToken) => send(input.attempt.remote, writeToken, CANDIDATE, true),
 	};
@@ -165,7 +174,7 @@ export interface ChainMember {
 	resolutions: Map<string, string>;
 }
 export type ChainStep =
-	| { id: string; ok: true; sha: string; parentSha: string; attemptSha: string; reconciled: string[]; sameTree: boolean }
+	| { id: string; ok: true; sha: string; parentSha: string; attemptSha: string; reconciled: string[]; combined: string[]; sameTree: boolean }
 	| { id: string; ok: false; reason: "conflict"; againstTrunk: boolean; onto: string; attemptSha: string; conflicts: MergeConflict[] }
 	| { id: string; ok: false; reason: "nothing-to-land" }
 	| { id: string; ok: false; reason: "moved"; found: string };
@@ -179,7 +188,7 @@ export type Chain =
  * the last one runs them all together, and trunk can move to any step. A member that conflicts with what is
  * ahead of it, has moved, or adds nothing is left out and the chain goes on without it. Nothing is pushed yet.
  */
-export async function chain(input: { branch: string; trunk: { remote: string; token: string }; expectTrunk: string; members: ChainMember[] }): Promise<Chain> {
+export async function chain(input: { branch: string; trunk: { remote: string; token: string }; expectTrunk: string; members: ChainMember[]; combining?: boolean }): Promise<Chain> {
 	const { branch } = input;
 	const fs = new MemoryFS(), repo = { fs, dir };
 	await fs.promises.mkdir(dir);
@@ -200,12 +209,12 @@ export async function chain(input: { branch: string; trunk: { remote: string; to
 		if (attemptSha !== m.expect) { steps.push({ id: m.id, ok: false, reason: "moved", found: attemptSha }); continue; }
 		if (onto === attemptSha || await git.isDescendent({ fs, dir, oid: onto, ancestor: attemptSha, depth: -1 })) { steps.push({ id: m.id, ok: false, reason: "nothing-to-land" }); continue; }
 		const baseSha = ((await git.findMergeBase({ fs, dir, oids: [onto, attemptSha] })) as string[])[0];
-		const merged = await mergeTrees(repo, baseSha ? await treeOf(baseSha) : null, await treeOf(onto), await treeOf(attemptSha), m.resolutions);
+		const merged = await mergeTrees(repo, baseSha ? await treeOf(baseSha) : null, await treeOf(onto), await treeOf(attemptSha), m.resolutions, input.combining);
 		if (merged.conflicts.length) { steps.push({ id: m.id, ok: false, reason: "conflict", againstTrunk: onto === trunkSha, onto, attemptSha, conflicts: merged.conflicts }); continue; }
 		const who = { ...m.author, timestamp: Math.floor(Date.now() / 1000), timezoneOffset: 0 };
-		const sha = await git.writeCommit({ fs, dir, commit: { message: `${m.message.trimEnd()}\n`, tree: merged.tree, parent: [onto, attemptSha], author: who, committer: who } });
+		const sha = await git.writeCommit({ fs, dir, commit: { message: `${withCombined(m.message, merged.combined).trimEnd()}\n`, tree: merged.tree, parent: [onto, attemptSha], author: who, committer: who } });
 		// An attempt that started from exactly the commit it lands on merges to its own tree, which has already been run.
-		steps.push({ id: m.id, ok: true, sha, parentSha: onto, attemptSha, reconciled: merged.reconciled, sameTree: baseSha === onto && merged.reconciled.length === 0 });
+		steps.push({ id: m.id, ok: true, sha, parentSha: onto, attemptSha, reconciled: merged.reconciled, combined: merged.combined, sameTree: baseSha === onto && merged.reconciled.length === 0 });
 		onto = sha;
 	}
 	const tip = onto === trunkSha ? null : onto;

@@ -559,3 +559,96 @@ test("a project sets how many landings go in one batch, and \"land now\" goes al
 	await w.finish(`batch:${s.batches[0].id}`, "pass"); await w.settle();
 	assert.equal((await w.state()).attempts.filter((x) => x.status === "landed").length, 4);
 });
+
+// ── merging without a person ─────────────────────────────────────────────────
+
+const app = (functions) => `const state = {};\n\n${functions.map((f) => `function ${f}() {\n\treturn "${f}";\n}\n\n`).join("")}function render() {}\n`;
+/** A project whose trunk has app.js with one function, verified by a run that has checks. */
+async function withApp(t, titles, config, env) {
+	const { w, intents } = await started(t, titles, env);
+	const trunk = w.clone("p--trunk", "owner");
+	w.push(trunk, { "app.js": app([]), ...(config ? { "braid.json": JSON.stringify(config) + "\n" } : {}) });
+	await w.project.onPush("p--trunk"); await w.settle(); await w.finish("trunk", "pass"); await w.settle();
+	return { w, intents };
+}
+
+test("two attempts that each add a function at the same place both land, with no reconciliation", async (t) => {
+	const { w, intents } = await withApp(t, ["One", "Two"]);
+	const a = await ready(w, intents[0], "ana", { "app.js": app(["one"]) }), b = await ready(w, intents[1], "ben", { "app.js": app(["two"]) });
+	let s = await w.state();
+	assert.deepEqual(s.overlaps.map((o) => [o.path, o.severity]), [["app.js", "touch"]], "seen as the same file, mergeable");
+	await askAll(w, [a, b]);
+	s = await w.state();
+	// The second is merged on top of the first, both additions kept, and that merge is run.
+	const batch = s.batches[0];
+	assert.deepEqual([batch.members, s.reconciliations.length], [[a.attemptId, b.attemptId], 0]);
+	await w.finish(`batch:${batch.id}`, "pass"); await w.settle();
+	s = await w.state();
+	assert.deepEqual(s.attempts.map((x) => x.status), ["landed", "landed"]);
+	assert.equal(trunkFile(w, "app.js"), app(["one", "two"]).trimEnd());
+	assert.match(w.git(`${w.root}/p--trunk.git`, "log", "-1", "--format=%B", "refs/heads/main"), /Combined: trunk and this attempt both added lines at the same place in app\.js; both were kept, trunk's first\.\n\nBraid-Intent: 2/);
+	assert.match(s.activity.map((x) => x.text).join("\n"), /keeping both sides' additions in app\.js/);
+	assert.deepEqual(s.decisions.filter((d) => d.agent === "braid").map((d) => [d.attemptId, d.title, d.files]), [[b.attemptId, "Both sides' additions kept", ["app.js"]]]);
+});
+
+test("additions are not combined when nothing would run the result, when the project says no, or for \"land now\"", async (t) => {
+	// The project turns it off.
+	const off = await withApp(t, ["One", "Two"], { landing: { combine: false } });
+	const a = await ready(off.w, off.intents[0], "ana", { "app.js": app(["one"]) }), b = await ready(off.w, off.intents[1], "ben", { "app.js": app(["two"]) });
+	assert.deepEqual((await off.w.state()).overlaps.map((o) => o.severity), ["conflict"]);
+	await land(off.w, a.attemptId);
+	assert.deepEqual((await land(off.w, b.attemptId)).conflict, ["app.js"]);
+	// Forced: the merge would land without being run, so it is not made by itself.
+	const forced = await withApp(t, ["One", "Two"]);
+	const c = await ready(forced.w, forced.intents[0], "cy", { "app.js": app(["one"]) }), d = await ready(forced.w, forced.intents[1], "dee", { "app.js": app(["two"]) });
+	await land(forced.w, c.attemptId);
+	assert.deepEqual((await land(forced.w, d.attemptId, { force: true })).conflict, ["app.js"]);
+});
+
+test("a combined merge that fails its run is refused like any other, and trunk is untouched", async (t) => {
+	const { w, intents } = await withApp(t, ["One", "Two"]);
+	const a = await ready(w, intents[0], "ana", { "app.js": app(["one"]) }), b = await ready(w, intents[1], "ben", { "app.js": app(["two"]) });
+	await land(w, a.attemptId);
+	const head = w.head("p--trunk");
+	await land(w, b.attemptId);
+	await w.finish(await mergeRef(w, b.attemptId), "fail"); await w.settle();
+	assert.match((await standing(w, b.attemptId)).refused, /failed verification when merged with trunk/);
+	assert.equal(w.head("p--trunk"), head);
+});
+
+test("a project can send conflicts to the attempt's agent, then the model, before a person", async (t) => {
+	const { w, intents } = await withApp(t, ["One", "Two", "Three"], { landing: { conflicts: "auto" } }, { ANTHROPIC_API_KEY: "k" });
+	const a = await ready(w, intents[0], "ana", title("Ana"));
+	// An attempt by an agent Braid can run, and one by an agent it does not run. Both started before anything landed.
+	const b = await agent(w, intents[1], "claude-code");
+	w.db.prepare("UPDATE attempts SET kind = 'claude' WHERE id = ?").run(b.attemptId);
+	b.sha = work(w, b, title("Ben")); await w.project.onPush(b.repo); await w.settle(); await w.finish(b.attemptId, "pass"); await w.settle();
+	const c = await ready(w, intents[2], "cy", title("Cy"));
+	await land(w, a.attemptId);
+	// The first conflicts: its agent is brought back to reconcile.
+	await land(w, b.attemptId);
+	let s = await w.state(), recon = s.reconciliations.find((r) => r.attemptId === b.attemptId);
+	assert.deepEqual([recon.status, recon.auto, s.attempts.find((x) => x.id === b.attemptId).hosted], ["open", "agent", "starting"]);
+	assert.deepEqual(w.agents.filter((x) => x.what === "start").map((x) => [x.name, x.job.task]), [[`p/${b.attemptId}`, "reconcile"]]);
+	// The agent finishes and the conflict is still open: the model is asked. Here it cannot answer, so it is left for a person.
+	await w.project.hostedDone(b.attemptId, "finished", "");
+	assert.deepEqual([(await w.state()).reconciliations.find((r) => r.attemptId === b.attemptId).auto, (await w.state()).reconciliations.find((r) => r.attemptId === b.attemptId).status], ["model", "resolving"]);
+	await w.settle();
+	s = await w.state(); recon = s.reconciliations.find((r) => r.attemptId === b.attemptId);
+	assert.deepEqual([recon.status, recon.auto, s.outcomes[0].kind, s.outcomes[0].outcome], ["open", "model", "reconcile", "failed"]);
+	// Each has had its turn: nothing more is tried until a person acts.
+	await w.project.hostedDone(b.attemptId, "finished", ""); await w.settle();
+	assert.equal(w.agents.filter((x) => x.what === "start").length, 1);
+	// An attempt by an agent Braid does not run goes straight to the model.
+	await w.project.land(c.attemptId, "rev");
+	for (let i = 0; i < 50 && !(await w.state()).reconciliations.some((r) => r.attemptId === c.attemptId); i++) await w.settle();
+	assert.equal((await w.state()).reconciliations.find((r) => r.attemptId === c.attemptId).auto, "model");
+});
+
+test("without the setting, a conflict waits for a person and nobody is started", async (t) => {
+	const { w, intents } = await withApp(t, ["One", "Two"], null, { ANTHROPIC_API_KEY: "k" });
+	const a = await ready(w, intents[0], "ana", title("Ana")), b = await ready(w, intents[1], "ben", title("Ben"));
+	await land(w, a.attemptId); await land(w, b.attemptId);
+	const s = await w.state();
+	assert.deepEqual([s.reconciliations[0].status, s.reconciliations[0].auto, w.agents.length], ["open", null, 0]);
+});

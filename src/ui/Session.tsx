@@ -76,10 +76,10 @@ export function Session({ slug, attemptId, decisions, live, focus }: { slug: str
 			</p>
 			<ol className="session" ref={box} tabIndex={0} aria-label="Session transcript" onScroll={(e) => { const el = e.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; }}>
 				{rows.map((r) => r.event ? <EventRow key={r.key} e={r.event} focused={r.event.id === focus} /> : (
-					<li key={r.key} className="ev decision-mark">
+					<li key={r.key} className={`ev decision-mark ${r.decision!.agent === "braid" ? "by-braid" : ""}`}>
 						<time className="ev-time">{clock(r.at)}</time>
-						<span className="ev-mark"><Icon name="decision" size={14} label="Decision recorded" /></span>
-						<div className="ev-body"><span className="ev-tool">{r.decision!.kind}</span><strong>{r.decision!.title}</strong>{r.decision!.body && <span className="ev-text ev-why"> {r.decision!.body}</span>}</div>
+						<span className="ev-mark"><Icon name={r.decision!.agent === "braid" ? "strands" : "decision"} size={14} label={r.decision!.agent === "braid" ? "Noted by Braid" : "Decision recorded"} /></span>
+						<div className="ev-body"><span className="ev-tool">{r.decision!.agent === "braid" ? "Braid's note" : r.decision!.kind}</span><strong>{r.decision!.title}</strong>{r.decision!.body && <span className="ev-text ev-why"> {r.decision!.body}</span>}</div>
 					</li>
 				))}
 				{live && <li className="ev tail"><span className="ev-time" /><span className="ev-mark pulse"><Icon name="say" size={14} /></span><div className="ev-body">The agent is working. New events appear here.</div></li>}

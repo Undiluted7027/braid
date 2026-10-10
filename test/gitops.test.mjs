@@ -77,3 +77,24 @@ test("mergeJson: the same key changed two ways, or removed against changed, is l
 	assert.deepEqual(JSON.parse(mergeJson(pkg({ ms: "1", a: "1" }), pkg({ a: "1" }), pkg({ ms: "1", a: "2" }))), { dependencies: { a: "2" } });
 	assert.equal(mergeJson("{", "{}", "{}"), null);
 });
+
+test("combine: both sides adding lines at the same place keeps both, trunk's first", async () => {
+	const { combine, predict, bothAdded } = await import("../src/worker/gitops.ts");
+	const base = "const a = 1;\n\nfunction render() {}\n";
+	const trunk = "const a = 1;\n\nfunction one() {}\n\nfunction render() {}\n", attempt = "const a = 1;\n\nfunction two() {}\n\nfunction render() {}\n";
+	assert.deepEqual(combine(base, trunk, attempt), { text: "const a = 1;\n\nfunction one() {}\n\nfunction two() {}\n\nfunction render() {}\n", places: 1 });
+	assert.deepEqual([predict(base, trunk, attempt).conflict, predict(base, trunk, attempt, true).conflict], [true, false]);
+	// Appended at the end of a file with no final newline on trunk's side: the two do not run together on one line.
+	assert.equal(bothAdded({ base: "", ours: "x", theirs: "y\n" }), "x\ny\n");
+	// One side's addition already contains the other's: kept once.
+	assert.equal(bothAdded({ base: "", ours: "import a;\nimport b;\n", theirs: "import b;\n" }), "import a;\nimport b;\n");
+});
+
+test("combine: a place where either side changed or removed lines is still a conflict, and the whole file is left alone", async () => {
+	const { combine, predict } = await import("../src/worker/gitops.ts");
+	const base = "title: Tally\n\n\n\n\n\n\n\nend\n";
+	const trunk = "title: Ana\n\n\n\n\n\n\n\nend\nmore from trunk\n", attempt = "title: Ben\n\n\n\n\n\n\n\nend\nmore from the attempt\n";
+	assert.equal(combine(base, trunk, attempt), null);
+	assert.deepEqual(predict(base, trunk, attempt, true), { conflict: true, regions: 2 });
+	assert.deepEqual(combine("a\n", "a\nb\n", "a\n"), { text: "a\nb\n", places: 0 });
+});

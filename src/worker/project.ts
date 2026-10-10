@@ -3,7 +3,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
-import { asText, assemble, diffTrees, listTree, markedView, merge3, mergeBase, predict } from "./gitops";
+import { asText, assemble, diffTrees, GENERATED, listTree, markedView, merge3, mergeBase, predict } from "./gitops";
 import { claimMatches, claimOverlaps, fileOverlaps, risen, strongest } from "./overlap.ts";
 import { CANDIDATE, chain, commitFiles, prepare, promoteFrom, revert, seed, type ChainStep } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
@@ -116,6 +116,8 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN revert_of TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE registry ADD COLUMN public INTEGER DEFAULT 0"); } catch {}
 		try { this.sql.exec("ALTER TABLE outcomes ADD COLUMN sha TEXT DEFAULT ''"); } catch {}
+		try { this.sql.exec("ALTER TABLE queue ADD COLUMN combined TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN auto TEXT"); } catch {}
 		try {
 			this.sql.exec("ALTER TABLE queue ADD COLUMN batch_id INTEGER");
 			this.sql.exec("ALTER TABLE queue ADD COLUMN position INTEGER");
@@ -175,7 +177,7 @@ export class Project extends DurableObject<BraidEnv> {
 	});
 	private toRecon = (r: any): Reconciliation => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, status: r.status, trunkSha: r.trunk_sha, conflicts: JSON.parse(r.conflicts),
-		resolutions: JSON.parse(r.resolutions), rationale: r.rationale, resolvedBy: r.resolved_by, at: r.at, attemptSha: r.attempt_sha ?? null,
+		resolutions: JSON.parse(r.resolutions), rationale: r.rationale, resolvedBy: r.resolved_by, at: r.at, attemptSha: r.attempt_sha ?? null, auto: r.auto ?? null,
 	});
 	private toLanding = (r: any): Landing => ({
 		sha: r.sha, parentSha: r.parent_sha, intentId: r.intent_id, attemptId: r.attempt_id, agent: r.agent, title: r.title,
@@ -790,7 +792,7 @@ export class Project extends DurableObject<BraidEnv> {
 		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", id)[0];
 		if (!row || !LIVE.has(row.status)) return;
 		let a = this.toAttempt(row);
-		const trunkLog = await this.trunkLog(), trunkHead = trunkLog[0];
+		const trunkLog = await this.trunkLog(), trunkHead = trunkLog[0], combining = await this.combining();
 		const head = (await this.host.log(a.repo, this.branch, 1))[0];
 		if (!head || !trunkHead) return;
 		let git: Observed | null = null;
@@ -805,7 +807,7 @@ export class Project extends DurableObject<BraidEnv> {
 				for (const f of files) {
 					const t = trunkFiles.get(f.path);
 					if (!t || t.head === f.head) continue;
-					if (predict(await this.text(a.repo, f.base), await this.text(this.trunk, t.head), await this.text(a.repo, f.head)).conflict) trunkConflicts.push(f.path);
+					if (predict(await this.text(a.repo, f.base), await this.text(this.trunk, t.head), await this.text(a.repo, f.head), combining && !GENERATED.test(f.path)).conflict) trunkConflicts.push(f.path);
 				}
 			}
 			git = { baseSha: base, headSha: head.hash, files, behind, trunkConflicts, trunkSeen: trunkHead.hash };
@@ -814,7 +816,7 @@ export class Project extends DurableObject<BraidEnv> {
 		const order = new Map(trunkLog.map((c, i) => [c.hash, i]));
 		const others = this.attempts().filter((o) => o.id !== id && LIVE.has(o.status) && o.intentId !== a.intentId);
 		const shared: Overlap[] = [];
-		for (const o of others) shared.push(...await fileOverlaps(a, o, order, (repo, hash) => this.text(repo, hash)));
+		for (const o of others) shared.push(...await fileOverlaps(a, o, order, (repo, hash) => this.text(repo, hash), combining));
 		this.recordObserved(id, row.head_sha, git, shared, new Map(others.map((o) => [o.id, o.headSha])));
 	}
 
@@ -990,6 +992,9 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("UPDATE attempts SET hosted = ?, hosted_detail = ? WHERE id = ?", state, detail, attemptId);
 		this.addEvents(attemptId, [{ kind: "system", text: state === "finished" ? "the agent finished and its sandbox was removed" : `the agent ${state}: ${detail}` }]);
 		this.note("attempt", "braid", state === "finished" ? `${a.agent} finished attempt ${a.id}; its sandbox was removed` : `${a.agent} on attempt ${a.id} ${state}: ${detail}`, a.intentId, a.id);
+		// An agent that was sent a conflict and left it open has had its turn. A person stopping it is a person taking over.
+		const left = this.rows<{ id: number }>("SELECT id FROM reconciliations WHERE attempt_id = ? AND status = 'open' AND auto = 'agent'", attemptId)[0];
+		if (left && state !== "stopped" && LIVE.has(a.status)) { await this.policy(); this.sendOn(left.id, a, "model"); }
 	}
 
 	// ── verification: each commit of an attempt is run in a sandbox ──────────
@@ -1017,6 +1022,16 @@ export class Project extends DurableObject<BraidEnv> {
 		const policy = { config: config && typeof config === "object" ? config : null, scripts: Object.keys(pkg?.scripts ?? {}) };
 		this.policyAt = { head, policy };
 		return policy;
+	}
+
+	/**
+	 * Whether a merge may keep both sides where both only added lines at the same place. Only when the result
+	 * will be run before it lands: a project with checks, and not turned off in trunk's braid.json (landing.combine).
+	 */
+	private async combining(): Promise<boolean> {
+		if (!this.env.RUNNER || (await this.policy()).config?.landing?.combine === false) return false;
+		const run = this.rows<any>("SELECT * FROM runs WHERE ref = 'trunk' AND status IN ('pass', 'fail') ORDER BY id DESC LIMIT 1")[0];
+		return !!run && !run.nothing_to_run;
 	}
 
 	private async startRun(ref: string, target: { repo: string; remote: string; sha: string; branch: string }, regenerate?: string[]) {
@@ -1514,6 +1529,41 @@ export class Project extends DurableObject<BraidEnv> {
 			this.noted("conflict", by, `Landing ${a.id} conflicted with trunk on ${paths.join(", ")}; reconciliation R${id} opened`, a.intentId, a.id),
 			this.settled("landing", "conflict", `Conflicts with trunk in ${paths.join(", ")}`, a, by, `R${id}`, String(entry.attempt_sha)),
 		] });
+		this.sendOn(id, a, "agent");
+	}
+
+	/**
+	 * A project can ask for conflicts to be worked on without waiting for a person (trunk's braid.json:
+	 * landing.conflicts = "auto"). The attempt's own agent is brought back first, if Braid can run it;
+	 * failing that, or if the agent leaves the conflict open, the model is asked. A person is needed only
+	 * when both have had their turn. Each is tried once for a reconciliation.
+	 */
+	private sendOn(reconId: number, a: Attempt, from: "agent" | "model") {
+		if (this.policyAt?.policy.config?.landing?.conflicts !== "auto") return;
+		const row = this.rows<any>("SELECT * FROM reconciliations WHERE id = ? AND status = 'open'", reconId)[0];
+		if (!row || row.auto === "model" || (from === "agent" && row.auto)) return;
+		const conflicts: Conflict[] = JSON.parse(row.conflicts);
+		if (conflicts.some((c) => c.kind === "delete")) return; // neither can answer a deleted file through the tools
+		const hosted = this.rows<{ hosted: string | null }>("SELECT hosted FROM attempts WHERE id = ?", a.id)[0]?.hosted;
+		const kind: HostedKind | null = a.kind === "codex" ? "codex" : a.kind === "claude" ? "claude" : null;
+		if (from === "agent" && kind && hosting(this.env)[kind] && hosted !== "starting" && hosted !== "running") {
+			try {
+				this.roomForAgent();
+				this.sql.exec("UPDATE reconciliations SET auto = 'agent' WHERE id = ?", reconId);
+				this.sql.exec("UPDATE attempts SET hosted = 'starting', hosted_detail = '' WHERE id = ?", a.id);
+				this.log.commit({
+					events: [this.noted("reconcile", "braid", `Bringing ${a.agent} back to attempt ${a.id} to reconcile R${reconId}, as this project asks`, a.intentId, a.id)],
+					effects: [{ id: `agent.start:${a.id}`, type: "agent.start", lane: `agent:${a.id}`, data: { attemptId: a.id, kind, task: "reconcile" } }],
+				});
+				return;
+			} catch {} // no room for another agent: the model is asked instead
+		}
+		if (!llmName(this.env)) return;
+		this.sql.exec("UPDATE reconciliations SET auto = 'model', status = 'resolving' WHERE id = ?", reconId);
+		this.log.commit({
+			events: [this.noted("reconcile", "braid", `Asking ${llmName(this.env)} to reconcile R${reconId}, as this project asks`, a.intentId, a.id)],
+			effects: [{ id: `model.reconcile:${reconId}`, type: "model.reconcile", lane: `model:${reconId}`, data: { reconId } }],
+		});
 	}
 
 	/**
@@ -1535,6 +1585,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (g.kind === "gone") return this.unqueue(entry);
 		if (g.kind === "refused") return this.refuse(entry, g.why);
 		const res = this.resolutionsFor(a), trunkHead = this.meta("head");
+		await this.policy();
 		const result = await prepare({
 			branch: this.branch,
 			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
@@ -1577,7 +1628,7 @@ export class Project extends DurableObject<BraidEnv> {
 	 * or lands at once when there is nothing left to verify.
 	 */
 	private async formBatch(): Promise<"again" | "idle"> {
-		const head = this.meta("head"), verifies = !!this.env.RUNNER;
+		const head = this.meta("head"), verifies = !!this.env.RUNNER, combining = await this.combining();
 		const cap = Math.min(32, Math.max(1, Number((await this.policy()).config?.landing?.batch) || BATCH));
 		const ready: any[] = [];
 		for (const entry of this.rows<any>("SELECT * FROM queue WHERE force = 0 AND batch_id IS NULL ORDER BY at, attempt_id")) {
@@ -1601,7 +1652,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (!members.length) return "idle";
 
 		const built = await chain({
-			branch: this.branch, expectTrunk: head,
+			branch: this.branch, expectTrunk: head, combining,
 			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
 			members: await Promise.all(members.map(async (m) => ({
 				id: m.a.id, attempt: { remote: m.a.remote, token: await this.host.token(m.a.repo, "read", 600) }, expect: String(m.entry.attempt_sha),
@@ -1646,8 +1697,8 @@ export class Project extends DurableObject<BraidEnv> {
 		const id = this.rows<{ id: number }>("INSERT INTO batches (trunk_sha, tip_sha, ref, state, size, target_sha, at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
 			head, built.tip, ref, direct ? "pushing" : "verifying", merged.length, direct ? built.tip : null, now())[0].id;
 		merged.forEach(({ m, step }, position) => {
-			this.sql.exec("UPDATE queue SET batch_id = ?, position = ?, state = ?, candidate_sha = ?, trunk_sha = ?, reconciled = ?, note = ? WHERE attempt_id = ? AND at = ?",
-				id, position, direct ? "pushing" : "verifying", step.sha, step.parentSha, json(step.reconciled), direct ? "landing" : `verifying the merge with trunk at ${short(head)}${merged.length > 1 ? `, together with ${merged.length - 1} other landing${merged.length === 2 ? "" : "s"}` : ""}`, m.a.id, m.entry.at);
+			this.sql.exec("UPDATE queue SET batch_id = ?, position = ?, state = ?, candidate_sha = ?, trunk_sha = ?, reconciled = ?, combined = ?, note = ? WHERE attempt_id = ? AND at = ?",
+				id, position, direct ? "pushing" : "verifying", step.sha, step.parentSha, json(step.reconciled), json(step.combined), direct ? "landing" : `verifying the merge with trunk at ${short(head)}${merged.length > 1 ? `, together with ${merged.length - 1} other landing${merged.length === 2 ? "" : "s"}` : ""}`, m.a.id, m.entry.at);
 			if (!direct) this.sql.exec("INSERT OR REPLACE INTO candidates (attempt_id, sha, trunk_sha, attempt_sha, at, run_ref, run_sha) VALUES (?, ?, ?, ?, ?, ?, ?)", m.a.id, step.sha, head, m.a.headSha, now(), `batch:${id}`, built.tip);
 		});
 		if (direct) {
@@ -1805,13 +1856,16 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const r of rows) {
 			if (this.rows("SELECT 1 FROM landings WHERE sha = ?", r.candidate_sha).length) continue;
 			const a = this.attempt(r.attempt_id), intent = this.intent(a.intentId);
-			await this.recordLanding(a, intent, String(r.by), String(r.candidate_sha), String(r.trunk_sha), JSON.parse(r.reconciled || "[]"), unverified);
+			await this.recordLanding(a, intent, String(r.by), String(r.candidate_sha), String(r.trunk_sha), JSON.parse(r.reconciled || "[]"), unverified, JSON.parse(r.combined || "[]"));
 		}
 		void batch;
 	}
 
 	/** Trunk has the landing commit: write down what it was, tell everyone affected, and keep the why. */
-	private async recordLanding(a: Attempt, intent: Intent, by: string, sha: string, parentSha: string, reconciled: string[], unverified = false) {
+	private async recordLanding(a: Attempt, intent: Intent, by: string, sha: string, parentSha: string, reconciled: string[], unverified = false, combined: string[] = []) {
+		// Kept with the attempt's decisions, so the lines it produced say how they came to stand next to trunk's.
+		if (combined.length) this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, 'braid', 'note', ?, ?, ?, ?, ?)", a.id, intent.id, "Both sides' additions kept",
+			`Trunk and this attempt both added lines at the same place in ${combined.join(", ")}. Neither changed the other's lines, so both were kept, trunk's first, and the result was verified before it landed.`, json(combined), sha, now());
 		this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
 		const files = a.files.map((f) => f.path);
 		this.sql.exec("INSERT OR REPLACE INTO landings (sha, parent_sha, intent_id, attempt_id, agent, title, files, reconciled, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1820,7 +1874,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.setStatus(a.id, "landed");
 		this.setMeta("head", sha);
 		this.log.commit({ events: [
-			this.noted("land", by, `Landed I${intent.id} (${a.agent}, attempt ${a.id}) on trunk as ${short(sha)}${reconciled.length ? `, reconciled ${reconciled.join(", ")}` : ""}${unverified ? ", forced without waiting for verification" : ""}`, intent.id, a.id),
+			this.noted("land", by, `Landed I${intent.id} (${a.agent}, attempt ${a.id}) on trunk as ${short(sha)}${reconciled.length ? `, reconciled ${reconciled.join(", ")}` : ""}${combined.length ? `, keeping both sides' additions in ${combined.join(", ")}` : ""}${unverified ? ", forced without waiting for verification" : ""}`, intent.id, a.id),
 			this.settled("landing", "landed", `Landed on trunk as ${short(sha)}`, a, by, sha, a.headSha),
 		] });
 		await this.retire(a.id);

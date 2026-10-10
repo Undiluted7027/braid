@@ -1,6 +1,6 @@
 // Three-way merge of git trees, by full path. Kept free of Worker-only imports so the tests can run it under Node.
 import git from "isomorphic-git";
-import { merge3, mergeJson, type ConflictRegion } from "./gitops.ts";
+import { combine, GENERATED, merge3, mergeJson, type ConflictRegion } from "./gitops.ts";
 
 export interface MergeConflict { path: string; kind: "content" | "delete"; base: string | null; trunk: string | null; attempt: string | null; regions: ConflictRegion[] }
 type Entry = { mode: string; path: string; oid: string; type: "blob" | "tree" | "commit" };
@@ -9,9 +9,10 @@ type Repo = { fs: any; dir: string };
 /**
  * Three-way merge of two trees by full path. A file both sides changed is merged as text, or taken
  * from `resolutions`. Returns the merged tree, or the conflicts if any file could not be merged.
+ * With `combining`, a file where both sides only added lines at the same place keeps both, trunk's first, and is listed in `combined`.
  */
-export async function mergeTrees(repo: Repo, base: string | null, trunk: string, attempt: string, resolutions: Map<string, string>) {
-	const conflicts: MergeConflict[] = [], reconciled: string[] = [];
+export async function mergeTrees(repo: Repo, base: string | null, trunk: string, attempt: string, resolutions: Map<string, string>, combining = false) {
+	const conflicts: MergeConflict[] = [], reconciled: string[] = [], combined: string[] = [];
 	const entries = async (oid: string | null) => new Map<string, Entry>(oid ? (await git.readTree({ ...repo, oid })).tree.map((e) => [e.path, e as Entry]) : []);
 	const text = async (e: Entry | undefined) => {
 		if (!e) return "";
@@ -42,6 +43,9 @@ export async function mergeTrees(repo: Repo, base: string | null, trunk: string,
 					const r = merge3(base, ours, theirs);
 					if (r.clean) merged = r.text;
 					else if (name === "package.json" && (merged = mergeJson(base, ours, theirs)) !== null) {}
+					// Only for a file both sides started from: two different new files of one name are not two additions to one file.
+					// And never a lockfile, which a package manager writes whole.
+					else if (combining && x && !GENERATED.test(name) && (merged = combine(base, ours, theirs)?.text ?? null) !== null) combined.push(path);
 					else conflicts.push({ path, kind: "content", base, trunk: ours, attempt: theirs, regions: r.regions });
 				}
 				// The side that changed the mode (made it executable, say) keeps it.
@@ -56,5 +60,5 @@ export async function mergeTrees(repo: Repo, base: string | null, trunk: string,
 		return out.length ? git.writeTree({ ...repo, tree: out }) : null;
 	};
 	const empty = () => git.writeTree({ ...repo, tree: [] });
-	return { tree: trunk === attempt ? trunk : (await merge(base, trunk, attempt, "")) ?? (await empty()), conflicts, reconciled };
+	return { tree: trunk === attempt ? trunk : (await merge(base, trunk, attempt, "")) ?? (await empty()), conflicts, reconciled, combined };
 }

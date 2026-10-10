@@ -1,7 +1,7 @@
 // Where two attempts at different intents meet: files both changed, and paths one plans to change
 // that the other has changed or also plans to. Computed for one pair at a time, so a push costs
 // the pairs it is part of and not every pair in the project.
-import { predict } from "./gitops.ts";
+import { GENERATED, predict } from "./gitops.ts";
 import type { Attempt, Overlap } from "../shared/types.ts";
 
 export const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
@@ -44,7 +44,7 @@ export function claimOverlaps(x: Side, y: Side): Overlap[] {
  * Files both attempts changed, each merged three ways to see whether they would conflict.
  * `order` is a commit's distance behind trunk's head; `text` reads a blob as text.
  */
-export async function fileOverlaps(x: Side, y: Side, order: Map<string, number>, text: (repo: string, hash: string | null) => Promise<string | null>): Promise<Overlap[]> {
+export async function fileOverlaps(x: Side, y: Side, order: Map<string, number>, text: (repo: string, hash: string | null) => Promise<string | null>, combining = false): Promise<Overlap[]> {
 	if (x.intentId === y.intentId) return [];
 	const [a, b] = ordered(x, y), out: Overlap[] = [];
 	const bFiles = new Map(b.files.map((f) => [f.path, f]));
@@ -55,7 +55,7 @@ export async function fileOverlaps(x: Side, y: Side, order: Map<string, number>,
 		// Merge against the older of the two bases: it is an ancestor of both.
 		const aOlder = (order.get(a.baseSha) ?? Infinity) >= (order.get(b.baseSha) ?? Infinity);
 		const base = aOlder ? await text(a.repo, fa.base) : await text(b.repo, fb.base);
-		const p = predict(base, await text(a.repo, fa.head), await text(b.repo, fb.head));
+		const p = predict(base, await text(a.repo, fa.head), await text(b.repo, fb.head), combining && !GENERATED.test(fa.path));
 		out.push({ a: a.id, b: b.id, path: fa.path, severity: p.conflict ? "conflict" : "touch", regions: p.regions });
 	}
 	return out;

@@ -108,6 +108,34 @@ export function merge3(base: string, ours: string, theirs: string): MergeResult 
 	return { clean: regions.length === 0, text, regions };
 }
 
+/** Files a tool writes whole. Their lines are not ours to put side by side. */
+export const GENERATED = /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|go\.sum)$/;
+
+/**
+ * Both sides put new lines at the same place and took nothing away there. That is not a disagreement:
+ * the two can stand one after the other. What stands there, trunk's lines first, or null when the
+ * place is a real conflict (either side changed or removed lines the other also touched).
+ * If one side's lines already contain the other's, they are kept once.
+ */
+export function bothAdded(region: Pick<ConflictRegion, "base" | "ours" | "theirs">): string | null {
+	if (region.base !== "" || region.ours === "" || region.theirs === "") return null;
+	if (region.ours.includes(region.theirs)) return region.ours;
+	if (region.theirs.includes(region.ours)) return region.theirs;
+	return closed(region.ours) + region.theirs;
+}
+
+/**
+ * A merge that keeps both sides wherever both only added lines at the same place. Returns the merged text and
+ * how many places were combined, or null when the file has a real conflict too: then it is left for a reconciliation whole.
+ */
+export function combine(base: string, ours: string, theirs: string): { text: string; places: number } | null {
+	const r = merge3(base, ours, theirs);
+	if (r.clean) return { text: r.text, places: 0 };
+	const pieces = r.regions.map(bothAdded);
+	if (pieces.some((p) => p === null)) return null;
+	return { text: assemble(base, ours, theirs, pieces as string[]), places: pieces.length };
+}
+
 /**
  * The merged file with `pieces[i]` in place of the i-th conflict, and everything both sides agree on
  * (including each side's changes elsewhere in the file) kept as the merge has it.
@@ -173,8 +201,11 @@ export function mergeJson(base: string, ours: string, theirs: string): string | 
 	return JSON.stringify(merged, null, /^([ \t]+)"/m.exec(ours)?.[1] ?? "\t") + (ours.endsWith("\n") ? "\n" : "");
 }
 
-/** Would these two versions of one file merge? null on either side means deleted (or binary). */
-export function predict(base: string | null, ours: string | null, theirs: string | null): { conflict: boolean; regions: number } {
+/**
+ * Would these two versions of one file merge? null on either side means deleted (or binary).
+ * With `combining`, places where both sides only added lines are not counted as conflicts, as at landing.
+ */
+export function predict(base: string | null, ours: string | null, theirs: string | null, combining = false): { conflict: boolean; regions: number } {
 	if (ours === theirs) return { conflict: false, regions: 0 };
 	if (ours === null || theirs === null || base === null) {
 		// add/add with different content, or delete on one side and edit on the other
@@ -182,5 +213,6 @@ export function predict(base: string | null, ours: string | null, theirs: string
 		return { conflict: !untouched, regions: untouched ? 0 : 1 };
 	}
 	const r = merge3(base, ours, theirs);
-	return { conflict: !r.clean, regions: r.regions.length };
+	const real = combining ? r.regions.filter((g) => bothAdded(g) === null).length : r.regions.length;
+	return { conflict: real > 0, regions: r.regions.length };
 }

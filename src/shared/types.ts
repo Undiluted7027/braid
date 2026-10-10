@@ -90,6 +90,8 @@ export interface Reconciliation {
 	trunkSha: string;
 	/** The attempt commit the conflict was found at. A resolution is only used for these two commits. */
 	attemptSha: string | null;
+	/** Set when the project sends conflicts on without waiting for a person: who was last asked. */
+	auto: "agent" | "model" | null;
 	conflicts: Conflict[];
 	resolutions: { path: string; content: string }[];
 	rationale: string;

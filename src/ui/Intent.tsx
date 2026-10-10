@@ -26,11 +26,13 @@ export function Why({ decisions, empty = "No decisions recorded.", answer }: { d
 		<ul className="decisions">
 			{decisions.map((d) => {
 				const person = d.kind === "feedback" || d.kind === "answer";
+				// Braid records a few things itself (keeping both sides' additions at a landing, a revert). They sit among the agent's decisions and must not read as the agent's.
+				const braid = d.agent === "braid";
 				return (
-					<li key={d.id} className={`${d.kind} ${person ? "from-person" : ""}`}>
-						<span className={`kind ${d.kind}`}><Icon name={KIND[d.kind][0]} size={12} />{KIND[d.kind][1]}</span>
+					<li key={d.id} className={`${d.kind} ${person ? "from-person" : ""} ${braid ? "from-braid" : ""}`}>
+						<span className={`kind ${braid ? "by-braid" : d.kind}`}><Icon name={braid ? "strands" : KIND[d.kind][0]} size={12} />{braid ? "Braid" : KIND[d.kind][1]}</span>
 						<div className="d-body">
-							<strong>{d.title}</strong>{person && <span className="dim"> · from {d.agent}</span>}
+							<strong>{d.title}</strong>{person && <span className="dim"> · from {d.agent}</span>}{braid && <span className="dim"> · done by Braid, not the agent</span>}
 							{d.body && <p>{d.body}</p>}
 							{d.files.length > 0 && <p className="d-files">{d.files.map((f) => <span key={f} className="mono"><Icon name="file" size={12} />{f}</span>)}</p>}
 							{answer && d.kind === "question" && !answered.has(d.title) && <AnswerBox send={(body) => answer(d, body)} />}
@@ -195,11 +197,27 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	const modelNote = resolving
 		? <p className="recon-model" role="status"><Icon name="running" className="spin" />{state.project.llm ?? "The model"} is reading both sides and their reasons. If it finds a resolution, that is run in a sandbox and then lands; if it cannot, the reason appears here.</p>
 		: failed ? <Notice small>{state.project.llm ?? "The model"} did not resolve this ({ago(failed.at)}): {sentence(failed.text)} The conflict is still open{state.viewer ? "." : ": try again, or resolve it below."}</Notice> : null;
+	// A project may have conflicts worked on without waiting for a person: the attempt's agent first, then the model. `auto` is who was last asked that way.
+	const auto = r.auto ?? null, who = owner?.agent ?? "the attempt's agent", model = state.project.llm ?? "the model";
+	const autoNote = !auto ? null : (
+		<p className="recon-who" role="status">
+			<Icon name={auto === "agent" ? "agent" : "reconcile"} />
+			<span>
+				<strong>This project sends conflicts to the agent first, then the model, before asking a person.</strong>{" "}
+				{auto === "agent"
+					? agentBusy ? `So ${who} was brought back to resolve this one. If it leaves the conflict open, ${model} is asked next.`
+						: `${who} was brought back and left this one open.${state.project.llm ? ` ${model} is asked next.` : " No model is set up, so it now needs a person."}`
+					: resolving ? `${who} had its turn and left this one open, so ${model} was asked.`
+						: "The agent and the model have both had their turn and this one is still open. It now needs a person."}
+			</span>
+		</p>
+	);
 	if (state.viewer) {
 		return (
 			<section className="panel recon" aria-label={`Reconciliation ${r.id}`}>
 				<h2><span className="chip conflict">conflict</span>Attempt {r.attemptId} and trunk changed the same lines</h2>
 				<p className="lede">Landing stopped on {r.conflicts.map((c) => c.path).join(", ")}. Someone signed in has to resolve it with both intents in view.</p>
+				{autoNote}
 				{modelNote}
 			</section>
 		);
@@ -208,6 +226,7 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 		<section className="panel recon open" aria-label={`Reconciliation ${r.id}`}>
 			<h2><span className="chip conflict">conflict</span>Attempt {r.attemptId} and trunk changed the same lines</h2>
 			<p className="lede">Git could not merge these lines. Each side is shown with the intent it served and the decisions behind it, so the resolution can keep both. The merged result is run in a sandbox before it lands.</p>
+			{autoNote}
 			<div className="recon-auto">
 				<span className="label">Let something else resolve it</span>
 				{state.project.llm && (

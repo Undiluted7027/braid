@@ -102,9 +102,12 @@ With AI Gateway or `ANTHROPIC_API_KEY` set, the "Reconcile with a model" button 
 - **Durable Object, one per project** (`src/worker/project.ts`): all coordination state in SQLite (intents, attempts, why log, overlaps, reconciliations, landings), WebSocket fan-out to the UI, and the only writer to trunk, so landings are serialized.
 - **Artifacts**: trunk is a repo; every attempt is a fork (`<project>--i<intent>-a<n>-<id>`). Reads use the Workers binding (`log`, `readTree`, `readBlob`, `readFile`, `fork`, `createToken`). The binding cannot write, so landing fetches trunk and the attempt into an in-memory repo with isomorphic-git, merges, and pushes over the Git protocol (`src/worker/land.ts`).
 - **Workflow on push events** (`PushWorkflow`): a `cf.artifacts.repo.pushed` trigger on the whole namespace starts a Workflow for every push, which tells the owning project to re-read that attempt and recompute overlaps. Agents also call `checkpoint` after pushing, which does the same thing synchronously.
-- **Landing queue** (in the project object): "Land this" is a request for the commit on screen. Requests are tried one at a time, in order.
+- **Landing queue** (in the project object): "Land this" is a request for the commit on screen. It is written down and answered at once; a worker in the project object does the rest, and how it turned out shows on the attempt.
   - The attempt's own commit must have passed. If the attempt started from trunk's head, its merge is the tree that passed, and it lands at once.
-  - Otherwise Braid builds the merge commit, parks it on the attempt's repository, and runs it in a sandbox. Trunk moves to it only if it passes, so two changes that each pass and break each other in different files are caught before trunk has them. A reconciled merge is verified the same way.
+  - Otherwise Braid builds the merge commit, parks it on a staging repository, and runs it in a sandbox. Trunk moves to it only if it passes, so two changes that each pass and break each other in different files are caught before trunk has them. A reconciled merge is verified the same way.
+  - Landings that are ready together are verified together: trunk + A, that + B, that + C, with one run of the last merge. If it passes they all land, each as its own commit. If it fails, every step is run at once: those before the first failure land, that one is refused, and the rest are merged again. Up to eight at a time.
+  - Where trunk and an attempt both added lines at the same place and neither changed the other's, both are kept, trunk's first, and the result is run like any merge. A place where either side changed or removed the other's lines is a conflict and opens a reconciliation.
+  - Settings, in trunk's `braid.json`: `"landing": { "batch": 8, "combine": true, "conflicts": "person" }`. With `"conflicts": "auto"` a conflict goes to the attempt's own agent first (if Braid runs it), then to the model, and to a person only after both.
   - If the attempt moves after landing was asked for, the request is dropped. A saved resolution is only used for the two commits it was written against.
   - While trunk is failing, only an attempt whose merge passes (one that fixes it) lands.
   - "Land now" skips all of this, and the landing is recorded as forced.
@@ -132,7 +135,7 @@ Every response carries `heads_up`: overlaps, messages from other agents, and tru
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`). A rename shows up as exactly that.
 - Lockfiles are regenerated for npm and pnpm only.
-- A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks; nothing does that automatically.
+- A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks. Only a conflict can bring it back by itself, and only in a project that asks for that (`landing.conflicts`).
 - Reverting a landing adds one commit that undoes it and reopens the intent. It is refused if a later landing changed the same lines, and the revert itself is verified on trunk afterwards, not before.
 - Braid refuses a resolution that is identical to one side unless told that is intended.
 - One merge is verified at a time, so landings queue behind each other; each takes as long as the project's checks.
