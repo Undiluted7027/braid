@@ -153,3 +153,96 @@ export async function commitFiles(remote: string, token: string, branch: string,
 	if (!push.ok) throw new Error(`push rejected: ${JSON.stringify(push.refs)}`);
 	return sha;
 }
+
+export interface ChainMember {
+	id: string;
+	attempt: { remote: string; token: string };
+	/** The attempt's commit this landing was asked for. */
+	expect: string;
+	message: string;
+	author: Author;
+	/** Reconciled file contents. Only the first member may carry any: they were written against trunk as it is. */
+	resolutions: Map<string, string>;
+}
+export type ChainStep =
+	| { id: string; ok: true; sha: string; parentSha: string; attemptSha: string; reconciled: string[]; sameTree: boolean }
+	| { id: string; ok: false; reason: "conflict"; againstTrunk: boolean; onto: string; attemptSha: string; conflicts: MergeConflict[] }
+	| { id: string; ok: false; reason: "nothing-to-land" }
+	| { id: string; ok: false; reason: "moved"; found: string };
+export type Chain =
+	| { ok: false; reason: "moved"; found: string }
+	| { ok: true; trunkSha: string; steps: ChainStep[]; tip: string | null; push(): Promise<void>; stage(remote: string, token: string, ref: string): Promise<void> };
+
+/**
+ * Merge several attempts into trunk one after another, each on top of the one before: trunk + A, that + B,
+ * that + C. Every step is the landing commit that attempt would have had landing in that order, so running
+ * the last one runs them all together, and trunk can move to any step. A member that conflicts with what is
+ * ahead of it, has moved, or adds nothing is left out and the chain goes on without it. Nothing is pushed yet.
+ */
+export async function chain(input: { branch: string; trunk: { remote: string; token: string }; expectTrunk: string; members: ChainMember[] }): Promise<Chain> {
+	const { branch } = input;
+	const fs = new MemoryFS(), repo = { fs, dir };
+	await fs.promises.mkdir(dir);
+	await git.init({ fs, dir, defaultBranch: branch });
+	await git.addRemote({ fs, dir, remote: "trunk", url: input.trunk.remote });
+	await git.fetch({ fs, http, dir, remote: "trunk", ref: branch, singleBranch: true, onAuth: gitAuth(input.trunk.token) });
+	const trunkSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/trunk/${branch}` });
+	if (trunkSha !== input.expectTrunk) return { ok: false, reason: "moved", found: trunkSha };
+	const treeOf = async (oid: string) => (await git.readCommit({ fs, dir, oid })).commit.tree;
+
+	const steps: ChainStep[] = [];
+	let onto = trunkSha;
+	for (const [i, m] of input.members.entries()) {
+		const remote = `m${i}`;
+		await git.addRemote({ fs, dir, remote, url: m.attempt.remote });
+		await git.fetch({ fs, http, dir, remote, ref: branch, singleBranch: true, onAuth: gitAuth(m.attempt.token) });
+		const attemptSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/${remote}/${branch}` });
+		if (attemptSha !== m.expect) { steps.push({ id: m.id, ok: false, reason: "moved", found: attemptSha }); continue; }
+		if (onto === attemptSha || await git.isDescendent({ fs, dir, oid: onto, ancestor: attemptSha, depth: -1 })) { steps.push({ id: m.id, ok: false, reason: "nothing-to-land" }); continue; }
+		const baseSha = ((await git.findMergeBase({ fs, dir, oids: [onto, attemptSha] })) as string[])[0];
+		const merged = await mergeTrees(repo, baseSha ? await treeOf(baseSha) : null, await treeOf(onto), await treeOf(attemptSha), m.resolutions);
+		if (merged.conflicts.length) { steps.push({ id: m.id, ok: false, reason: "conflict", againstTrunk: onto === trunkSha, onto, attemptSha, conflicts: merged.conflicts }); continue; }
+		const who = { ...m.author, timestamp: Math.floor(Date.now() / 1000), timezoneOffset: 0 };
+		const sha = await git.writeCommit({ fs, dir, commit: { message: `${m.message.trimEnd()}\n`, tree: merged.tree, parent: [onto, attemptSha], author: who, committer: who } });
+		// An attempt that started from exactly the commit it lands on merges to its own tree, which has already been run.
+		steps.push({ id: m.id, ok: true, sha, parentSha: onto, attemptSha, reconciled: merged.reconciled, sameTree: baseSha === onto && merged.reconciled.length === 0 });
+		onto = sha;
+	}
+	const tip = onto === trunkSha ? null : onto;
+	const send = async (url: string, token: string, ref: string, force: boolean) => {
+		if (!tip) return;
+		await git.writeRef({ fs, dir, ref: `refs/heads/${ref}`, value: tip, force: true });
+		const push = await git.push({ fs, http, dir, url, ref, force, onAuth: gitAuth(token) });
+		if (!push.ok) throw new Error(`push of ${ref} rejected: ${JSON.stringify(push.refs)}`);
+	};
+	return { ok: true, trunkSha, steps, tip, push: () => send(input.trunk.remote, input.trunk.token, branch, false), 
+		// The staging repository's own branch is moved too: a repository whose HEAD names no commit cannot be fetched from.
+		stage: async (remote, token, ref) => { await send(remote, token, ref, true); await send(remote, token, branch, true); },
+	};
+}
+
+/**
+ * Move trunk to a commit of a chain that was parked under `ref` on the staging repository: the tip, or
+ * any step before it. Trunk only moves forward: if it is no longer where the chain was built from, nothing happens.
+ */
+export async function promoteFrom(input: { branch: string; trunk: { remote: string; token: string }; staging: { remote: string; token: string; ref: string }; sha: string; parentSha: string }): Promise<{ ok: true } | { ok: false; found: string }> {
+	const { branch } = input;
+	const fs = new MemoryFS();
+	await fs.promises.mkdir(dir);
+	await git.init({ fs, dir, defaultBranch: branch });
+	await git.addRemote({ fs, dir, remote: "trunk", url: input.trunk.remote });
+	await git.addRemote({ fs, dir, remote: "staging", url: input.staging.remote });
+	await git.fetch({ fs, http, dir, remote: "trunk", ref: branch, singleBranch: true, onAuth: gitAuth(input.trunk.token) });
+	const trunkSha = await git.resolveRef({ fs, dir, ref: `refs/remotes/trunk/${branch}` });
+	if (trunkSha === input.sha) return { ok: true };
+	if (trunkSha !== input.parentSha) return { ok: false, found: trunkSha };
+	await git.fetch({ fs, http, dir, remote: "staging", ref: input.staging.ref, singleBranch: true, onAuth: gitAuth(input.staging.token) });
+	// The commit asked for must be in what was parked, and must stand on the trunk it was built from.
+	const parked = await git.resolveRef({ fs, dir, ref: `refs/remotes/staging/${input.staging.ref}` });
+	if (parked !== input.sha && !(await git.isDescendent({ fs, dir, oid: parked, ancestor: input.sha, depth: -1 }))) return { ok: false, found: trunkSha };
+	if (!(await git.isDescendent({ fs, dir, oid: input.sha, ancestor: trunkSha, depth: -1 }))) return { ok: false, found: trunkSha };
+	await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: input.sha, force: true });
+	const push = await git.push({ fs, http, dir, url: input.trunk.remote, ref: branch, onAuth: gitAuth(input.trunk.token) });
+	if (!push.ok) throw new Error(`push to trunk rejected: ${JSON.stringify(push.refs)}`);
+	return { ok: true };
+}

@@ -5,7 +5,7 @@ import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
 import { asText, assemble, diffTrees, listTree, markedView, merge3, mergeBase, predict } from "./gitops";
 import { claimMatches, claimOverlaps, fileOverlaps, risen, strongest } from "./overlap.ts";
-import { CANDIDATE, commitFiles, prepare, promote, revert, seed } from "./land";
+import { CANDIDATE, chain, commitFiles, prepare, promoteFrom, revert, seed, type ChainStep } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
@@ -33,6 +33,10 @@ const SPARE_FORKS = 2, SPARE_FORKS_MAX = 8;
 const SPARE_SETTLE_MS = 15_000;
 /** How long `checkpoint` and `ready` wait for Braid to read the caller's own latest push before answering with what it has. */
 const OBSERVE_WAIT_MS = 4000;
+/** How many landings are merged and verified together, unless trunk's braid.json says otherwise (landing.batch). */
+const BATCH = 8;
+/** A merge that has not been verified in this long is given up on. */
+const VERIFY_LIMIT_MS = 45 * 60_000;
 const MAX_TEXT = 400_000;
 const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
@@ -100,6 +104,7 @@ export class Project extends DurableObject<BraidEnv> {
 				candidate_sha TEXT, trunk_sha TEXT, reconciled TEXT);
 			CREATE TABLE IF NOT EXISTS candidates (attempt_id TEXT PRIMARY KEY, sha TEXT, trunk_sha TEXT, attempt_sha TEXT, at INTEGER);
 			CREATE TABLE IF NOT EXISTS spares (repo TEXT PRIMARY KEY, remote TEXT, base_sha TEXT, at INTEGER);
+			CREATE TABLE IF NOT EXISTS batches (id INTEGER PRIMARY KEY AUTOINCREMENT, trunk_sha TEXT, tip_sha TEXT, ref TEXT, state TEXT, size INTEGER, target_sha TEXT, at INTEGER);
 			CREATE TABLE IF NOT EXISTS outcomes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, outcome TEXT, text TEXT, attempt_id TEXT, intent_id INTEGER, by TEXT, ref TEXT, at INTEGER, sha TEXT DEFAULT '');
 		`);
 		// Added after the first projects existed.
@@ -111,6 +116,14 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN revert_of TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE registry ADD COLUMN public INTEGER DEFAULT 0"); } catch {}
 		try { this.sql.exec("ALTER TABLE outcomes ADD COLUMN sha TEXT DEFAULT ''"); } catch {}
+		try {
+			this.sql.exec("ALTER TABLE queue ADD COLUMN batch_id INTEGER");
+			this.sql.exec("ALTER TABLE queue ADD COLUMN position INTEGER");
+			this.sql.exec("ALTER TABLE candidates ADD COLUMN run_ref TEXT");
+			this.sql.exec("ALTER TABLE candidates ADD COLUMN run_sha TEXT");
+			// A merge that an older version was verifying on the attempt's own repository is built again, in a batch.
+			this.sql.exec("UPDATE queue SET state = 'waiting', candidate_sha = NULL WHERE state = 'verifying'");
+		} catch {}
 		this.log.schema();
 		// Before the outbox, landings whose context copy failed were kept on a list and tried at the next landing.
 		const owed: string[] = (() => { try { return JSON.parse(this.meta("context_pending") || "[]"); } catch { return []; } })();
@@ -253,7 +266,11 @@ export class Project extends DurableObject<BraidEnv> {
 			},
 		},
 		"trunk.observe": { replaySafe: true, run: async () => { if (this.trunk) await this.readTrunk(); } },
-		"run.start": { replaySafe: true, run: async (effect) => { if (this.trunk && (effect.data.ref === "trunk" || this.rows("SELECT 1 FROM attempts WHERE id = ?", effect.data.ref).length)) await this.verify(effect.data.ref); } },
+		"run.start": { replaySafe: true, run: async (effect) => {
+			// While a batch is being written down trunk's head passes through each of its landings; trunk is looked at once that is done.
+			if (effect.data.ref === "trunk" && this.rows("SELECT 1 FROM batches WHERE state = 'pushing' LIMIT 1").length) return;
+			if (this.trunk && (effect.data.ref === "trunk" || this.rows("SELECT 1 FROM attempts WHERE id = ?", effect.data.ref).length)) await this.verify(effect.data.ref);
+		} },
 		// Everything that moves trunk shares one lane, so it happens one at a time and in the order asked.
 		"queue.advance": { replaySafe: true, run: async () => { if (this.trunk) await this.advance(); } },
 		"landing.revert": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doRevert(effect.data.sha, effect.data.by, effect.data.reason); } },
@@ -461,7 +478,7 @@ export class Project extends DurableObject<BraidEnv> {
 	/** Delete the project. With `keepRepos`, forget it here and leave its repositories, for a project that has moved. */
 	async destroy(keepRepos = false) {
 		this.requireProject();
-		for (const repo of keepRepos ? [] : [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo), ...this.rows<{ repo: string }>("SELECT repo FROM spares").map((r) => r.repo)]) {
+		for (const repo of keepRepos ? [] : [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo), ...this.rows<{ repo: string }>("SELECT repo FROM spares").map((r) => r.repo), `${this.meta("slug")}--landing`]) {
 			try { await this.host.remove(repo); } catch {}
 		}
 		for (const { id } of this.rows<{ id: string }>("SELECT id FROM attempts WHERE hosted IS NOT NULL")) {
@@ -483,8 +500,12 @@ export class Project extends DurableObject<BraidEnv> {
 				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env), public: this.meta("public") === "1",
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
-			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note })),
-			candidates: this.rows<any>("SELECT * FROM candidates").map((c) => ({ attemptId: c.attempt_id, sha: c.sha, trunkSha: c.trunk_sha, attemptSha: c.attempt_sha })),
+			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note, batch: q.batch_id ?? null })),
+			batches: this.rows<any>("SELECT * FROM batches ORDER BY id").map((b) => ({
+				id: b.id, trunkSha: b.trunk_sha, tipSha: b.tip_sha, state: b.state, at: b.at,
+				members: this.rows<{ attempt_id: string }>("SELECT attempt_id FROM queue WHERE batch_id = ? ORDER BY position", b.id).map((r) => r.attempt_id),
+			})),
+			candidates: this.rows<any>("SELECT * FROM candidates").map((c) => ({ attemptId: c.attempt_id, sha: c.sha, trunkSha: c.trunk_sha, attemptSha: c.attempt_sha, runRef: c.run_ref ?? `land:${c.attempt_id}`, runSha: c.run_sha ?? c.sha })),
 			intents: this.intents(),
 			attempts: this.attempts().map((a) => ({ ...a, now: this.latestEvent(a.id) })),
 			decisions: this.rows("SELECT * FROM decisions ORDER BY id").map(this.toDecision),
@@ -1034,6 +1055,19 @@ export class Project extends DurableObject<BraidEnv> {
 			run.status, json(run.steps), run.preview ? 1 : 0, run.previewApi ? 1 : 0, run.nothingToRun ? 1 : 0, run.error ?? null, run.finishedAt ?? null, runId);
 		if (!patch.finishedAt || run.status === "superseded") return this.broadcast();
 
+		const checked = (run.steps.filter((s) => s.name !== "clone" && s.name !== "install").length ? run.steps.filter((s) => s.name !== "clone" && s.name !== "install") : run.steps).map((s) => `${s.name} ${s.status === "pass" ? "✓" : "✗"}`).join(" · ");
+		const result = run.status === "error" ? `could not run: ${run.error}` : run.nothingToRun ? "nothing to run" : checked;
+		if (run.ref.startsWith("batch:")) {
+			// The merge of a batch of landings, or one step of it. The queue decides what follows.
+			const [, id, position] = run.ref.split(":");
+			const members = this.rows<{ attempt_id: string; position: number }>("SELECT attempt_id, position FROM queue WHERE batch_id = ? ORDER BY position", Number(id));
+			const one = position === undefined ? null : members.find((m) => m.position === Number(position));
+			const what = one ? `attempt ${one.attempt_id} as merged in its batch` : members.length === 1 ? `attempt ${members[0].attempt_id} merged with trunk` : `attempts ${members.map((m) => m.attempt_id).join(", ")} merged with trunk together`;
+			const about = one ?? (members.length === 1 ? members[0] : null), a = about ? this.attempt(about.attempt_id) : null;
+			this.log.commit({ events: [this.noted("verify", "braid", `Verified ${what} at ${short(run.sha)}: ${result}`, a?.intentId ?? null, a?.id ?? null)], effects: this.advanceEffect() });
+			this.broadcast();
+			return;
+		}
 		const merged = run.ref.includes(":"), locking = run.ref.startsWith("lock:");
 		const a = run.ref === "trunk" ? null : this.attempt(run.ref.slice(run.ref.indexOf(":") + 1));
 		if (a && locking) {
@@ -1079,11 +1113,11 @@ export class Project extends DurableObject<BraidEnv> {
 		if (run.sha !== a.headSha) return { status: "pending", note: "your latest commit has not been verified yet" };
 		// Before it lands, the commit is also run merged with trunk. A failure there is the agent's to fix too.
 		const candidate = this.rows<any>("SELECT * FROM candidates WHERE attempt_id = ? AND attempt_sha = ? AND trunk_sha = ?", a.id, a.headSha, this.meta("head"))[0];
-		const merged = candidate ? this.latestRun(`land:${a.id}`) : null;
+		const merged = candidate?.run_ref ? this.latestRun(candidate.run_ref) : null;
 		return {
 			status: run.status, commit: short(run.sha), steps: run.steps.map((s) => ({ step: s.name, status: s.status, exit_code: s.exitCode })),
 			...(run.status === "queued" || run.status === "running" ? { note: "still running; a failure will arrive in heads_up" } : {}),
-			...(merged && merged.sha === candidate.sha ? { merged_with_trunk: {
+			...(merged && merged.sha === candidate.run_sha ? { merged_with_trunk: {
 				status: merged.status, trunk: short(candidate.trunk_sha),
 				steps: merged.steps.map((s) => ({ step: s.name, status: s.status, exit_code: s.exitCode, ...(s.status === "fail" ? { command: s.command, output: s.tail.slice(-2000) } : {}) })),
 				...(merged.status === "fail" ? { note: "Your commit passes alone but fails once merged with trunk. Merge trunk into your attempt (`sync`), fix it, push, and checkpoint." } : {}),
@@ -1381,7 +1415,9 @@ export class Project extends DurableObject<BraidEnv> {
 		if (sha && sha !== a.headSha) throw new BraidError(`attempt ${a.id} has moved to ${short(a.headSha)} since you looked at ${short(sha)}; review it again before landing`, 409);
 		// Only written down here. The worker reads the attempt once more, and the queue decides against what it finds.
 		const before = this.rows<any>("SELECT * FROM queue WHERE attempt_id = ?", a.id)[0];
-		if (before && before.attempt_sha === a.headSha) this.sql.exec("UPDATE queue SET force = ?, by = ? WHERE attempt_id = ?", force || before.force ? 1 : 0, by, a.id);
+		if (before?.state === "pushing") return { landed: false, queued: true, waiting: "landing now" };
+		// "Land now" on something being verified with others takes it out of that batch, which is then built again without it.
+		if (before && before.attempt_sha === a.headSha) this.sql.exec(`UPDATE queue SET force = ?, by = ?${force && before.batch_id ? ", batch_id = NULL, position = NULL, state = 'waiting', candidate_sha = NULL" : ""} WHERE attempt_id = ?`, force || before.force ? 1 : 0, by, a.id);
 		else this.sql.exec("INSERT OR REPLACE INTO queue (attempt_id, by, at, attempt_sha, force, state, note) VALUES (?, ?, ?, ?, ?, 'waiting', '')", a.id, by, now(), a.headSha, force ? 1 : 0);
 		this.log.commit({ effects: [this.observeEffect(a.id), ...this.advanceEffect()] });
 		this.broadcast();
@@ -1400,182 +1436,378 @@ export class Project extends DurableObject<BraidEnv> {
 
 	/**
 	 * Move the landing queue as far as it will go. Run by the worker, one at a time. Safe to run at any
-	 * time, and again after being cut off: every step reads what is true now, and the queue row says
-	 * how far a landing had got.
+	 * time, and again after being cut off: every step reads what is true now, and the queue and batch
+	 * rows say how far things had got.
+	 *
+	 * Landings that are ready are merged one on top of the other and verified together with one run of
+	 * the last merge (a batch). "Land now" goes alone and first.
 	 */
 	private async advance(): Promise<void> {
-		for (let moved = true, rounds = 0; moved && rounds < 50; rounds++) {
-			moved = false;
-			for (const entry of this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id")) {
-				const step = await this.tryLanding(entry);
-				// The request this step was for was taken back meanwhile (cancelled, sent back, or asked again): nothing here applies to it.
-				if (step.kind === "gone" && !this.held(entry)) continue;
-				if (step.kind === "wait" || step.kind === "hold") {
-					this.sql.exec("UPDATE queue SET note = ? WHERE attempt_id = ? AND at = ?", step.why, entry.attempt_id, entry.at);
-					if (step.kind === "wait") continue;
-					// One merge is verified at a time: whatever lands next changes what the others must be merged with.
-					this.sql.exec("UPDATE queue SET note = ? WHERE attempt_id != ? AND state = 'waiting' AND force = 0 AND note = ''", `behind attempt ${entry.attempt_id} in the landing queue`, entry.attempt_id);
-					break;
-				}
-				this.sql.exec("DELETE FROM queue WHERE attempt_id = ? AND at = ?", entry.attempt_id, entry.at);
-				if (step.kind === "landed") {
-					moved = true; // trunk moved, so start again from the front
-					break;
-				}
-				const a = this.attempt(entry.attempt_id);
-				if (step.kind === "conflict") this.log.commit({ events: [this.settled("landing", "conflict", `Conflicts with trunk in ${step.paths.join(", ")}`, a, String(entry.by), `R${step.id}`, String(entry.attempt_sha))] });
-				if (step.kind === "refused") this.log.commit({ events: [this.noted("land", "braid", `Attempt ${a.id} was not landed: ${step.why}`, a.intentId, a.id), this.settled("landing", "refused", step.why, a, String(entry.by), "", a.headSha)] });
-			}
+		for (let rounds = 0; rounds < 60; rounds++) {
+			// "Land now", and a landing an older version was pushing when it stopped, go alone and ahead of everything.
+			const solo = this.rows<any>("SELECT * FROM queue WHERE batch_id IS NULL AND (force = 1 OR state = 'pushing') ORDER BY at, attempt_id LIMIT 1")[0];
+			if (solo) { await this.landAlone(solo); continue; }
+			const batch = this.rows<any>("SELECT * FROM batches ORDER BY id LIMIT 1")[0];
+			if (batch) { if ((await this.batchStep(batch)) === "hold") break; continue; }
+			if ((await this.formBatch()) !== "again") break;
 		}
 		this.broadcast();
 	}
 
 	/** Whether the request a landing step is working on is still the one in the queue. Asked again after every wait on git. */
 	private held(entry: any) { return this.rows("SELECT 1 FROM queue WHERE attempt_id = ? AND at = ?", entry.attempt_id, entry.at).length > 0; }
+	private failedSteps(run: Run) { return run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", "); }
+	private setNote(entry: any, note: string) { this.sql.exec("UPDATE queue SET note = ? WHERE attempt_id = ? AND at = ?", note, entry.attempt_id, entry.at); }
+	private unqueue(entry: any) { this.sql.exec("DELETE FROM queue WHERE attempt_id = ? AND at = ?", entry.attempt_id, entry.at); }
 
-	/** One queued landing, one step. */
-	private async tryLanding(entry: any): Promise<
-		{ kind: "wait" | "hold" | "refused"; why: string } | { kind: "landed"; sha: string } | { kind: "conflict"; id: number; paths: string[] } | { kind: "gone" }
-	> {
-		// The row is read again: it was listed before the entries ahead of it were worked on.
-		entry = this.rows<any>("SELECT * FROM queue WHERE attempt_id = ? AND at = ?", entry.attempt_id, entry.at)[0];
-		if (!entry) return { kind: "gone" };
-		const a = this.attempt(entry.attempt_id), intent = this.intent(a.intentId), by = String(entry.by), forced = !!entry.force;
-		const failed = (run: Run) => run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ");
+	/** A landing that will not happen: taken out of the queue, with the reason where the person and the agent can see it. */
+	private refuse(entry: any, why: string) {
+		if (!this.held(entry)) return;
+		this.unqueue(entry);
+		const a = this.attempt(entry.attempt_id);
+		this.log.commit({ events: [this.noted("land", "braid", `Attempt ${a.id} was not landed: ${why}`, a.intentId, a.id), this.settled("landing", "refused", why, a, String(entry.by), "", a.headSha)] });
+	}
 
+	/** What can be told about a queued landing without reading anything: whether it can be merged now. */
+	private gate(entry: any): { kind: "ready" | "gone" } | { kind: "wait" | "refused"; why: string } {
+		const a = this.attempt(entry.attempt_id), intent = this.intent(a.intentId);
+		if (!LIVE.has(a.status) || intent.status !== "open") return { kind: "gone" };
+		if (a.headSha !== entry.attempt_sha) return { kind: "refused", why: `attempt ${a.id} moved to ${short(a.headSha)} after landing was asked for at ${short(entry.attempt_sha)}; review it and land again` };
+		if (!this.env.RUNNER || entry.force) return { kind: "ready" };
+		const own = this.latestRun(a.id);
+		if (!own || own.sha !== a.headSha || own.status === "queued" || own.status === "running") return { kind: "wait", why: `waiting for ${short(a.headSha)} to be verified` };
+		if (own.status === "fail") return { kind: "refused", why: `attempt ${a.id} failed verification at ${short(a.headSha)} (${this.failedSteps(own)}); land it anyway with force` };
+		if (own.status !== "pass") return { kind: "refused", why: `attempt ${a.id} could not be verified at ${short(a.headSha)}${own.error ? ` (${own.error})` : ""}; run the verification again, or land it anyway with force` };
+		// A lockfile being regenerated for this trunk and this commit: wait for it, then merge with what came back.
+		if (entry.state === "locking") {
+			const run = this.latestRun(`lock:${a.id}`);
+			if (entry.trunk_sha === this.meta("head") && run && run.sha === entry.candidate_sha) {
+				if ((run.status === "queued" || run.status === "running") && now() - run.startedAt < VERIFY_LIMIT_MS) return { kind: "wait", why: "regenerating the lockfile from the merged package.json" };
+				if (run.status !== "pass") return { kind: "refused", why: `both sides changed dependencies and the lockfile could not be regenerated${run.error ? ` (${run.error})` : this.failedSteps(run) ? ` (${this.failedSteps(run)} failed)` : ""}. Merge trunk into the attempt with git and run the install there` };
+			}
+			this.sql.exec("UPDATE queue SET state = 'waiting', candidate_sha = NULL WHERE attempt_id = ? AND at = ?", a.id, entry.at);
+		}
+		return { kind: "ready" };
+	}
+
+	/** Every resolution still standing for an attempt against trunk as it is: what a person, an agent or a model wrote, and any lockfile Braid regenerated. */
+	private resolutionsFor(a: Attempt): Resolutions {
+		// A saved resolution is only for the two commits it was written against.
+		this.sql.exec("UPDATE reconciliations SET status = 'stale' WHERE attempt_id = ? AND status = 'resolved' AND (trunk_sha != ? OR COALESCE(attempt_sha, ?) != ?)", a.id, this.meta("head"), a.headSha, a.headSha);
+		const resolved = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id", a.id).map(this.toRecon);
+		return { recon: resolved.filter((r) => r.resolvedBy !== "braid").pop() ?? null, map: new Map(resolved.flatMap((r) => r.resolutions.map((x) => [x.path, x.content] as [string, string]))) };
+	}
+	private authorOf(a: Attempt) { return { name: a.agent, email: `${a.agent.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@agents.braid.dev` }; }
+
+	/** A landing conflicts with trunk as it is: open a reconciliation for it and take it out of the queue. */
+	private openReconciliation(entry: any, a: Attempt, found: { path: string }[], trunkSha: string, attemptSha: string, lockfilesHandled: boolean) {
+		const conflicts: Conflict[] = (found as any[]).map((c) => ({ ...c, ...(LOCKFILE.test(c.path) && lockfilesHandled ? { kind: "lockfile" as const, base: null, trunk: null, attempt: null, regions: [] } : {}), trunkWhy: this.trunkWhy(a.baseSha, c.path) }));
+		const paths = conflicts.map((c) => c.path), by = String(entry.by);
+		this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
+		this.sql.exec("INSERT INTO reconciliations (attempt_id, intent_id, status, trunk_sha, attempt_sha, conflicts, resolutions, rationale, resolved_by, at) VALUES (?, ?, 'open', ?, ?, ?, '[]', '', '', ?)",
+			a.id, a.intentId, trunkSha, attemptSha, json(conflicts), now());
+		const id = this.rows<{ id: number }>("SELECT id FROM reconciliations ORDER BY id DESC LIMIT 1")[0].id;
+		this.setStatus(a.id, "conflicted");
+		this.unqueue(entry);
+		this.log.commit({ events: [
+			this.signalled(a.id, "reconcile", { paths, note: "Landing conflicted with trunk. Call `reconciliation` for both sides and their reasoning, then `resolve`." }),
+			this.noted("conflict", by, `Landing ${a.id} conflicted with trunk on ${paths.join(", ")}; reconciliation R${id} opened`, a.intentId, a.id),
+			this.settled("landing", "conflict", `Conflicts with trunk in ${paths.join(", ")}`, a, by, `R${id}`, String(entry.attempt_sha)),
+		] });
+	}
+
+	/**
+	 * "Land now": one landing, merged and pushed without waiting for any run. Also finishes a landing that an
+	 * older version was pushing when it stopped.
+	 */
+	private async landAlone(entry: any): Promise<void> {
+		const a = this.attempt(entry.attempt_id), intent = this.intent(a.intentId), by = String(entry.by);
 		// A landing that was being pushed when this object stopped: trunk says whether it got there.
 		if (entry.state === "pushing") {
 			if ((await this.trunkLog()).some((c) => c.hash === entry.candidate_sha)) {
 				if (!this.rows("SELECT 1 FROM landings WHERE sha = ?", entry.candidate_sha).length) await this.recordLanding(a, intent, by, entry.candidate_sha, entry.trunk_sha, JSON.parse(entry.reconciled || "[]"));
-				return { kind: "landed", sha: entry.candidate_sha };
+				return this.unqueue(entry);
 			}
-			this.sql.exec("UPDATE queue SET state = 'waiting', candidate_sha = NULL WHERE attempt_id = ?", a.id);
-			entry = { ...entry, state: "waiting", candidate_sha: null };
+			this.sql.exec("UPDATE queue SET state = 'waiting', candidate_sha = NULL WHERE attempt_id = ? AND at = ?", a.id, entry.at);
+			if (!entry.force) return; // it joins the next batch like any other
 		}
-		if (!LIVE.has(a.status) || intent.status !== "open") return { kind: "gone" };
-		if (a.headSha !== entry.attempt_sha) return { kind: "refused", why: `attempt ${a.id} moved to ${short(a.headSha)} after landing was asked for at ${short(entry.attempt_sha)}; review it and land again` };
-
-		const head = this.meta("head"), verifies = !!this.env.RUNNER && !forced;
-		const own = this.latestRun(a.id), trunkRun = this.latestRun("trunk");
-		const trunkRed = trunkRun?.sha === head && trunkRun.status === "fail";
-		if (verifies) {
-			if (!own || own.sha !== a.headSha || own.status === "queued" || own.status === "running") return { kind: "wait", why: `waiting for ${short(a.headSha)} to be verified` };
-			if (own.status === "fail") return { kind: "refused", why: `attempt ${a.id} failed verification at ${short(a.headSha)} (${failed(own)}); land it anyway with force` };
-			if (own.status !== "pass") return { kind: "refused", why: `attempt ${a.id} could not be verified at ${short(a.headSha)}${own.error ? ` (${own.error})` : ""}; run the verification again, or land it anyway with force` };
-
-			// A lockfile being regenerated for this trunk and this commit: wait for it, then merge with what came back.
-			if (entry.state === "locking" && entry.trunk_sha === head && entry.candidate_sha) {
-				const run = this.latestRun(`lock:${a.id}`);
-				if (run && run.sha === entry.candidate_sha) {
-					if ((run.status === "queued" || run.status === "running") && now() - run.startedAt < 45 * 60_000) return { kind: "hold", why: "regenerating the lockfile from the merged package.json" };
-					if (run.status !== "pass") return { kind: "refused", why: `both sides changed dependencies and the lockfile could not be regenerated${run.error ? ` (${run.error})` : failed(run) ? ` (${failed(run)} failed)` : ""}. Merge trunk into the attempt with git and run the install there` };
-				}
-			}
-
-			// A merge already built for this trunk and this commit: its result decides.
-			if (entry.state === "verifying" && entry.trunk_sha === head && entry.candidate_sha) {
-				const run = this.latestRun(`land:${a.id}`);
-				if (run && run.sha === entry.candidate_sha) {
-					if (run.status === "queued" || run.status === "running") {
-						if (now() - run.startedAt < 45 * 60_000) return { kind: "hold", why: `verifying the merge with trunk at ${short(head)}` };
-						return { kind: "refused", why: `the merge of attempt ${a.id} with trunk was not verified within 45 minutes; land it again` };
-					}
-					if (run.status === "fail") {
-						this.signal(a.id, "merge-failed", {
-							trunk: short(head),
-							failed: run.steps.filter((s) => s.status === "fail").map((s) => ({ step: s.name, command: s.command, exit_code: s.exitCode, output: s.tail.slice(-2000) })),
-							note: "Your commit passes on its own but fails once merged with trunk. Merge trunk into your attempt (see `sync`), fix it, push, and checkpoint.",
-						});
-						return { kind: "refused", why: `attempt ${a.id} passes on its own but failed verification when merged with trunk at ${short(head)} (${failed(run)})${trunkRed ? "; trunk itself is failing, and this attempt does not fix it" : ""}. Land it anyway with force` };
-					}
-					if (run.status !== "pass") return { kind: "refused", why: `the merge of attempt ${a.id} with trunk could not be verified${run.error ? ` (${run.error})` : ""}; land it again` };
-					this.sql.exec("UPDATE queue SET state = 'pushing' WHERE attempt_id = ?", a.id);
-					const moved = await promote({
-						branch: this.branch, sha: entry.candidate_sha, parentSha: entry.trunk_sha,
-						trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
-						attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
-					});
-					if (moved.ok) {
-						await this.recordLanding(a, intent, by, entry.candidate_sha, entry.trunk_sha, JSON.parse(entry.reconciled || "[]"));
-						return { kind: "landed", sha: entry.candidate_sha };
-					}
-					await this.trunkLog(); // trunk moved under it (a push from outside Braid): merge again
-				}
-			}
-		}
-
-		// Build the merge. A saved resolution is only for the two commits it was written against.
-		const trunkHead = this.meta("head");
-		this.sql.exec("UPDATE reconciliations SET status = 'stale' WHERE attempt_id = ? AND status = 'resolved' AND (trunk_sha != ? OR COALESCE(attempt_sha, ?) != ?)", a.id, trunkHead, a.headSha, a.headSha);
-		// Every resolution still standing for these two commits: what a person, an agent or a model wrote, and any lockfile Braid regenerated.
-		const resolved = this.rows("SELECT * FROM reconciliations WHERE attempt_id = ? AND status = 'resolved' ORDER BY id", a.id).map(this.toRecon);
-		const recon = resolved.filter((r) => r.resolvedBy !== "braid").pop() ?? null;
-		const resolutions = new Map(resolved.flatMap((r) => r.resolutions.map((x) => [x.path, x.content] as [string, string])));
-		const build = async (extra: [string, string][] = []) => prepare({
+		const g = this.gate(entry);
+		if (g.kind === "gone") return this.unqueue(entry);
+		if (g.kind === "refused") return this.refuse(entry, g.why);
+		const res = this.resolutionsFor(a), trunkHead = this.meta("head");
+		const result = await prepare({
 			branch: this.branch,
 			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
 			attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
-			message: this.landingMessage(intent, a, recon),
-			author: { name: a.agent, email: `${a.agent.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}@agents.braid.dev` },
-			resolutions: new Map([...resolutions, ...extra]),
+			message: this.landingMessage(intent, a, res.recon), author: this.authorOf(a), resolutions: res.map,
 			expect: { trunk: trunkHead, attempt: a.headSha },
 		});
-		let result = await build();
 		// Building the merge takes seconds. A landing cancelled in that time must not go on to move trunk.
-		if (!this.held(entry)) return { kind: "gone" };
-		// Only lockfiles left in conflict: nobody should merge those by hand. Build the merge with trunk's
-		// lockfile, and have a sandbox bring it up to date with the merged package.json.
-		if (!result.ok && result.reason === "conflict" && verifies && result.conflicts.every((c) => LOCKFILE.test(c.path) && c.trunk !== null)) {
-			const locks = result.conflicts.map((c) => c.path);
-			const interim = await build(result.conflicts.map((c) => [c.path, c.trunk!]));
-			if (interim.ok) {
-				await interim.stage(await this.host.token(a.repo, "write", 600));
-				if (!this.held(entry)) return { kind: "gone" };
-				this.sql.exec("UPDATE queue SET state = 'locking', candidate_sha = ?, trunk_sha = ? WHERE attempt_id = ?", interim.sha, interim.parentSha, a.id);
-				await this.startRun(`lock:${a.id}`, { repo: a.repo, remote: a.remote, sha: interim.sha, branch: CANDIDATE }, locks);
-				this.note("land", by, `Both attempt ${a.id} and trunk changed ${locks.join(", ")}; regenerating it from the merged package.json`, a.intentId, a.id);
-				return { kind: "hold", why: "regenerating the lockfile from the merged package.json" };
-			}
-			result = interim;
-		}
+		if (!this.held(entry)) return;
 		if (!result.ok && result.reason === "moved") {
 			// Something was pushed since this object last looked. Look again; the next pass decides with what is there now.
+			this.setNote(entry, `${result.what === "trunk" ? "trunk" : `attempt ${a.id}`} moved while landing; trying again`);
 			await this.readTrunk();
 			await this.observe(a.id);
-			return { kind: "wait", why: `${result.what === "trunk" ? "trunk" : `attempt ${a.id}`} moved while landing; trying again` };
+			return;
 		}
-		if (!result.ok && result.reason === "nothing-to-land") return { kind: "refused", why: `attempt ${a.id} has nothing that trunk does not already have` };
-		if (!result.ok) {
-			// A lockfile in conflict next to other files is left for Braid: once the rest is resolved, it is regenerated.
-			const conflicts: Conflict[] = result.conflicts.map((c) => ({ ...c, ...(LOCKFILE.test(c.path) && verifies ? { kind: "lockfile" as const, base: null, trunk: null, attempt: null, regions: [] } : {}), trunkWhy: this.trunkWhy(a.baseSha, c.path) }));
-			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
-			this.sql.exec("INSERT INTO reconciliations (attempt_id, intent_id, status, trunk_sha, attempt_sha, conflicts, resolutions, rationale, resolved_by, at) VALUES (?, ?, 'open', ?, ?, ?, '[]', '', '', ?)",
-				a.id, a.intentId, result.trunkSha, result.attemptSha, json(conflicts), now());
-			const id = this.rows<{ id: number }>("SELECT id FROM reconciliations ORDER BY id DESC LIMIT 1")[0].id;
-			this.setStatus(a.id, "conflicted");
-			this.signal(a.id, "reconcile", { paths: conflicts.map((c) => c.path), note: "Landing conflicted with trunk. Call `reconciliation` for both sides and their reasoning, then `resolve`." });
-			this.note("conflict", by, `Landing ${a.id} conflicted with trunk on ${conflicts.map((c) => c.path).join(", ")}; reconciliation R${id} opened`, a.intentId, a.id);
-			return { kind: "conflict", id, paths: conflicts.map((c) => c.path) };
+		if (!result.ok && result.reason === "nothing-to-land") return this.refuse(entry, `attempt ${a.id} has nothing that trunk does not already have`);
+		if (!result.ok) return this.openReconciliation(entry, a, result.conflicts, result.trunkSha, result.attemptSha, false);
+		// Written down before the push, so a landing that reaches trunk is recorded even if this object stops in between.
+		this.sql.exec("UPDATE queue SET state = 'pushing', candidate_sha = ?, trunk_sha = ?, reconciled = ? WHERE attempt_id = ? AND at = ?", result.sha, result.parentSha, json(result.reconciled), a.id, entry.at);
+		await result.push();
+		await this.recordLanding(a, intent, by, result.sha, result.parentSha, result.reconciled, !!this.env.RUNNER);
+		this.unqueue(entry);
+	}
+
+	/** Where merged commits wait while they are verified: one repository per project, made the first time it is needed. */
+	private async staging(): Promise<{ repo: string; remote: string }> {
+		const repo = `${this.meta("slug")}--landing`;
+		if (!this.meta("staging_remote")) {
+			const remote = await this.host.create(repo, `Braid: merges of ${this.meta("name")} waiting to be verified`).then((r) => r.remote, () => this.host.remote(repo));
+			this.setMeta("staging_remote", remote);
+		}
+		return { repo, remote: this.meta("staging_remote") };
+	}
+
+	/**
+	 * Take the landings that are ready, in the order they were asked for, and merge them one on top of
+	 * the other. One that conflicts with trunk gets its reconciliation; one that conflicts only with a
+	 * landing ahead of it waits for that landing. What merged is parked and becomes a batch to verify,
+	 * or lands at once when there is nothing left to verify.
+	 */
+	private async formBatch(): Promise<"again" | "idle"> {
+		const head = this.meta("head"), verifies = !!this.env.RUNNER;
+		const cap = Math.min(32, Math.max(1, Number((await this.policy()).config?.landing?.batch) || BATCH));
+		const ready: any[] = [];
+		for (const entry of this.rows<any>("SELECT * FROM queue WHERE force = 0 AND batch_id IS NULL ORDER BY at, attempt_id")) {
+			const g = this.gate(entry);
+			if (g.kind === "wait") this.setNote(entry, g.why);
+			else if (g.kind === "refused") this.refuse(entry, g.why);
+			else if (g.kind === "gone") this.unqueue(entry);
+			else ready.push(this.rows<any>("SELECT * FROM queue WHERE attempt_id = ? AND at = ?", entry.attempt_id, entry.at)[0]);
+		}
+		const members: { entry: any; a: Attempt; intent: Intent; res: Resolutions }[] = [], intents = new Set<number>();
+		for (const entry of ready) {
+			const a = this.attempt(entry.attempt_id), res = this.resolutionsFor(a);
+			// Two attempts at one intent: the first to land settles it, so the second is not merged alongside.
+			if (intents.has(a.intentId)) { this.setNote(entry, "another attempt at the same intent is landing first"); continue; }
+			// A reconciliation, or a regenerated lockfile, was written against trunk as it is: it can only go first.
+			if (res.map.size && members.length) { this.setNote(entry, "goes first in the next batch: it was reconciled against trunk as it is now"); continue; }
+			members.push({ entry, a, intent: this.intent(a.intentId), res });
+			intents.add(a.intentId);
+			if (members.length >= cap) break;
+		}
+		if (!members.length) return "idle";
+
+		const built = await chain({
+			branch: this.branch, expectTrunk: head,
+			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
+			members: await Promise.all(members.map(async (m) => ({
+				id: m.a.id, attempt: { remote: m.a.remote, token: await this.host.token(m.a.repo, "read", 600) }, expect: String(m.entry.attempt_sha),
+				message: this.landingMessage(m.intent, m.a, m.res.recon), author: this.authorOf(m.a), resolutions: m.res.map,
+			}))),
+		});
+		// Something was pushed to trunk since this object last looked. Look again and start over.
+		if (!built.ok) { await this.readTrunk(); return "again"; }
+		// Building takes seconds. If a landing was cancelled or trunk was moved in that time, this chain is of the wrong things.
+		if (this.meta("head") !== head || members.some((m) => !this.held(m.entry))) return "again";
+
+		const merged: { m: (typeof members)[number]; step: Extract<ChainStep, { ok: true }> }[] = [], locks: { m: (typeof members)[number]; step: Extract<ChainStep, { reason: "conflict" }> }[] = [];
+		for (const step of built.steps) {
+			const m = members.find((x) => x.a.id === step.id)!;
+			if (step.ok) merged.push({ m, step });
+			else if (step.reason === "nothing-to-land") this.refuse(m.entry, `attempt ${m.a.id} has nothing that trunk does not already have`);
+			else if (step.reason === "moved") {
+				// The attempt was pushed to since it was last read. Read it; the next pass refuses the landing for the commit it was asked for.
+				this.setNote(m.entry, `attempt ${m.a.id} moved while landing; reading it again`);
+				this.log.commit({ effects: [this.observeEffect(m.a.id)] });
+			} else if (!step.againstTrunk) this.setNote(m.entry, "conflicts with a landing ahead of it; it is tried again once that has landed");
+			// Only lockfiles left in conflict: nobody should merge those by hand. A sandbox brings them up to date (see startLock).
+			else if (verifies && step.conflicts.every((c) => LOCKFILE.test(c.path) && c.trunk !== null)) locks.push({ m, step });
+			else this.openReconciliation(m.entry, m.a, step.conflicts, step.onto, step.attemptSha, verifies);
+		}
+		for (const { m, step } of locks) await this.startLock(m.entry, m.a, m.intent, m.res, step);
+		if (!merged.length || !built.tip) return locks.length ? "again" : "idle";
+		if (this.meta("head") !== head || merged.some((x) => !this.held(x.m.entry))) return "again";
+
+		// What has already been run does not need running again: a lone attempt that starts from trunk's head
+		// merges to exactly the tree that passed, and a project with no checks has nothing to run.
+		const trunkRun = this.latestRun("trunk"), trunkRed = trunkRun?.sha === head && trunkRun.status === "fail";
+		const nothing = !trunkRed && trunkRun?.sha === head && trunkRun.status === "pass" && trunkRun.nothingToRun && merged.every((x) => this.latestRun(x.m.a.id)?.nothingToRun);
+		const direct = !verifies || nothing || (merged.length === 1 && merged[0].step.sameTree);
+		const ref = `batch-${now().toString(36)}-${crypto.randomUUID().slice(0, 6)}`;
+		if (!direct) {
+			const staging = await this.staging();
+			await built.stage(staging.remote, await this.host.token(staging.repo, "write", 600), ref);
+			if (this.meta("head") !== head || merged.some((x) => !this.held(x.m.entry))) return "again";
+		}
+		// The batch is written down in one go, before anything moves trunk.
+		const id = this.rows<{ id: number }>("INSERT INTO batches (trunk_sha, tip_sha, ref, state, size, target_sha, at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+			head, built.tip, ref, direct ? "pushing" : "verifying", merged.length, direct ? built.tip : null, now())[0].id;
+		merged.forEach(({ m, step }, position) => {
+			this.sql.exec("UPDATE queue SET batch_id = ?, position = ?, state = ?, candidate_sha = ?, trunk_sha = ?, reconciled = ?, note = ? WHERE attempt_id = ? AND at = ?",
+				id, position, direct ? "pushing" : "verifying", step.sha, step.parentSha, json(step.reconciled), direct ? "landing" : `verifying the merge with trunk at ${short(head)}${merged.length > 1 ? `, together with ${merged.length - 1} other landing${merged.length === 2 ? "" : "s"}` : ""}`, m.a.id, m.entry.at);
+			if (!direct) this.sql.exec("INSERT OR REPLACE INTO candidates (attempt_id, sha, trunk_sha, attempt_sha, at, run_ref, run_sha) VALUES (?, ?, ?, ?, ?, ?, ?)", m.a.id, step.sha, head, m.a.headSha, now(), `batch:${id}`, built.tip);
+		});
+		if (direct) {
+			await built.push();
+			const batch = this.rows<any>("SELECT * FROM batches WHERE id = ?", id)[0];
+			await this.recordBatch(batch, this.members(id));
+			this.sql.exec("DELETE FROM batches WHERE id = ?", id);
+			this.log.commit({ effects: [this.runEffect("trunk")] });
+		}
+		return "again";
+	}
+
+	/**
+	 * Both sides changed dependencies and only lockfiles conflict: build the merge with trunk's lockfile, park it on the
+	 * attempt's repository, and have a sandbox bring the lockfile up to date with the merged package.json. What comes
+	 * back is kept as a resolution, and the landing then goes first in a batch like any reconciled one.
+	 */
+	private async startLock(entry: any, a: Attempt, intent: Intent, res: Resolutions, step: Extract<ChainStep, { reason: "conflict" }>) {
+		const locks = step.conflicts.map((c) => c.path), by = String(entry.by);
+		const interim = await prepare({
+			branch: this.branch,
+			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
+			attempt: { remote: a.remote, token: await this.host.token(a.repo, "read", 600) },
+			message: this.landingMessage(intent, a, res.recon), author: this.authorOf(a),
+			resolutions: new Map([...res.map, ...step.conflicts.map((c) => [c.path, c.trunk!] as [string, string])]),
+			expect: { trunk: step.onto, attempt: step.attemptSha },
+		});
+		if (!interim.ok) return; // something moved; the next pass starts over
+		await interim.stage(await this.host.token(a.repo, "write", 600));
+		if (!this.held(entry)) return;
+		this.sql.exec("UPDATE queue SET state = 'locking', candidate_sha = ?, trunk_sha = ?, note = ? WHERE attempt_id = ? AND at = ?", interim.sha, interim.parentSha, "regenerating the lockfile from the merged package.json", a.id, entry.at);
+		await this.startRun(`lock:${a.id}`, { repo: a.repo, remote: a.remote, sha: interim.sha, branch: CANDIDATE }, locks);
+		this.note("land", by, `Both attempt ${a.id} and trunk changed ${locks.join(", ")}; regenerating it from the merged package.json`, a.intentId, a.id);
+	}
+
+	private members(batchId: number) { return this.rows<any>("SELECT * FROM queue WHERE batch_id = ? ORDER BY position", batchId); }
+	/** Take a batch apart without landing anything: its members go back in line and are merged again. */
+	private dissolve(batch: any) {
+		this.sql.exec("UPDATE queue SET batch_id = NULL, position = NULL, state = 'waiting', candidate_sha = NULL, note = '' WHERE batch_id = ?", batch.id);
+		this.sql.exec("DELETE FROM batches WHERE id = ?", batch.id);
+	}
+	private async startBatchRun(batch: any, ref: string, sha: string) {
+		const staging = await this.staging();
+		await this.startRun(ref, { repo: staging.repo, remote: staging.remote, sha, branch: batch.ref });
+	}
+
+	/** One step for the batch being verified: wait, land it, or find which landing broke it. */
+	private async batchStep(batch: any): Promise<"hold" | "again"> {
+		const rows = this.members(batch.id), head = this.meta("head"), ids = rows.map((r) => r.attempt_id).join(", ");
+		// Cut off around the push: trunk says whether it got there.
+		if (batch.state === "pushing") {
+			if ((await this.readTrunk()).some((c) => c.hash === batch.target_sha)) await this.recordBatch(batch, rows.filter((r) => r.state === "pushing"));
+			this.dissolve(batch);
+			this.log.commit({ effects: [this.runEffect("trunk")] });
+			return "again";
+		}
+		// The batch stands only while trunk and every member are as they were when it was built. A landing
+		// cancelled or sent back, an attempt pushed to, a "land now" that got ahead: build it again.
+		const intact = head === batch.trunk_sha && rows.length === batch.size && rows.every((r) => {
+			const a = this.attempt(r.attempt_id);
+			return LIVE.has(a.status) && a.headSha === r.attempt_sha && this.intent(a.intentId).status === "open";
+		});
+		if (!intact) { this.dissolve(batch); return "again"; }
+		const pending = (run: Run | null) => !!run && (run.status === "queued" || run.status === "running");
+		const late = (run: Run) => now() - run.startedAt >= VERIFY_LIMIT_MS;
+		const giveUp = (why: (id: string) => string) => { for (const r of rows) this.refuse(r, why(r.attempt_id)); this.sql.exec("DELETE FROM batches WHERE id = ?", batch.id); return "again" as const; };
+
+		if (batch.state === "verifying") {
+			const run = this.latestRun(`batch:${batch.id}`);
+			if (!run || run.sha !== batch.tip_sha) {
+				await this.startBatchRun(batch, `batch:${batch.id}`, batch.tip_sha);
+				this.note("land", "braid", rows.length === 1 ? `Merged attempt ${ids} with trunk at ${short(head)} as ${short(batch.tip_sha)}; it lands if that passes verification`
+					: `Merged attempts ${ids} with trunk at ${short(head)}, one on top of the other, as ${short(batch.tip_sha)}; they all land if that passes verification`);
+				return "hold";
+			}
+			if (pending(run)) return late(run) ? giveUp((id) => `the merge of attempt ${id} with trunk was not verified within 45 minutes; land it again`) : "hold";
+			if (run.status === "pass") return this.landBatch(batch, rows, rows.length - 1, run);
+			if (run.status !== "fail") return giveUp((id) => `the merge of attempt ${id} with trunk could not be verified${run.error ? ` (${run.error})` : ""}; land it again`);
+			if (rows.length === 1) { this.blame(rows[0], run, head); this.sql.exec("DELETE FROM batches WHERE id = ?", batch.id); return "again"; }
+			// Something in the batch breaks it. Run every step at once to see which.
+			this.sql.exec("UPDATE batches SET state = 'splitting' WHERE id = ?", batch.id);
+			this.sql.exec("UPDATE queue SET note = ? WHERE batch_id = ?", "the landings verified together failed; each is being run to find which one", batch.id);
+			this.note("land", "braid", `Attempts ${ids} failed verification when merged with trunk together (${this.failedSteps(run)}); running each step to find which one breaks it`);
 		}
 
-		// What has already been run does not need running again: an attempt that starts from trunk's head
-		// merges to exactly the tree that passed, and a project with no checks has nothing to run.
-		const sameTree = a.baseSha === result.parentSha && result.reconciled.length === 0;
-		const nothing = !!own?.nothingToRun && trunkRun?.sha === result.parentSha && trunkRun.status === "pass" && trunkRun.nothingToRun;
-		if (!verifies || sameTree || (nothing && !trunkRed)) {
-			// Written down before the push, so a landing that reaches trunk is recorded even if this object stops in between.
-			this.sql.exec("UPDATE queue SET state = 'pushing', candidate_sha = ?, trunk_sha = ?, reconciled = ? WHERE attempt_id = ?", result.sha, result.parentSha, json(result.reconciled), a.id);
-			await result.push();
-			await this.recordLanding(a, intent, by, result.sha, result.parentSha, result.reconciled, forced && !!this.env.RUNNER);
-			return { kind: "landed", sha: result.sha };
+		const runs = rows.map((r) => this.latestRun(`batch:${batch.id}:${r.position}`));
+		let started = false;
+		for (const [i, r] of rows.entries()) {
+			if (runs[i]?.sha === r.candidate_sha) continue;
+			this.sql.exec("UPDATE candidates SET run_ref = ?, run_sha = ? WHERE attempt_id = ?", `batch:${batch.id}:${r.position}`, r.candidate_sha, r.attempt_id);
+			await this.startBatchRun(batch, `batch:${batch.id}:${r.position}`, r.candidate_sha);
+			started = true;
 		}
-		await result.stage(await this.host.token(a.repo, "write", 600));
-		if (!this.held(entry)) return { kind: "gone" };
-		this.sql.exec("UPDATE queue SET state = 'verifying', candidate_sha = ?, trunk_sha = ?, reconciled = ? WHERE attempt_id = ?", result.sha, result.parentSha, json(result.reconciled), a.id);
-		this.sql.exec("INSERT OR REPLACE INTO candidates (attempt_id, sha, trunk_sha, attempt_sha, at) VALUES (?, ?, ?, ?, ?)", a.id, result.sha, result.parentSha, a.headSha, now());
-		await this.startRun(`land:${a.id}`, { repo: a.repo, remote: a.remote, sha: result.sha, branch: CANDIDATE });
-		this.note("land", by, `Merged attempt ${a.id} with trunk at ${short(result.parentSha)} as ${short(result.sha)}; it lands if that passes verification`, a.intentId, a.id);
-		return { kind: "hold", why: `verifying the merge with trunk at ${short(result.parentSha)}` };
+		if (started) return "hold";
+		if (runs.some(pending)) return runs.some((run) => pending(run) && late(run!)) ? giveUp((id) => `the merge of attempt ${id} with trunk was not verified within 45 minutes; land it again`) : "hold";
+		const first = runs.findIndex((run) => run!.status !== "pass");
+		if (first === -1) {
+			// Every step passes on its own, the last one included: the failure did not repeat.
+			this.note("land", "braid", `Attempts ${ids} failed once when verified together and passed when each step was run again; landing them`);
+			return this.landBatch(batch, rows, rows.length - 1, runs.at(-1)!);
+		}
+		// The first step that does not pass is the one that breaks it. Those ahead of it are good and land;
+		// those behind it were merged on top of it, so they go back in line.
+		const parent = String(rows[first].trunk_sha);
+		this.sql.exec("UPDATE candidates SET trunk_sha = ? WHERE attempt_id = ?", parent, rows[first].attempt_id);
+		this.blame(rows[first], runs[first]!, parent);
+		this.sql.exec("UPDATE queue SET batch_id = NULL, position = NULL, state = 'waiting', candidate_sha = NULL, note = '' WHERE batch_id = ? AND position > ?", batch.id, rows[first].position);
+		if (first === 0) { this.sql.exec("DELETE FROM batches WHERE id = ?", batch.id); return "again"; }
+		return this.landBatch(batch, rows.slice(0, first), first - 1, runs[first - 1]!);
+	}
+
+	/** The landing whose merge does not pass: refused, with the failing output sent to its agent. */
+	private blame(row: any, run: Run, onto: string) {
+		const a = this.attempt(row.attempt_id), trunkRun = this.latestRun("trunk");
+		const trunkRed = trunkRun?.sha === this.meta("head") && trunkRun.status === "fail";
+		if (run.status !== "fail") return this.refuse(row, `the merge of attempt ${a.id} with trunk could not be verified${run.error ? ` (${run.error})` : ""}; land it again`);
+		this.signal(a.id, "merge-failed", {
+			trunk: short(onto),
+			failed: run.steps.filter((s) => s.status === "fail").map((s) => ({ step: s.name, command: s.command, exit_code: s.exitCode, output: s.tail.slice(-2000) })),
+			note: "Your commit passes on its own but fails once merged with trunk. Merge trunk into your attempt (see `sync`), fix it, push, and checkpoint.",
+		});
+		this.refuse(row, `attempt ${a.id} passes on its own but failed verification when merged with trunk at ${short(onto)} (${this.failedSteps(run)})${trunkRed ? "; trunk itself is failing, and this attempt does not fix it" : ""}. Land it anyway with force`);
+	}
+
+	/** Move trunk to the step at `upto` of a batch, whose run passed, and record every landing up to it. */
+	private async landBatch(batch: any, rows: any[], upto: number, passed: Run): Promise<"again"> {
+		const target = String(rows[upto].candidate_sha), staging = await this.staging();
+		// Written down before the push, so landings that reach trunk are recorded even if this object stops in between.
+		this.sql.exec("UPDATE batches SET state = 'pushing', target_sha = ? WHERE id = ?", target, batch.id);
+		this.sql.exec("UPDATE queue SET state = 'pushing', note = 'landing' WHERE batch_id = ? AND position <= ?", batch.id, rows[upto].position);
+		const moved = await promoteFrom({
+			branch: this.branch, sha: target, parentSha: batch.trunk_sha,
+			trunk: { remote: this.meta("remote"), token: await this.host.token(this.trunk, "write", 600) },
+			staging: { remote: staging.remote, token: await this.host.token(staging.repo, "read", 600), ref: batch.ref },
+		});
+		if (!moved.ok) {
+			// Trunk moved under it (a push from outside Braid): merge again.
+			this.dissolve(batch);
+			await this.readTrunk();
+			return "again";
+		}
+		// Trunk is now the very commit that just passed. Its result stands for trunk, unless the project builds
+		// a preview: that is made by running trunk itself.
+		if (!passed.preview && !this.rows("SELECT 1 FROM runs WHERE ref = 'trunk' AND sha = ?", target).length) {
+			this.sql.exec("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at, finished_at) VALUES ('trunk', ?, 'pass', ?, 0, ?, NULL, ?, ?)", target, json(passed.steps), passed.nothingToRun ? 1 : 0, passed.startedAt, passed.finishedAt ?? now());
+		}
+		await this.recordBatch(batch, rows.slice(0, upto + 1));
+		this.sql.exec("DELETE FROM batches WHERE id = ?", batch.id);
+		this.log.commit({ effects: [this.runEffect("trunk")] });
+		return "again";
+	}
+
+	/** Trunk has these landings: write each down in the order it landed. One already written down (by a try that was cut off) is left alone. */
+	private async recordBatch(batch: any, rows: any[], unverified = false) {
+		for (const r of rows) {
+			if (this.rows("SELECT 1 FROM landings WHERE sha = ?", r.candidate_sha).length) continue;
+			const a = this.attempt(r.attempt_id), intent = this.intent(a.intentId);
+			await this.recordLanding(a, intent, String(r.by), String(r.candidate_sha), String(r.trunk_sha), JSON.parse(r.reconciled || "[]"), unverified);
+		}
+		void batch;
 	}
 
 	/** Trunk has the landing commit: write down what it was, tell everyone affected, and keep the why. */
@@ -2004,6 +2236,7 @@ function describeCall(tool: string, args: Record<string, any>): string {
 
 /** Requests that may carry an Idempotency-Key. */
 const KEYED = new Set(["createIntent", "join", "hostAgent", "rehost", "respond", "revertLanding", "land", "cancelLanding", "resolve", "resolveWithModel", "abandonIntent", "abandonAttempt", "restoreAttempt", "editIntent", "stopHosted"]);
+type Resolutions = { recon: Reconciliation | null; map: Map<string, string> };
 type Observed = Pick<Attempt, "baseSha" | "headSha" | "files" | "behind" | "trunkConflicts"> & { trunkSeen: string };
 const STALE_NOTE = "Braid has not finished reading your latest push, so this is what it knew before. Anything new arrives in heads_up on your next call.";
 

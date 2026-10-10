@@ -7,6 +7,7 @@ import type { Attempt, Overlap, State, TrunkCommit } from "../shared/types";
 import { ago, short, useNarrow, useNow } from "./api";
 import { Agent, IntentId, Link } from "./App";
 import { Icon, type IconName } from "./Kit";
+import { batchFor, batchWords, queueLabel } from "./Batch";
 import { landingVerdict, neverStarted, reason } from "./Later";
 import { runFor } from "./Verify";
 
@@ -63,7 +64,7 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 	const answered = new Set(decisions.filter((d) => d.kind === "answer").map((d) => d.title.replace(/^Answer: /, "")));
 	const asking = going ? decisions.filter((d) => d.kind === "question" && !answered.has(d.title)) : [];
 	const landing = state.landings.find((l) => l.attemptId === a.id && !l.revertOf);
-	const queued = state.queue.find((q) => q.attemptId === a.id);
+	const queued = state.queue.find((q) => q.attemptId === a.id), inBatch = batchFor(state, a.id);
 	const last = landingVerdict(state, a), refused = last?.outcome === "refused" ? last : null;
 	const run = checks(state, a);
 	const mine = state.overlaps.filter((o) => o.a === a.id || o.b === a.id);
@@ -75,14 +76,15 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 			<p className="lc-kicker">Attempt <span className="mono">{a.id}</span></p>
 			<p className="lc-title"><IntentId id={a.intentId} /><span>{intent?.title ?? `Intent ${a.intentId}`}</span></p>
 			<p className="lc-who"><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="lc-dim">{a.model ? a.agent : ""}</span></p>
-			<p className="lc-status"><span className={`chip ${a.status}`}>{queued ? "landing" : a.status}</span><span>{STATUS[a.status]}{landing && a.status === "landed" ? ` ${ago(landing.at)}` : ""}.</span></p>
+			<p className="lc-status"><span className={`chip ${queued ? "working" : a.status}`}>{queued ? queueLabel(state, queued) : a.status}</span><span>{STATUS[a.status]}{landing && a.status === "landed" ? ` ${ago(landing.at)}` : ""}.</span></p>
 			{a.status === "working" && now && <p className="lc-now"><span className="lc-label">Right now</span><span className="mono">{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 120)}</span></p>}
 			{a.summary && <p className="lc-summary">{a.summary}</p>}
 			<ul className="lc-facts">
 				<Fact icon="changes">{a.files.length ? `${plural(a.files.length, "file")} changed` : "No files changed yet"} · {plural(decisions.length, "decision")} recorded</Fact>
 				{asking.length > 0 && <Fact icon="question" tone="warn">Asks you: {asking[0].title}{asking.length > 1 ? ` (and ${asking.length - 1} more)` : ""}</Fact>}
 				{(going || a.status === "landed") && <Fact icon={run.icon} tone={run.tone}>{run.text}</Fact>}
-				{queued && <Fact icon="land">Waiting to land{queued.note ? `: ${queued.note}` : ""}</Fact>}
+				{queued && !inBatch && <Fact icon="land">Asked to land by {queued.by}{queued.note ? `: ${queued.note}` : ""}</Fact>}
+				{queued && inBatch && <Fact icon="land" tone={inBatch.batch.state === "splitting" ? "warn" : ""}>{inBatch.batch.members.length > 1 ? `Landing ${inBatch.place} of ${inBatch.batch.members.length} in a batch (${inBatch.batch.members.join(", then ")}). ` : "Asked to land. "}{batchWords(state, inBatch.batch, a.id)}</Fact>}
 				{refused && <Fact icon="land" tone="bad">It was asked to land and did not. {reason(refused.text)}</Fact>}
 				{going && <Fact icon="fork">{a.behind > 0 ? `${plural(a.behind, "landing")} behind trunk: trunk has moved since it forked` : "Up to date with trunk"}</Fact>}
 				{going && a.trunkConflicts.length > 0 && <Fact icon="conflict" tone="bad">Would conflict with trunk on {a.trunkConflicts.join(", ")}</Fact>}

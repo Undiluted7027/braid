@@ -497,6 +497,32 @@ circle.hit { fill: transparent; stroke: none; pointer-events: all; }
 .attempt-meta > span { display: inline-flex; align-items: center; gap: 6px; }
 .landing-wait { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px; background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm); }
 .landing-wait > span:nth-child(2) { flex: 1; min-width: 200px; }
+.landing-wait .batch, .landing-wait > .hint { flex-basis: 100%; }
+/* A batch of landings: trunk, then each landing merged on top of the one before, then the one run that decides them all. */
+.batch { display: grid; gap: 8px; min-width: 0; }
+.batch-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.batch-chain > li { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.batch-trunk { padding: 4px 8px; border: 1px solid var(--ink); border-radius: var(--r-sm); background: var(--surface); gap: 8px !important; }
+.batch-trunk .label { color: var(--ink); }
+.batch-plus { color: var(--ghost); }
+.batch-box { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 4px 8px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); text-decoration: none; min-width: 0; transition: border-color 0.12s var(--ease); }
+a.batch-box:hover { border-color: var(--ink); }
+.batch-member.me .batch-box { border-color: var(--ink); box-shadow: var(--offset-sm); margin-right: 2px; }
+.batch-n { font: 500 11px/14px var(--mono); color: var(--faint); }
+.batch-id { white-space: nowrap; }
+.batch-me { font: 500 10.5px/14px var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--on-ink); background: var(--ink); padding: 1px 5px; border-radius: 3px; }
+.batch-run .icon { color: var(--ghost); }
+.batch-chain .chip { vertical-align: 0; }
+.batch-words { color: var(--muted); font-size: 13px; line-height: 18px; max-width: 100ch; }
+.queue { padding: 12px 16px; margin-bottom: 20px; display: grid; gap: 10px; }
+.queue > h2 { display: flex; align-items: center; gap: 8px; }
+.queue > h2 .count { margin-left: 0; }
+.queue .batch + .batch, .queue-waiting { padding-top: 10px; border-top: 1px solid var(--line); }
+.queue-waiting { display: grid; gap: 8px; }
+.queue-waiting li { display: grid; grid-template-columns: 150px minmax(120px, auto) minmax(0, 1fr); gap: 4px 12px; align-items: baseline; }
+.queue-waiting .chip { justify-self: start; align-self: center; }
+.queue-who { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.queue-note { color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
 /* How something asked for earlier turned out, shown where it was asked. */
 .verdict { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 10px; padding: 10px 12px; border: 1px solid var(--bad); border-radius: var(--r-sm); background: var(--surface); box-shadow: 2px 2px 0 var(--bad); margin-right: 2px; }
 .verdict > .icon { color: var(--bad); margin-top: 2px; }
@@ -810,6 +836,8 @@ p .mono, .ihead .mono { overflow-wrap: anywhere; }
 	.needs a { grid-template-columns: minmax(0, 1fr) auto; }
 	.needs .chip { grid-column: 1 / -1; }
 	.needs-row { grid-template-columns: minmax(0, 1fr); }
+	.queue-waiting li { grid-template-columns: minmax(0, 1fr); }
+	.batch-id { white-space: normal; }
 	.needs-row > button { justify-self: start; }
 	.empty { flex-direction: column; align-items: flex-start; gap: 12px; padding: 16px; }
 	.state-art { width: 120px; }

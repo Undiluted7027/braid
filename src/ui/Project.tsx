@@ -3,6 +3,7 @@ import { useState, type FormEvent } from "react";
 import type { Attempt, Intent, State } from "../shared/types";
 import { api, ago, short, useNow } from "./api";
 import { Agent, IntentId, Link, useAction, useSignedIn as useMe, useTitle } from "./App";
+import { batchFor, LandingQueue, queueLabel } from "./Batch";
 import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
 import { Empty, MiniLoom } from "./Graphics";
@@ -182,12 +183,13 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const decisions = state.decisions.filter((d) => d.attemptId === a.id).length;
 	const now = useNow(a.id, a.now);
 	const going = LIVE.has(a.status);
-	const queued = state.queue.some((q) => q.attemptId === a.id);
+	const queued = state.queue.find((q) => q.attemptId === a.id);
+	const batch = batchFor(state, a.id)?.batch;
 	const verdict = landingVerdict(state, a);
 	return (
 		<li className={`attempt-row ${a.status}`}>
 			<span className="who"><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="mono id" title={`Attempt ${a.id}`}>{a.id}</span></span>
-			<span className="state"><span className={`chip ${a.status}`}>{queued ? "landing" : a.status}</span><HostedChip a={a} /></span>
+			<span className="state"><span className={`chip ${queued ? (batch?.state === "splitting" ? "conflict" : "working") : a.status}`} title={queued ? (batch && batch.members.length > 1 ? `In a batch with attempts ${batch.members.filter((m) => m !== a.id).join(", ")}; see the landing queue above` : queued.note) : undefined}>{queued ? queueLabel(state, queued) : a.status}</span><HostedChip a={a} /></span>
 			<span className="what">
 				{a.status === "working" && now ? <span className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</span>
 					: <span className="summary">{a.summary || (a.headSha === a.baseSha ? "Nothing pushed yet." : "No summary yet.")}</span>}
@@ -277,6 +279,7 @@ export function ProjectPage({ state }: { state: State }) {
 			</header>
 			{!state.project.head && <Notice tone="warn">Trunk is empty. Push a repository into it before starting attempts: <a href="#trunk">make a push command</a>.</Notice>}
 			<NeedsYou items={items} state={state} />
+			<LandingQueue state={state} />
 			<Braid state={state} />
 			<div className="columns">
 				<div className="col-main">

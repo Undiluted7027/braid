@@ -70,6 +70,9 @@ async function ready(w, intent, name, files, status = "pass") {
 	if (status) { await w.finish(a.attemptId, status); await w.settle(); }
 	return a;
 }
+/** The run that decides an attempt's merge with trunk: its batch's, or its own step once a failed batch is taken apart. */
+const mergeRef = async (w, id) => (await w.state()).candidates.find((c) => c.attemptId === id).runRef;
+const trunkLine = (w) => w.git(`${w.root}/p--trunk.git`, "log", "--first-parent", "--format=%s", "refs/heads/main").split("\n");
 const trunkFile = (w, file) => w.git(`${w.root}/p--trunk.git`, "show", `refs/heads/main:${file}`);
 const title = (to) => ({ "index.html": `<!doctype html>\n<title>${to}</title>\n` });
 
@@ -100,9 +103,11 @@ test("when trunk has moved, the merge is built, parked on the attempt and verifi
 	const held = await land(w, b.attemptId);
 	assert.equal(held.queued, "verifying");
 	assert.equal(w.head("p--trunk"), afterA, "trunk does not move before the merge has passed");
-	const candidate = w.head(b.repo, "braid-candidate");
-	assert.deepEqual([w.runs.at(-1).ref, w.runs.at(-1).sha, w.runs.at(-1).branch], [`land:${b.attemptId}`, candidate, "braid-candidate"]);
-	await w.finish(`land:${b.attemptId}`, "pass");
+	const batch = (await w.state()).batches[0], candidate = batch.tipSha;
+	assert.deepEqual([batch.members, batch.trunkSha, batch.state], [[b.attemptId], afterA, "verifying"]);
+	const job = w.runs.at(-1);
+	assert.deepEqual([job.ref, job.sha, job.repo, w.head("p--landing", job.branch)], [`batch:${batch.id}`, candidate, "p--landing", candidate]);
+	await w.finish(await mergeRef(w, b.attemptId), "pass");
 	await w.settle();
 	assert.equal((await standing(w, b.attemptId)).landed, candidate);
 	assert.deepEqual([w.head("p--trunk"), trunkFile(w, "a.md"), trunkFile(w, "b.md")], [candidate, "a", "b"]);
@@ -114,7 +119,7 @@ test("a merge that fails verification is refused, trunk is untouched and the age
 	await land(w, a.attemptId);
 	const afterA = w.head("p--trunk");
 	await land(w, b.attemptId);
-	await w.finish(`land:${b.attemptId}`, "fail");
+	await w.finish(await mergeRef(w, b.attemptId), "fail");
 	await w.settle();
 	const out = await standing(w, b.attemptId);
 	assert.match(out.refused, /passes on its own but failed verification when merged with trunk/);
@@ -161,7 +166,7 @@ test("a conflict opens a reconciliation; a resolution is verified as a merge and
 	await w.tool(b, "resolve", { resolutions: [{ path: "index.html", regions: ["<title>Ana and Ben</title>\n"] }], rationale: "Both names are in the title." });
 	await w.settle();
 	assert.equal((await standing(w, b.attemptId)).queued, "verifying");
-	await w.finish(`land:${b.attemptId}`, "pass");
+	await w.finish(await mergeRef(w, b.attemptId), "pass");
 	await w.settle();
 	assert.ok((await standing(w, b.attemptId)).landed);
 	assert.match(trunkFile(w, "index.html"), /Ana and Ben/);
@@ -217,7 +222,7 @@ test("a landing can be reverted: trunk gets one commit that undoes it and the in
 	const { w, intents } = await started(t, ["One", "Two"]);
 	const a = await ready(w, intents[0], "ana", { "a.md": "a\n" }), b = await ready(w, intents[1], "ben", { "b.md": "b\n" });
 	const first = await land(w, a.attemptId);
-	await land(w, b.attemptId); await w.finish(`land:${b.attemptId}`, "pass"); await w.settle();
+	await land(w, b.attemptId); await w.finish(await mergeRef(w, b.attemptId), "pass"); await w.settle();
 	await assert.rejects(() => w.project.revertLanding(first.landed, "rev", ""), /say why/);
 	assert.deepEqual(await w.project.revertLanding(first.landed, "rev", "broke the build"), { queued: true });
 	await w.settle();
@@ -244,7 +249,7 @@ test("both sides changing dependencies: the lockfile is regenerated in a sandbox
 	await w.finish(`lock:${b.attemptId}`, "pass");
 	await w.settle();
 	assert.equal((await standing(w, b.attemptId)).queued, "verifying");
-	await w.finish(`land:${b.attemptId}`, "pass");
+	await w.finish(await mergeRef(w, b.attemptId), "pass");
 	await w.settle();
 	assert.ok((await standing(w, b.attemptId)).landed);
 	assert.equal(trunkFile(w, "package-lock.json"), "lock with left and right");
@@ -256,9 +261,9 @@ test("while trunk is failing, an attempt whose merge does not pass is refused an
 	const a = await ready(w, intents[0], "ana", { "a.md": "a\n" }), b = await ready(w, intents[1], "ben", { "b.md": "b\n" }), c = await ready(w, intents[2], "cy", { "fix.md": "fix\n" });
 	await land(w, a.attemptId);
 	await w.finish("trunk", "fail"); await w.settle();
-	await land(w, b.attemptId); await w.finish(`land:${b.attemptId}`, "fail"); await w.settle();
+	await land(w, b.attemptId); await w.finish(await mergeRef(w, b.attemptId), "fail"); await w.settle();
 	assert.match((await standing(w, b.attemptId)).refused, /trunk itself is failing, and this attempt does not fix it/);
-	await land(w, c.attemptId); await w.finish(`land:${c.attemptId}`, "pass"); await w.settle();
+	await land(w, c.attemptId); await w.finish(await mergeRef(w, c.attemptId), "pass"); await w.settle();
 	assert.ok((await standing(w, c.attemptId)).landed);
 });
 
@@ -288,7 +293,7 @@ test("after a landing, an attempt that touches none of its files is not read aga
 	const s = await w.state(), row = (x) => s.attempts.find((y) => y.id === x.attemptId);
 	assert.deepEqual([row(b).behind, row(b).trunkConflicts, row(c).behind, row(c).trunkConflicts], [1, [], 1, ["a.md"]]);
 	// The one that was not read still lands on the trunk that is really there.
-	await land(w, b.attemptId); await w.finish(`land:${b.attemptId}`, "pass"); await w.settle();
+	await land(w, b.attemptId); await w.finish(await mergeRef(w, b.attemptId), "pass"); await w.settle();
 	assert.deepEqual([trunkFile(w, "a.md"), trunkFile(w, "b.md")], ["a", "b"]);
 });
 
@@ -393,4 +398,164 @@ test("a landing cancelled while its merge is being built does not move trunk", a
 	// Asked again afterwards, it lands.
 	w.project.host.token = token;
 	assert.ok((await land(w, a.attemptId)).landed);
+});
+
+// ── batches: landings merged one on top of the other and verified together ────
+
+/** Attempts that are ready and verified, one per intent, then trunk moved once so that none of them merges to a tree already run. */
+async function several(t, changes, env) {
+	const { w, intents } = await started(t, ["Mover", ...changes.map((_, i) => `Intent ${i + 1}`)], env);
+	const mover = await ready(w, intents[0], "mover", { "moved.md": "moved\n" });
+	const agents = [];
+	for (const [i, files] of changes.entries()) agents.push(await ready(w, intents[i + 1], `agent${i + 1}`, files));
+	assert.ok((await land(w, mover.attemptId)).landed);
+	return { w, intents, agents, base: w.head("p--trunk") };
+}
+const askAll = async (w, agents) => { for (const a of agents) await w.project.land(a.attemptId, "rev"); await w.settle(); };
+const jobsSince = (w, n) => w.runs.slice(n).map((r) => r.ref);
+
+test("landings asked for together are merged one on top of the other, verified with one run, and all land", async (t) => {
+	const { w, agents, base } = await several(t, [{ "a.md": "a\n" }, { "b.md": "b\n" }, { "c.md": "c\n" }]);
+	const before = w.runs.length;
+	await askAll(w, agents);
+	const s = await w.state(), batch = s.batches[0];
+	assert.deepEqual([batch.members, batch.state, s.queue.map((q) => [q.state, q.batch])], [agents.map((a) => a.attemptId), "verifying", agents.map(() => ["verifying", batch.id])]);
+	assert.deepEqual(jobsSince(w, before), [`batch:${batch.id}`], "one run for the three of them");
+	assert.equal(w.head("p--trunk"), base, "trunk has not moved yet");
+	await w.finish(`batch:${batch.id}`, "pass");
+	await w.settle();
+	const done = await w.state();
+	assert.deepEqual([done.attempts.filter((a) => a.status === "landed").length, done.queue.length, done.batches.length, done.project.head], [4, 0, 0, batch.tipSha]);
+	assert.equal(w.head("p--trunk"), batch.tipSha);
+	// Trunk's own line is one landing commit each, in the order asked, each on top of the one before.
+	assert.deepEqual(trunkLine(w).slice(0, 3), ["Land I4: Intent 3", "Land I3: Intent 2", "Land I2: Intent 1"]);
+	const three = done.landings.slice(-3);
+	assert.deepEqual(three.map((l) => l.parentSha), [base, three[0].sha, three[1].sha]);
+	assert.deepEqual([trunkFile(w, "a.md"), trunkFile(w, "b.md"), trunkFile(w, "c.md")], ["a", "b", "c"]);
+	// Trunk is the commit that just passed, so it is not run a second time.
+	assert.deepEqual(jobsSince(w, before), [`batch:${batch.id}`]);
+	assert.deepEqual(done.runs.filter((r) => r.ref === "trunk").map((r) => [r.sha, r.status]), [[batch.tipSha, "pass"]]);
+	assert.deepEqual(done.outcomes.slice(0, 3).map((o) => o.outcome), ["landed", "landed", "landed"]);
+});
+
+test("when a batch fails, every step is run at once: those before the one that breaks it land, it is refused, the rest go back in line", async (t) => {
+	const { w, agents, base } = await several(t, [{ "a.md": "a\n" }, { "b.md": "b\n" }, { "c.md": "c\n" }]);
+	const [a, b, c] = agents;
+	await askAll(w, agents);
+	const batch = (await w.state()).batches[0], before = w.runs.length;
+	await w.finish(`batch:${batch.id}`, "fail");
+	await w.settle();
+	assert.deepEqual([(await w.state()).batches[0].state, jobsSince(w, before)], ["splitting", [0, 1, 2].map((n) => `batch:${batch.id}:${n}`)]);
+	assert.equal(w.head("p--trunk"), base);
+	await w.finish(`batch:${batch.id}:0`, "pass"); await w.finish(`batch:${batch.id}:1`, "fail"); await w.finish(`batch:${batch.id}:2`, "fail");
+	await w.settle();
+	const s = await w.state(), of = (x) => s.attempts.find((y) => y.id === x.attemptId);
+	assert.deepEqual([of(a).status, of(b).status, of(c).status], ["landed", "working", "working"]);
+	assert.equal(w.head("p--trunk"), s.landings.at(-1).sha);
+	assert.match((await standing(w, b.attemptId)).refused, /attempt 3\.1 passes on its own but failed verification when merged with trunk/);
+	assert.ok((await w.tool(b, "checkpoint")).heads_up.some((h) => h.kind === "merge-failed"));
+	// The one behind it is merged again, on the trunk that is there now, and lands when that passes.
+	const next = s.batches[0];
+	assert.deepEqual([next.members, next.trunkSha], [[c.attemptId], w.head("p--trunk")]);
+	await w.finish(`batch:${next.id}`, "pass"); await w.settle();
+	assert.ok((await standing(w, c.attemptId)).landed);
+	assert.throws(() => trunkFile(w, "b.md"));
+});
+
+test("a batch that fails once and passes step by step is landed whole, and that is said", async (t) => {
+	const { w, agents } = await several(t, [{ "a.md": "a\n" }, { "b.md": "b\n" }]);
+	await askAll(w, agents);
+	const batch = (await w.state()).batches[0];
+	await w.finish(`batch:${batch.id}`, "fail"); await w.settle();
+	await w.finish(`batch:${batch.id}:0`, "pass"); await w.finish(`batch:${batch.id}:1`, "pass"); await w.settle();
+	const s = await w.state();
+	assert.deepEqual([s.attempts.filter((x) => x.status === "landed").length, w.head("p--trunk")], [3, batch.tipSha]);
+	assert.match(s.activity.map((x) => x.text).join("\n"), /failed once when verified together and passed when each step was run again/);
+});
+
+test("a landing that conflicts with one ahead of it waits for that one, then gets its reconciliation against trunk", async (t) => {
+	const { w, agents } = await several(t, [title("Ana"), title("Ben"), { "c.md": "c\n" }]);
+	const [a, b, c] = agents;
+	await askAll(w, agents);
+	let s = await w.state();
+	assert.deepEqual(s.batches[0].members, [a.attemptId, c.attemptId]);
+	assert.match(s.queue.find((q) => q.attemptId === b.attemptId).note, /conflicts with a landing ahead of it/);
+	assert.equal(s.reconciliations.length, 0, "no reconciliation against a trunk that does not exist yet");
+	await w.finish(`batch:${s.batches[0].id}`, "pass"); await w.settle();
+	s = await w.state();
+	assert.deepEqual([a, b, c].map((x) => s.attempts.find((y) => y.id === x.attemptId).status), ["landed", "conflicted", "landed"]);
+	assert.deepEqual((await standing(w, b.attemptId)).conflict, ["index.html"]);
+	assert.equal(s.reconciliations[0].trunkSha, w.head("p--trunk"));
+});
+
+test("cancelling one landing of a batch builds the batch again without it", async (t) => {
+	const { w, agents, base } = await several(t, [{ "a.md": "a\n" }, { "b.md": "b\n" }, { "c.md": "c\n" }]);
+	const [a, b, c] = agents;
+	await askAll(w, agents);
+	const first = (await w.state()).batches[0];
+	await w.project.cancelLanding(b.attemptId, "rev");
+	await w.settle();
+	const second = (await w.state()).batches[0];
+	assert.deepEqual([second.id !== first.id, second.members, w.runs.at(-1).ref], [true, [a.attemptId, c.attemptId], `batch:${second.id}`]);
+	// The run of the batch that no longer stands changes nothing when it comes back.
+	await w.finish(`batch:${first.id}`, "pass"); await w.settle();
+	assert.equal(w.head("p--trunk"), base);
+	await w.finish(`batch:${second.id}`, "pass"); await w.settle();
+	const s = await w.state();
+	assert.deepEqual([a, b, c].map((x) => s.attempts.find((y) => y.id === x.attemptId).status), ["landed", "working", "landed"]);
+	assert.throws(() => trunkFile(w, "b.md"));
+});
+
+test("a batch that reached trunk but was not written down is recorded after a restart, each landing once", async (t) => {
+	const { w, agents } = await several(t, [{ "a.md": "a\n" }, { "b.md": "b\n" }, { "c.md": "c\n" }]);
+	await askAll(w, agents);
+	const batch = (await w.state()).batches[0];
+	w.project.recordBatch = async () => { throw new Error("the process ended"); };
+	await w.finish(`batch:${batch.id}`, "pass");
+	await w.settle();
+	assert.equal(w.head("p--trunk"), batch.tipSha, "trunk has the batch");
+	assert.equal((await w.state()).landings.length, 1, "and none of the three is written down");
+	w.restart();
+	await w.project.onPush("p--trunk");
+	await w.settle({ later: true });
+	const s = await w.state();
+	assert.deepEqual([s.landings.length, s.attempts.filter((x) => x.status === "landed").length, s.queue.length, s.batches.length, s.project.head], [4, 4, 0, 0, batch.tipSha]);
+	assert.equal(new Set(s.landings.map((l) => l.sha)).size, 4);
+	assert.equal(w.head("p--trunk"), batch.tipSha);
+});
+
+test("two attempts at one intent are not merged in the same batch; the second is superseded when the first lands", async (t) => {
+	const { w, intents } = await started(t, ["Mover", "Shared"]);
+	const mover = await ready(w, intents[0], "mover", { "moved.md": "m\n" });
+	const a = await ready(w, intents[1], "ana", { "a.md": "a\n" }), b = await ready(w, intents[1], "ben", { "b.md": "b\n" });
+	await land(w, mover.attemptId);
+	await askAll(w, [a, b]);
+	const batch = (await w.state()).batches[0];
+	assert.deepEqual(batch.members, [a.attemptId]);
+	await w.finish(`batch:${batch.id}`, "pass"); await w.settle();
+	const s = await w.state();
+	assert.deepEqual([s.attempts.find((x) => x.id === a.attemptId).status, s.attempts.find((x) => x.id === b.attemptId).status, s.queue.length, s.batches.length], ["landed", "superseded", 0, 0]);
+	assert.throws(() => trunkFile(w, "b.md"));
+});
+
+test("a project sets how many landings go in one batch, and \"land now\" goes alone and first", async (t) => {
+	const { w, intents } = await started(t, ["One", "Two", "Three", "Four"]);
+	const trunk = w.clone("p--trunk", "owner");
+	w.push(trunk, { "braid.json": JSON.stringify({ landing: { batch: 2 } }) + "\n" });
+	await w.project.onPush("p--trunk"); await w.settle(); await w.finish("trunk", "pass"); await w.settle();
+	const agents = [];
+	for (const [i, intent] of intents.entries()) agents.push(await ready(w, intent, `agent${i}`, { [`f${i}.md`]: `${i}\n` }));
+	await askAll(w, agents.slice(0, 3));
+	let s = await w.state();
+	assert.deepEqual([s.batches[0].members, s.queue.length], [agents.slice(0, 2).map((a) => a.attemptId), 3]);
+	// Forced, the fourth lands at once; trunk has moved, so the batch is built again on top of it.
+	await w.project.land(agents[3].attemptId, "rev", true); await w.settle();
+	s = await w.state();
+	assert.equal(s.attempts.find((x) => x.id === agents[3].attemptId).status, "landed");
+	assert.deepEqual([s.batches.length, s.batches[0].trunkSha, s.batches[0].members], [1, w.head("p--trunk"), agents.slice(0, 2).map((a) => a.attemptId)]);
+	await w.finish(`batch:${s.batches[0].id}`, "pass"); await w.settle();
+	s = await w.state();
+	assert.deepEqual(s.batches[0].members, [agents[2].attemptId]);
+	await w.finish(`batch:${s.batches[0].id}`, "pass"); await w.settle();
+	assert.equal((await w.state()).attempts.filter((x) => x.status === "landed").length, 4);
 });

@@ -134,12 +134,14 @@ export interface State {
 	/** Set when the instance has an admin token: the key that lets a sandboxed preview frame load each ref. */
 	previewKeys?: Record<string, string>;
 	project: ProjectInfo;
-	/** The latest run for each ref: an attempt id, "trunk", or "land:<attempt id>" for an attempt merged with trunk. */
+	/** The latest run for each ref: an attempt id, "trunk", or "batch:<id>" for a batch of landings merged with trunk ("batch:<id>:<n>" for one step of it), "lock:<attempt id>" for a lockfile being regenerated. */
 	runs: Run[];
 	/** Attempts someone asked to land, in the order they will be tried. */
 	queue: QueuedLanding[];
 	/** The last merge with trunk that was built for an attempt and sent to be verified. */
-	candidates: { attemptId: string; sha: string; trunkSha: string; attemptSha: string }[];
+	candidates: { attemptId: string; sha: string; trunkSha: string; attemptSha: string; /** The run that decides it: the batch's, or this attempt's own step once a failed batch is taken apart. */ runRef: string; runSha: string }[];
+	/** Landings being merged and verified together, in the order they will land. */
+	batches: Batch[];
 	intents: Intent[];
 	attempts: Attempt[];
 	decisions: Decision[];
@@ -174,7 +176,15 @@ export interface QueuedLanding {
 	state: "waiting" | "locking" | "verifying" | "pushing";
 	/** What it is waiting for, in words. */
 	note: string;
+	/** The batch it is being verified in, if it is in one. */
+	batch: number | null;
 }
+/**
+ * Several landings merged one on top of the other and verified with one run of the last. If that passes they
+ * all land. If it fails ("splitting"), every step is run at once: those before the first failure land, that one
+ * is refused, and the rest go back in the queue.
+ */
+export interface Batch { id: number; trunkSha: string; tipSha: string; state: "verifying" | "splitting" | "pushing"; members: string[]; at: number }
 export type LandOutcome =
 	| { landed: true; sha: string }
 	| { landed: false; reconciliationId: number; conflicts: string[] }

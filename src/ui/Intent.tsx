@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Attempt, Conflict, Decision, DecisionKind, DiffFile, Intent, Reconciliation, State } from "../shared/types";
 import { api, ago, intentColor, short, useAsync } from "./api";
 import { Agent, IntentId, Link, useAction, useTitle } from "./App";
+import { BatchChain, batchFor, queueLabel } from "./Batch";
 import { FileDiff } from "./Diff";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Icon, Notice, Tabs, type IconName, type Tab } from "./Kit";
@@ -269,7 +270,6 @@ function EditIntent({ intent, slug, done }: { intent: Intent; slug: string; done
 }
 
 type TabId = "changes" | "checks" | "why" | "session" | "preview";
-const WAITING = { verifying: "running the merge with trunk", locking: "regenerating the lockfile", pushing: "landing now", waiting: "waiting to land" } as const;
 
 function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLand: boolean }) {
 	const slug = state.project.slug;
@@ -314,8 +314,15 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	});
 	// A merge result only says something while trunk is still where the merge was made.
 	const candidate = state.candidates.find((c) => c.attemptId === a.id && c.attemptSha === a.headSha && c.trunkSha === state.project.head);
-	const mergeRun = candidate ? state.runs.find((r) => r.ref === `land:${a.id}` && r.sha === candidate.sha) ?? null : null;
-	const failing = run?.status === "fail" && run.sha === a.headSha ? "the failed checks" : mergeRun?.status === "fail" ? "the merge with trunk" : null;
+	const mergeRun = candidate ? state.runs.find((r) => r.ref === candidate.runRef && r.sha === candidate.runSha) ?? null : null;
+	// The run that decides the merge is the batch's while landings are checked together ("batch:<id>"), and this
+	// attempt's own step ("batch:<id>:<n>") once a failed batch is taken apart. Only the second is about this attempt alone.
+	const inBatch = batchFor(state, a.id);
+	const sharedWith = candidate && /^batch:\d+$/.test(candidate.runRef) ? ((state.batches ?? []).find((b) => `batch:${b.id}` === candidate.runRef)?.members ?? null) : null;
+	const shared = !!sharedWith && sharedWith.length > 1;
+	const ownStep = !!candidate && /^batch:\d+:\d+$/.test(candidate.runRef);
+	const mergeFailed = mergeRun?.status === "fail" && !shared;
+	const failing = run?.status === "fail" && run.sha === a.headSha ? "the failed checks" : mergeFailed ? "the merge with trunk" : null;
 	const skipQueue = () => force(`Land attempt ${a.id} now?`, "It lands without waiting for its run to finish, so trunk may take something that does not pass.");
 	const abandon = () => drop.run(async () => {
 		if (await ask({ title: `Abandon attempt ${a.id}?`, body: <p>{hostedGoing ? `${a.agent} is running and will be stopped. ` : ""}You can reopen it while the intent is open.</p>, confirm: "Abandon attempt", danger: true }) === null) return;
@@ -326,7 +333,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const sessionLive = a.hosted ? hostedGoing : a.status === "working";
 	const byId = new Map(state.attempts.map((x) => [x.id, x]));
 	const collisions = state.overlaps.filter((o) => o.a === a.id || o.b === a.id).map((o) => ({ ...o, other: byId.get(o.a === a.id ? o.b : o.a)! })).filter((o) => o.other);
-	const checkState = mergeRun?.status === "fail" ? "fail" : run && run.sha === a.headSha ? run.status : going ? "queued" : null;
+	const checkState = mergeFailed ? "fail" : run && run.sha === a.headSha ? run.status : going ? "queued" : null;
 	const tabs: Tab<TabId>[] = [
 		{ id: "changes", label: "Changes", icon: "changes", badge: diff ? <span className="n">{diff.length}</span> : null },
 		{ id: "checks", label: "Checks", icon: "check", badge: <>{!nothingPushed && checkState && <span className={`dot ${checkState}`} title={run ? `Braid's run: ${run.status}` : "Not run yet"} />}{collisions.length > 0 && <span className="n warn" title="Collisions with other attempts">{collisions.length}</span>}</> },
@@ -390,15 +397,17 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				{verdict?.outcome === "cancelled" && <p className="hint" role="status">Landing was cancelled by {verdict.by}, {ago(verdict.at)}. Nothing changed on trunk.</p>}
 				{queued && (
 					<div className="landing-wait" role="status">
-						<span className="chip working">{WAITING[queued.state]}</span>
-						<span>Landing was asked for by {queued.by}{queued.note ? `: ${queued.note}. It lands by itself when that is done.` : "."}</span>
+						<span className={`chip ${inBatch?.batch.state === "splitting" ? "conflict" : "working"}`}>{queueLabel(state, queued)}</span>
+						<span>Landing was asked for by {queued.by}{inBatch ? "." : queued.note ? `: ${queued.note}. It lands by itself when that is done.` : ". It lands by itself."}</span>
 						{!state.viewer && queued.state !== "pushing" && <span className="row">
-							<button disabled={land.busy} onClick={skipQueue}>Land now</button>
+							<button disabled={land.busy} onClick={skipQueue} title="It goes alone and first, without waiting for a run">Land now</button>
 							<button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/cancel-landing`, { by: "human" }))}>Cancel landing</button>
 						</span>}
+						{inBatch && <BatchChain state={state} batch={inBatch.batch} me={a.id} />}
+						{inBatch && inBatch.batch.members.length > 1 && !state.viewer && queued.state !== "pushing" && <p className="hint">Cancelling this landing, or landing it now, builds the batch again without it.</p>}
 					</div>
 				)}
-				{!state.viewer && going && failing && !hostedGoing && state.project.hosting[a.kind === "codex" ? "codex" : "claude"] && (
+				{!state.viewer && going && failing && !queued && !hostedGoing && state.project.hosting[a.kind === "codex" ? "codex" : "claude"] && (
 					<p className="row"><button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/rehost`, { task: "fix" }))}><Icon name="agent" />Have {a.agent} fix {failing}</button></p>
 				)}
 				{going && a.status !== "conflicted" && a.trunkConflicts.length > 0 && <Notice tone="warn" small>Landing now would conflict with trunk on <span className="mono">{a.trunkConflicts.join(", ")}</span>. Braid will open a reconciliation so you can resolve it.</Notice>}
@@ -425,7 +434,9 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 					</>}
 					{going && candidate && mergeRun && <>
 						<h3>Merged with trunk at <span className="mono">{short(candidate.trunkSha)}</span></h3>
-						<Verification slug={slug} refName={`land:${a.id}`} run={mergeRun} head={candidate.sha} fixed />
+						{shared && <Notice tone="info" small>This run is shared. It checks {sharedWith!.length} landings merged together in this order: attempts {sharedWith!.join(", then ")}. All of them land if it passes. If it fails, that is the batch's failure, not necessarily this attempt's: Braid then runs each one on its own to find which.</Notice>}
+						{ownStep && <Notice tone="info" small>The landings checked together failed, so this is the run of this attempt's own step: trunk, the landings ahead of it in the batch, and this attempt. {mergeRun.status === "pass" ? "It passed, so this attempt is not what broke the batch." : mergeRun.status === "fail" ? "It failed, so the failure is at or before this attempt." : "Its result says whether this attempt is what broke the batch."}</Notice>}
+						<Verification slug={slug} refName={candidate.runRef} run={mergeRun} head={candidate.runSha} fixed />
 					</>}
 					{a.checks.length > 0 && <>
 						<h3>Reported by the agent</h3>
