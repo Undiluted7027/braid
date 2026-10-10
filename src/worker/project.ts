@@ -4,11 +4,12 @@ import { DurableObject } from "cloudflare:workers";
 import { diffArrays } from "diff";
 import { ArtifactsHost, type CommitMeta, type RepoHost } from "./host";
 import { asText, assemble, diffTrees, listTree, markedView, merge3, mergeBase, predict } from "./gitops";
+import { claimMatches, claimOverlaps, fileOverlaps, risen, strongest } from "./overlap.ts";
 import { CANDIDATE, commitFiles, prepare, promote, revert, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
-import { drain, Log, type Effect, type Executor } from "./log.ts";
+import { drain, Log, type Effect, type Executor, type NewEffect, type NewEvent } from "./log.ts";
 import { applyEvent } from "./projection.ts";
 import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
@@ -18,7 +19,7 @@ import type {
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
-	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string; HOSTED_MAX?: string;
+	AI_GATEWAY_TOKEN?: string; OPENAI_API_KEY?: string; HOSTED_CLAUDE_MODEL?: string; HOSTED_CODEX_MODEL?: string; HOSTED_MAX?: string; SPARE_FORKS?: string;
 };
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
@@ -26,7 +27,12 @@ const LIVE = new Set(["working", "ready", "conflicted"]);
 const HOSTED_MAX = 6;
 /** Files a package manager writes. A conflict in one is not merged as text; it is regenerated. */
 const LOCKFILE = /(^|\/)(pnpm-lock\.yaml|package-lock\.json)$/;
-const RANK = { claim: 1, touch: 2, conflict: 3 } as const;
+/** Forks of trunk kept ready so that starting an attempt does not wait for one to be made, unless SPARE_FORKS says otherwise. */
+const SPARE_FORKS = 2, SPARE_FORKS_MAX = 8;
+/** After trunk moves, spare forks are replaced once it has been still this long, so a run of landings replaces them once. */
+const SPARE_SETTLE_MS = 15_000;
+/** How long `checkpoint` and `ready` wait for Braid to read the caller's own latest push before answering with what it has. */
+const OBSERVE_WAIT_MS = 4000;
 const MAX_TEXT = 400_000;
 const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
@@ -47,11 +53,6 @@ export function splitError(e: unknown): { status: number; message: string } {
 	const text = String((e as Error)?.message ?? e);
 	const m = /\[(\d{3})\] ([\s\S]*)$/.exec(text);
 	return m ? { status: Number(m[1]), message: m[2] } : { status: 500, message: text };
-}
-
-function claimMatches(pattern: string, path: string) {
-	const p = pattern.replace(/\*+$/, "").replace(/\/$/, "");
-	return p === "" || path === p || path.startsWith(p + "/") || (pattern.endsWith("*") && path.startsWith(p));
 }
 
 export class Project extends DurableObject<BraidEnv> {
@@ -99,6 +100,7 @@ export class Project extends DurableObject<BraidEnv> {
 			CREATE TABLE IF NOT EXISTS queue (attempt_id TEXT PRIMARY KEY, by TEXT, at INTEGER, attempt_sha TEXT, force INTEGER, state TEXT, note TEXT,
 				candidate_sha TEXT, trunk_sha TEXT, reconciled TEXT);
 			CREATE TABLE IF NOT EXISTS candidates (attempt_id TEXT PRIMARY KEY, sha TEXT, trunk_sha TEXT, attempt_sha TEXT, at INTEGER);
+			CREATE TABLE IF NOT EXISTS spares (repo TEXT PRIMARY KEY, remote TEXT, base_sha TEXT, at INTEGER);
 		`);
 		// Added after the first projects existed.
 		try { this.sql.exec("ALTER TABLE runs ADD COLUMN preview_api INTEGER DEFAULT 0"); } catch {}
@@ -188,20 +190,17 @@ export class Project extends DurableObject<BraidEnv> {
 		);
 	}
 
-	/** What a re-read of the repository found. Written on its own, so it cannot undo a claim, a check or a status change made meanwhile. */
-	private saveGit(a: Attempt) {
-		this.sql.exec("UPDATE attempts SET base_sha=?, head_sha=?, files=?, behind=?, trunk_conflicts=?, updated_at=? WHERE id=?",
-			a.baseSha, a.headSha, json(a.files), a.behind, json(a.trunkConflicts), now(), a.id);
-	}
 	private setStatus(id: string, status: Attempt["status"]) { this.sql.exec("UPDATE attempts SET status = ?, updated_at = ? WHERE id = ?", status, now(), id); }
 
+	private noted(kind: string, actor: string, text: string, intentId: number | null = null, attemptId: string | null = null): NewEvent {
+		return { type: "activity.noted", actor, intentId, attemptId, data: { kind, text: redact(text) } };
+	}
+	private signalled(to: string, kind: string, body: unknown): NewEvent { return { type: "signal.sent", attemptId: to, data: { kind, body } }; }
 	private note(kind: string, actor: string, text: string, intentId: number | null = null, attemptId: string | null = null) {
-		this.log.commit({ events: [{ type: "activity.noted", actor, intentId, attemptId, data: { kind, text: redact(text) } }] });
+		this.log.commit({ events: [this.noted(kind, actor, text, intentId, attemptId)] });
 		this.broadcast();
 	}
-	private signal(to: string, kind: string, body: unknown) {
-		this.log.commit({ events: [{ type: "signal.sent", attemptId: to, data: { kind, body } }] });
-	}
+	private signal(to: string, kind: string, body: unknown) { this.log.commit({ events: [this.signalled(to, kind, body)] }); }
 
 	// ── the worker: effects recorded by a decision are carried out here ──────
 
@@ -213,14 +212,22 @@ export class Project extends DurableObject<BraidEnv> {
 
 	async alarm() {
 		await drain(this.log, this.executors, {
-			until: now() + DRAIN_MS,
+			until: now() + DRAIN_MS, concurrency: 8,
 			onFailed: (effect, error) => this.effectFailed(effect, error),
 		});
 		this.log.prune();
 		this.wake();
 	}
 
-	private contextEffect(attemptId: string) { return { id: `context.save:${attemptId}`, type: "context.save", lane: "context", data: { attemptId } }; }
+	private contextEffect(attemptId: string): NewEffect { return { id: `context.save:${attemptId}`, type: "context.save", lane: "context", data: { attemptId } }; }
+	/** Read one attempt's repository again and compare it with the attempts it could collide with. */
+	private observeEffect(attemptId: string): NewEffect { return { id: `attempt.observe:${attemptId}`, type: "attempt.observe", lane: `repo:${attemptId}`, data: { attemptId } }; }
+	/** Verify the current commit of an attempt, or of trunk, unless it already has a run. */
+	private runEffect(ref: string): NewEffect { return { id: `run.start:${ref}`, type: "run.start", lane: `run:${ref}`, data: { ref } }; }
+	private spareEffect(): NewEffect { return { id: "fork.spare", type: "fork.spare", lane: "spares" }; }
+	private removeEffect(repo: string): NewEffect { return { id: `repo.remove:${repo}`, type: "repo.remove", lane: "spares", data: { repo } }; }
+	/** Move the landing queue, if anything is in it. */
+	private advanceEffect(): NewEffect[] { return this.rows("SELECT 1 FROM queue LIMIT 1").length ? [{ id: "queue.advance", type: "queue.advance", lane: "landing" }] : []; }
 
 	/** Each kind of effect checks what is true before it acts, so one that runs twice does no harm. */
 	private executors: Record<string, Executor> = {
@@ -232,6 +239,20 @@ export class Project extends DurableObject<BraidEnv> {
 				await this.saveContext(intent, a, intent.landedSha ?? "");
 			},
 		},
+		"attempt.observe": {
+			replaySafe: true,
+			run: async (effect) => {
+				const id: string = effect.data.attemptId, started = ++this.tick;
+				await this.observe(id);
+				// Whoever asked before this reading began has now been answered.
+				this.waiting = this.waiting.filter((w) => !(w.id === id && w.asked < started && (w.done(true), true)));
+			},
+		},
+		"trunk.observe": { replaySafe: true, run: async () => { if (this.trunk) await this.readTrunk(); } },
+		"run.start": { replaySafe: true, run: async (effect) => { if (this.trunk && (effect.data.ref === "trunk" || this.rows("SELECT 1 FROM attempts WHERE id = ?", effect.data.ref).length)) await this.verify(effect.data.ref); } },
+		"queue.advance": { replaySafe: true, run: async () => { if (this.trunk) await this.serial(() => this.advance()); } },
+		"fork.spare": { replaySafe: true, run: () => this.keepSpares() },
+		"repo.remove": { replaySafe: true, run: async (effect) => { await this.host.remove(effect.data.repo).catch((e) => { if (!/not.?found|does not exist/i.test(String(e?.message ?? e))) throw e; }); } },
 	};
 
 	private effectFailed(effect: Effect, error: string) {
@@ -248,10 +269,17 @@ export class Project extends DurableObject<BraidEnv> {
 		this.requireProject();
 		return { latest: this.log.latest(), events: this.log.after(after, limit), unsettled: this.log.effects().filter((e) => e.status === "pending" || e.status === "running" || e.status === "failed") };
 	}
+	/** Tell open pages to read the state again. Many changes close together are told once. */
+	private telling = false;
 	private broadcast() {
-		for (const ws of this.ctx.getWebSockets()) {
-			try { ws.send("changed"); } catch {}
-		}
+		if (this.telling) return;
+		this.telling = true;
+		setTimeout(() => {
+			this.telling = false;
+			for (const ws of this.ctx.getWebSockets()) {
+				try { ws.send("changed"); } catch {}
+			}
+		}, 100);
 	}
 
 	// ── live updates ─────────────────────────────────────────────────────────
@@ -324,6 +352,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.setMeta("branch", branch);
 		this.setMeta("head", head);
 		this.note("project", "braid", head ? `Project created with trunk ${repo} at ${short(head)}` : `Project created with an empty trunk ${repo}; waiting for a first push`);
+		if (head) this.log.commit({ effects: [this.runEffect("trunk"), this.spareEffect()] });
 	}
 
 	/**
@@ -377,14 +406,14 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		this.requireProject();
 		this.note("project", "braid", "Project moved to this Braid instance");
-		await this.serial(() => this.recompute());
+		this.log.commit({ effects: [{ id: "trunk.observe", type: "trunk.observe", lane: "trunk" }, ...this.trunkMovedEffects()] });
 		return { slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description") };
 	}
 
 	/** Delete the project. With `keepRepos`, forget it here and leave its repositories, for a project that has moved. */
 	async destroy(keepRepos = false) {
 		this.requireProject();
-		for (const repo of keepRepos ? [] : [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo)]) {
+		for (const repo of keepRepos ? [] : [this.trunk, `${this.meta("slug")}--context`, ...this.attempts().map((a) => a.repo), ...this.rows<{ repo: string }>("SELECT repo FROM spares").map((r) => r.repo)]) {
 			try { await this.host.remove(repo); } catch {}
 		}
 		for (const { id } of this.rows<{ id: string }>("SELECT id FROM attempts WHERE hosted IS NOT NULL")) {
@@ -457,36 +486,104 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("UPDATE attempts SET status = 'abandoned' WHERE intent_id = ? AND status IN ('working','ready','conflicted')", id);
 		this.note("intent", by, `Abandoned I${id}`, id);
 		for (const a of live) await this.retire(a.id);
-		await this.serial(() => this.recompute());
 	}
 
-	/** Start an attempt: fork trunk into a fresh Artifacts repo and hand the agent its credentials. */
-	join(input: { intentId: number; agent: string; kind?: string; origin: string }): Promise<JoinResult> {
-		return this.serial(() => this.startAttempt(input));
-	}
-	private async startAttempt(input: { intentId: number; agent: string; kind?: string; origin: string }): Promise<JoinResult> {
+	/**
+	 * Start an attempt: the agent gets its own fork of trunk in Artifacts and its credentials.
+	 * Making a fork takes seconds, so a few are kept ready (see keepSpares) and one is taken here when
+	 * it starts from trunk's head. Without one, the fork is made now. Nothing else waits on this.
+	 */
+	async join(input: { intentId: number; agent: string; kind?: string; origin: string }): Promise<JoinResult> {
 		this.requireProject();
-		const intent = this.intent(input.intentId);
-		if (intent.status !== "open") throw new BraidError(`I${intent.id} is ${intent.status}`);
-		if (!this.meta("head")) throw new BraidError("trunk has no commits yet: push a first commit before starting attempts");
+		const open = () => {
+			const intent = this.intent(input.intentId);
+			if (intent.status !== "open") throw new BraidError(`I${intent.id} is ${intent.status}`);
+			return intent;
+		};
+		let intent = open();
+		const head = this.meta("head");
+		if (!head) throw new BraidError("trunk has no commits yet: push a first commit before starting attempts");
 		const agent = (input.agent || "agent").trim().slice(0, 40);
+		let repo = "", remote: string, base: string;
+		const spare = this.rows<{ repo: string; remote: string; base_sha: string }>("SELECT * FROM spares WHERE base_sha = ? ORDER BY at LIMIT 1", head)[0];
+		if (spare) {
+			// Taken before anything is awaited, so two joins at once cannot be given the same fork.
+			this.log.commit({ events: [{ type: "spare.taken", data: { repo: spare.repo } }] });
+			[repo, remote, base] = [spare.repo, spare.remote, spare.base_sha];
+		} else {
+			const fork = () => {
+				repo = `${this.meta("slug")}--a-${crypto.randomUUID().slice(0, 8)}`;
+				return this.host.fork(this.trunk, repo, `Braid attempt (${agent}) for: ${intent.title}`);
+			};
+			// Several forks of one repository at once sometimes fail in Artifacts; a second try under a new name gets through.
+			remote = (await fork().catch(() => fork())).remote;
+			base = (await this.host.log(repo, this.branch, 1))[0]?.hash ?? head;
+		}
+		let gitToken: string, trunkToken: string;
+		try {
+			[gitToken, trunkToken] = await Promise.all([this.host.token(repo, "write", 86400), this.host.token(this.trunk, "read", 86400)]);
+			intent = open(); // it may have landed or been abandoned while the fork was being made
+		} catch (e) {
+			this.log.commit({ effects: [this.removeEffect(repo)] });
+			throw e;
+		}
 		const n = this.rows<{ n: number }>("SELECT COUNT(*) AS n FROM attempts WHERE intent_id = ?", intent.id)[0].n + 1;
 		const id = `${intent.id}.${n}`;
-		const repo = `${this.meta("slug")}--i${intent.id}-a${n}-${crypto.randomUUID().slice(0, 4)}`;
-		const forked = await this.host.fork(this.trunk, repo, `Braid attempt ${id} (${agent}) for: ${intent.title}`);
-		const base = (await this.host.log(repo, this.branch, 1))[0]?.hash ?? this.meta("head");
 		const token = "brd_" + [...crypto.getRandomValues(new Uint8Array(20))].map((b) => b.toString(16).padStart(2, "0")).join("");
 		this.sql.exec(
 			`INSERT INTO attempts (id, intent_id, agent, kind, repo, remote, token, base_sha, head_sha, trunk_seen, status, summary, files, claims, behind,
 				trunk_conflicts, checks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'working', '', '[]', '[]', 0, '[]', '[]', ?, ?)`,
-			id, intent.id, agent, input.kind ?? "agent", repo, forked.remote, token, base, base, base, now(), now(),
+			id, intent.id, agent, input.kind ?? "agent", repo, remote, token, base, base, base, now(), now(),
 		);
-		this.note("attempt", agent, `${agent} started attempt ${id} on I${intent.id} from ${short(base)}`, intent.id, id);
+		this.log.commit({
+			events: [this.noted("attempt", agent, `${agent} started attempt ${id} on I${intent.id} from ${short(base)}`, intent.id, id)],
+			// A fork made while trunk moved starts behind it: have that read. And make the next spare.
+			effects: [...(base === this.meta("head") ? [] : [this.observeEffect(id)]), this.spareEffect()],
+		});
+		this.broadcast();
 		return {
-			attemptId: id, intentId: intent.id, branch: this.branch, remote: forked.remote, gitToken: forked.token, agentToken: token,
-			trunkRemote: this.meta("remote"), trunkToken: await this.host.token(this.trunk, "read", 86400),
+			attemptId: id, intentId: intent.id, branch: this.branch, remote, gitToken, agentToken: token,
+			trunkRemote: this.meta("remote"), trunkToken,
 			mcpUrl: `${input.origin}/mcp/${this.meta("slug")}`, brief: this.briefText(this.attempt(id)),
 		};
+	}
+
+	/** How many forks to keep ready: a couple, and more while attempts are being started quickly. */
+	private spareTarget() {
+		const floor = this.env.SPARE_FORKS === undefined ? SPARE_FORKS : Math.max(0, Number(this.env.SPARE_FORKS) || 0);
+		if (!floor) return 0;
+		const lately = this.rows<{ n: number }>("SELECT COUNT(*) AS n FROM attempts WHERE created_at > ?", now() - 120_000)[0].n;
+		return Math.min(SPARE_FORKS_MAX, Math.max(floor, lately));
+	}
+
+	/** Replace spare forks that trunk has moved past, and make new ones up to the number wanted. */
+	private trunkMovedAt = 0;
+	private async keepSpares() {
+		if (!this.trunk || !this.meta("head")) return;
+		// While landings are still coming, a fork made now is behind by the next one. Wait until trunk has been still.
+		const still = now() - this.trunkMovedAt;
+		if (still < SPARE_SETTLE_MS || this.rows("SELECT 1 FROM queue LIMIT 1").length) {
+			this.log.commit({ effects: [{ ...this.spareEffect(), after: now() + Math.max(SPARE_SETTLE_MS - still, 5000) }] });
+			return;
+		}
+		const slug = this.meta("slug");
+		const stale = this.rows<{ repo: string }>("SELECT repo FROM spares WHERE base_sha != ?", this.meta("head"));
+		if (stale.length) this.log.commit({ events: stale.map((s) => ({ type: "spare.dropped", data: { repo: s.repo } })), effects: stale.map((s) => this.removeEffect(s.repo)) });
+		const one = async () => {
+			const repo = `${slug}--a-${crypto.randomUUID().slice(0, 8)}`;
+			const forked = await this.host.fork(this.trunk || `${slug}--trunk`, repo, "Braid: a fork of trunk kept ready for the next attempt");
+			const base = (await this.host.log(repo, this.branch, 1))[0]?.hash ?? "";
+			// The project was deleted, or trunk moved, while the fork was being made: it is of no use.
+			if (!this.trunk || base !== this.meta("head")) return void (await this.host.remove(repo).catch(() => {}));
+			this.log.commit({ events: [{ type: "spare.ready", data: { repo, remote: forked.remote, base } }] });
+		};
+		// A few at a time, and the number wanted is read again each round: it grows while attempts are being started.
+		for (let round = 0; round < 6 && this.trunk; round++) {
+			const short = this.spareTarget() - this.rows<{ n: number }>("SELECT COUNT(*) AS n FROM spares WHERE base_sha = ?", this.meta("head"))[0].n;
+			if (short <= 0) return;
+			const made = await Promise.allSettled(Array.from({ length: Math.min(short, 4) }, one));
+			if (made.every((m) => m.status === "rejected")) throw (made[0] as PromiseRejectedResult).reason;
+		}
 	}
 
 	async abandonAttempt(id: string, by = "human") {
@@ -495,7 +592,6 @@ export class Project extends DurableObject<BraidEnv> {
 		this.setStatus(id, "abandoned");
 		this.note("attempt", by, `Attempt ${id} abandoned`, a.intentId, id);
 		await this.retire(id);
-		await this.serial(() => this.recompute());
 	}
 
 	/** Undo an abandon. */
@@ -505,7 +601,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (this.intent(a.intentId).status !== "open") throw new BraidError(`I${a.intentId} is ${this.intent(a.intentId).status}; reopen is only for attempts of an open intent`);
 		this.setStatus(id, "working");
 		this.note("attempt", by, `Attempt ${id} reopened`, a.intentId, id);
-		await this.serial(() => this.recompute());
+		this.log.commit({ effects: [this.observeEffect(id)] });
 	}
 
 	/**
@@ -552,56 +648,150 @@ export class Project extends DurableObject<BraidEnv> {
 	/** An attempt that is over takes no further part: its agent is stopped and any landing asked for it is dropped. */
 	private async retire(id: string) {
 		this.sql.exec("DELETE FROM queue WHERE attempt_id = ?", id);
+		// It can no longer collide with anyone.
+		if (this.rows("SELECT 1 FROM overlaps WHERE a = ? OR b = ? LIMIT 1", id, id).length) this.log.commit({ events: [{ type: "overlaps.changed", attemptId: id, data: { overlaps: [] } }] });
+		this.log.cancel({ lane: `repo:${id}` }, "the attempt is over");
 		const hosted = this.rows<{ hosted: string | null }>("SELECT hosted FROM attempts WHERE id = ?", id)[0]?.hosted;
 		if (hosted === "starting" || hosted === "running") await this.agentHost(id)?.stop("the attempt is over").catch((e) => console.error("stop agent", id, e));
 	}
 
 	// ── awareness: what changed, and who is about to collide ─────────────────
 
+	/** Trunk's own line, newest first. Kept between calls, and read again only when the head held is not the recorded one. */
+	private trunkAt: CommitMeta[] | null = null;
 	private async trunkLog(): Promise<CommitMeta[]> {
-		const log = await this.host.log(this.trunk, this.branch, 300);
-		if (log[0] && log[0].hash !== this.meta("head")) {
-			if (!this.meta("head")) this.note("project", "braid", `Trunk received its first commit ${short(log[0].hash)}`);
-			this.setMeta("head", log[0].hash);
-		}
-		return log;
+		const head = this.meta("head");
+		return head && this.trunkAt?.[0]?.hash === head ? this.trunkAt : this.readTrunk();
 	}
 
-	/** Re-read an attempt from Artifacts: head, the trunk commit it is based on, changed files, conflicts with trunk. */
-	private async refresh(a: Attempt, trunkLog: CommitMeta[]): Promise<Attempt> {
-		const head = (await this.host.log(a.repo, this.branch, 1))[0];
-		const trunkHead = trunkLog[0];
-		if (!head || !trunkHead) return a;
-		const seen = this.rows<{ trunk_seen: string }>("SELECT trunk_seen FROM attempts WHERE id = ?", a.id)[0]?.trunk_seen;
-		if (head.hash === a.headSha && seen === trunkHead.hash) return a;
+	/** Read trunk from Artifacts. If its head is not the recorded one, trunk moved, and everything that depends on it is looked at again. */
+	private async readTrunk(): Promise<CommitMeta[]> {
+		for (let tries = 0; ; tries++) {
+			const was = this.meta("head"), held = this.trunkAt;
+			const log = await this.host.log(this.trunk, this.branch, 300);
+			if (this.meta("head") !== was && tries < 3) continue; // a landing was recorded while this was being read
+			const head = log[0]?.hash;
+			// An answer naming a commit that is already behind the recorded head is an old answer, not a move.
+			if (head && head !== was && (held?.slice(1).some((c) => c.hash === head) || this.rows("SELECT 1 FROM landings WHERE parent_sha = ?", head).length)) return held ?? log;
+			this.trunkAt = log;
+			if (head && head !== was) {
+				this.log.commit({
+					events: [{ type: "trunk.moved", data: { head } }, ...(was ? [] : [this.noted("project", "braid", `Trunk received its first commit ${short(head)}`)])],
+					effects: this.trunkMovedEffects(),
+				});
+				this.broadcast();
+			}
+			return log;
+		}
+	}
 
-		const base = (await mergeBase(this.host, a.repo, head.hash, trunkLog.map((c) => c.hash))) ?? a.baseSha;
-		const baseCommit = await this.host.readCommit(a.repo, base);
-		const baseTree = baseCommit?.treeHash ?? null;
-		a.baseSha = base;
-		a.headSha = head.hash;
-		a.files = await diffTrees(this.host, a.repo, baseTree, head.treeHash);
-		a.behind = Math.max(0, trunkLog.findIndex((c) => c.hash === base));
-		a.trunkConflicts = [];
-		if (a.behind > 0 && a.files.length) {
-			const trunkFiles = new Map((await diffTrees(this.host, this.trunk, baseTree, trunkHead.treeHash)).map((f) => [f.path, f]));
-			for (const f of a.files) {
-				const t = trunkFiles.get(f.path);
-				if (!t || t.head === f.head) continue;
-				const p = predict(await this.text(a.repo, f.base), await this.text(this.trunk, t.head), await this.text(a.repo, f.head));
-				if (p.conflict) a.trunkConflicts.push(f.path);
+	/** Trunk has a new head: every live attempt stands differently to it, trunk itself needs verifying, and the spare forks are behind. */
+	private trunkMovedEffects(): NewEffect[] {
+		const live = this.rows<{ id: string }>("SELECT id FROM attempts WHERE status IN ('working', 'ready', 'conflicted')");
+		this.trunkMovedAt = now();
+		return [...live.map((a) => this.observeEffect(a.id)), this.runEffect("trunk"), { ...this.spareEffect(), after: now() + SPARE_SETTLE_MS }, ...this.advanceEffect()];
+	}
+
+	/** Requests waiting to hear that an attempt has been read since they asked. */
+	private tick = 0;
+	private waiting: { id: string; asked: number; done: (fresh: boolean) => void }[] = [];
+	/** Ask for an attempt to be read again and wait a little for it. False means the answer will be from what was known before. */
+	private observed(id: string, ms = OBSERVE_WAIT_MS): Promise<boolean> {
+		const asked = ++this.tick;
+		this.log.commit({ effects: [this.observeEffect(id)] });
+		return new Promise((resolve) => {
+			const w = { id, asked, done: resolve };
+			this.waiting.push(w);
+			setTimeout(() => { this.waiting = this.waiting.filter((x) => x !== w); resolve(false); }, ms);
+		});
+	}
+
+	/**
+	 * Read one attempt from Artifacts: its head, the trunk commit it is based on, what it changed, what
+	 * would conflict with trunk, and where it meets the other live attempts. Only this attempt's
+	 * repository is read; the others are compared from what is already recorded about them.
+	 */
+	private async observe(id: string): Promise<void> {
+		if (!this.trunk) return;
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", id)[0];
+		if (!row || !LIVE.has(row.status)) return;
+		let a = this.toAttempt(row);
+		const trunkLog = await this.trunkLog(), trunkHead = trunkLog[0];
+		const head = (await this.host.log(a.repo, this.branch, 1))[0];
+		if (!head || !trunkHead) return;
+		let git: Observed | null = null;
+		if (head.hash !== a.headSha || row.trunk_seen !== trunkHead.hash) {
+			const base = (await mergeBase(this.host, a.repo, head.hash, trunkLog.map((c) => c.hash))) ?? a.baseSha;
+			const baseTree = (await this.host.readCommit(a.repo, base))?.treeHash ?? null;
+			const files = await diffTrees(this.host, a.repo, baseTree, head.treeHash);
+			const behind = Math.max(0, trunkLog.findIndex((c) => c.hash === base));
+			const trunkConflicts: string[] = [];
+			if (behind > 0 && files.length) {
+				const trunkFiles = new Map((await diffTrees(this.host, this.trunk, baseTree, trunkHead.treeHash)).map((f) => [f.path, f]));
+				for (const f of files) {
+					const t = trunkFiles.get(f.path);
+					if (!t || t.head === f.head) continue;
+					if (predict(await this.text(a.repo, f.base), await this.text(this.trunk, t.head), await this.text(a.repo, f.head)).conflict) trunkConflicts.push(f.path);
+				}
+			}
+			git = { baseSha: base, headSha: head.hash, files, behind, trunkConflicts, trunkSeen: trunkHead.hash };
+			a = { ...a, ...git };
+		}
+		const order = new Map(trunkLog.map((c, i) => [c.hash, i]));
+		const others = this.attempts().filter((o) => o.id !== id && LIVE.has(o.status) && o.intentId !== a.intentId);
+		const shared: Overlap[] = [];
+		for (const o of others) shared.push(...await fileOverlaps(a, o, order, (repo, hash) => this.text(repo, hash)));
+		this.recordObserved(id, row.head_sha, git, shared, new Map(others.map((o) => [o.id, o.headSha])));
+	}
+
+	/** Write down what a reading found. No awaiting here: it is decided against what is true now, which may have moved during the reading. */
+	private recordObserved(id: string, started: string, git: Observed | null, shared: Overlap[], compared: Map<string, string>) {
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", id)[0];
+		if (!row || !LIVE.has(row.status)) return;
+		// Another reading of this attempt was written down meanwhile: this one compared an older commit. Read again.
+		if (row.head_sha !== started) { this.log.commit({ effects: [this.observeEffect(id)] }); return; }
+		const before = this.toAttempt(row), a: Attempt = git ? { ...before, ...git } : before;
+		const events: NewEvent[] = [], effects: NewEffect[] = [];
+		if (git) {
+			events.push({ type: "attempt.observed", attemptId: id, intentId: a.intentId, data: git });
+			if (git.headSha !== before.headSha) events.push(this.noted("push", a.agent, `${a.agent} pushed ${short(a.headSha)} to attempt ${a.id} (${a.files.length} file${a.files.length === 1 ? "" : "s"} changed)`, a.intentId, a.id));
+			// An agent that merged trunk into its attempt has reconciled the git way: the open reconciliation is moot.
+			if (before.status === "conflicted" && git.behind === 0) {
+				a.status = "ready";
+				events.push({ type: "attempt.status", attemptId: id, data: { status: "ready" } }, { type: "reconciliation.dropped", attemptId: id },
+					this.noted("reconcile", a.agent, `${a.agent} merged trunk into attempt ${a.id}; it is ready to land again`, a.intentId, a.id));
+			}
+			effects.push(...this.advanceEffect());
+		}
+		// Every new commit of an attempt is verified in a sandbox.
+		if (a.headSha !== a.baseSha && this.latestRun(id)?.sha !== a.headSha) effects.push(this.runEffect(id));
+		const live = new Map(this.attempts().filter((o) => LIVE.has(o.status)).map((o) => [o.id, o]));
+		live.set(id, a);
+		const others = [...live.values()].filter((o) => o.id !== id && o.intentId !== a.intentId);
+		// Claims are compared here, from what is recorded this instant; a claim made during the reading is not missed.
+		const next = strongest([...shared.filter((o) => live.has(o.a) && live.has(o.b)), ...others.flatMap((o) => claimOverlaps(a, o))]);
+		events.push(...this.overlapEvents(a, next, live));
+		// Another attempt moved while this one was being compared with it: compare again.
+		if (others.some((o) => (compared.has(o.id) ? compared.get(o.id) !== o.headSha : o.files.length > 0))) effects.push(this.observeEffect(id));
+		this.log.commit({ events, effects });
+		this.broadcast();
+	}
+
+	/** The events for an attempt's overlaps becoming `next`: the new set, and a heads-up to both sides for each one that is new or worse. */
+	private overlapEvents(a: Attempt, next: Overlap[], live: Map<string, Attempt>): NewEvent[] {
+		const before = this.rows<Overlap>("SELECT a, b, path, severity, regions FROM overlaps WHERE a = ? OR b = ?", a.id, a.id);
+		const events: NewEvent[] = [];
+		for (const { overlap: o, had } of risen(before, next)) {
+			const A = live.get(o.a)!, B = live.get(o.b)!;
+			for (const [me, other] of [[A, B], [B, A]]) events.push(this.signalled(me.id, "overlap", { path: o.path, severity: o.severity, with: this.describe(other, o.path) }));
+			if (o.severity !== "claim" || !had) {
+				const verb = o.severity === "conflict" ? "will conflict on" : o.severity === "touch" ? "both changed" : "both plan to change";
+				events.push(this.noted(o.severity === "conflict" ? "conflict" : "overlap", "braid", `${A.agent} (I${A.intentId}) and ${B.agent} (I${B.intentId}) ${verb} ${o.path}`));
 			}
 		}
-		this.saveGit(a);
-		this.sql.exec("UPDATE attempts SET trunk_seen = ? WHERE id = ?", trunkHead.hash, a.id);
-		// An agent that merged trunk into its attempt has reconciled the git way: the open reconciliation is moot.
-		// The status is read again here: this attempt may have been abandoned or landed while the repository was being read.
-		if (this.attempt(a.id).status === "conflicted" && a.behind === 0) {
-			this.setStatus(a.id, "ready");
-			this.sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", a.id);
-			this.note("reconcile", a.agent, `${a.agent} merged trunk into attempt ${a.id}; it is ready to land again`, a.intentId, a.id);
-		}
-		return this.attempt(a.id);
+		const flat = (list: Overlap[]) => list.map((o) => `${o.a}|${o.b}|${o.path}|${o.severity}|${o.regions}`).sort().join("\n");
+		if (flat(before) !== flat(next)) events.push({ type: "overlaps.changed", attemptId: a.id, data: { overlaps: next } });
+		return events;
 	}
 
 	private blobCache = new Map<string, string | null>();
@@ -612,74 +802,6 @@ export class Project extends DurableObject<BraidEnv> {
 			this.blobCache.set(hash, asText(await this.host.readBlob(repo, hash)));
 		}
 		return this.blobCache.get(hash)!;
-	}
-
-	/** Refresh every live attempt, then find every pair of different intents touching the same file. */
-	private async recompute() {
-		const trunkLog = await this.trunkLog();
-		const order = new Map(trunkLog.map((c, i) => [c.hash, i]));
-		const live: Attempt[] = [];
-		for (const a of this.attempts()) {
-			if (!LIVE.has(a.status)) continue;
-			const fresh = await this.refresh(a, trunkLog);
-			if (LIVE.has(fresh.status)) live.push(fresh);
-		}
-		// Every new commit of an attempt is verified in a sandbox. Queued here, it runs on its own.
-		for (const a of live) {
-			if (a.headSha !== a.baseSha) await this.verify(a.id).catch((e) => console.error("verify", a.id, e));
-		}
-		// Trunk too, however its head moved: a landing, or a push from outside Braid.
-		// A merge of two attempts that each passed can still be broken.
-		if (this.meta("head")) await this.verify("trunk").catch((e) => console.error("verify trunk", e));
-
-		const next = new Map<string, Overlap>();
-		const put = (o: Overlap) => {
-			const key = `${o.a}|${o.b}|${o.path}`;
-			const prev = next.get(key);
-			if (!prev || RANK[o.severity] > RANK[prev.severity]) next.set(key, o);
-		};
-		for (let i = 0; i < live.length; i++) {
-			for (let j = i + 1; j < live.length; j++) {
-				const [a, b] = live[i].id < live[j].id ? [live[i], live[j]] : [live[j], live[i]];
-				if (a.intentId === b.intentId) continue; // competing attempts at one intent are alternatives, not collisions
-				const bFiles = new Map(b.files.map((f) => [f.path, f]));
-				for (const fa of a.files) {
-					const fb = bFiles.get(fa.path);
-					if (!fb) continue;
-					if (fa.head === fb.head) { put({ a: a.id, b: b.id, path: fa.path, severity: "touch", regions: 0 }); continue; }
-					// Merge against the older of the two bases: it is an ancestor of both.
-					const aOlder = (order.get(a.baseSha) ?? Infinity) >= (order.get(b.baseSha) ?? Infinity);
-					const base = aOlder ? await this.text(a.repo, fa.base) : await this.text(b.repo, fb.base);
-					const p = predict(base, await this.text(a.repo, fa.head), await this.text(b.repo, fb.head));
-					put({ a: a.id, b: b.id, path: fa.path, severity: p.conflict ? "conflict" : "touch", regions: p.regions });
-				}
-				for (const [x, y] of [[a, b], [b, a]] as const) {
-					for (const claim of x.claims) {
-						for (const path of [...y.files.map((f) => f.path), ...y.claims]) {
-							if (claimMatches(claim, path) || claimMatches(path, claim)) put({ a: a.id, b: b.id, path: claimMatches(claim, path) ? path : claim, severity: "claim", regions: 0 });
-						}
-					}
-				}
-			}
-		}
-
-		const prev = new Map(this.rows<Overlap>("SELECT a, b, path, severity, regions FROM overlaps").map((o) => [`${o.a}|${o.b}|${o.path}`, o]));
-		const byId = new Map(live.map((a) => [a.id, a]));
-		for (const [key, o] of next) {
-			const before = prev.get(key);
-			if (before && RANK[before.severity] >= RANK[o.severity]) continue;
-			for (const [me, other] of [[o.a, o.b], [o.b, o.a]]) {
-				this.signal(me, "overlap", { path: o.path, severity: o.severity, with: this.describe(byId.get(other)!, o.path) });
-			}
-			if (o.severity !== "claim" || !before) {
-				const A = byId.get(o.a)!, B = byId.get(o.b)!;
-				const verb = o.severity === "conflict" ? "will conflict on" : o.severity === "touch" ? "both changed" : "both plan to change";
-				this.note(o.severity === "conflict" ? "conflict" : "overlap", "braid", `${A.agent} (I${A.intentId}) and ${B.agent} (I${B.intentId}) ${verb} ${o.path}`);
-			}
-		}
-		this.sql.exec("DELETE FROM overlaps");
-		for (const o of next.values()) this.sql.exec("INSERT INTO overlaps (a, b, path, severity, regions) VALUES (?, ?, ?, ?, ?)", o.a, o.b, o.path, o.severity, o.regions);
-		this.broadcast();
 	}
 
 	/** Another agent's work as seen from outside: who, for which intent, and the reasoning that touches `path`. */
@@ -693,22 +815,12 @@ export class Project extends DurableObject<BraidEnv> {
 		};
 	}
 
-	/** Called for every push in the Artifacts namespace (via PushWorkflow). */
+	/** Called for every push in the Artifacts namespace (via PushWorkflow). The push is only written down here; reading it is the worker's job. */
 	async onPush(repo: string) {
 		if (!this.trunk) return;
 		const row = this.rows<{ id: string }>("SELECT id FROM attempts WHERE repo = ?", repo)[0];
-		if (!row && repo !== this.trunk) return;
-		await this.serial(async () => {
-			if (row) {
-				const before = this.attempt(row.id);
-				await this.recompute();
-				const after = this.attempt(row.id);
-				if (after.headSha !== before.headSha) {
-					this.note("push", after.agent, `${after.agent} pushed ${short(after.headSha)} to attempt ${after.id} (${after.files.length} file${after.files.length === 1 ? "" : "s"} changed)`, after.intentId, after.id);
-				}
-			} else await this.recompute();
-			await this.advance();
-		});
+		if (row) this.log.commit({ effects: [this.observeEffect(row.id)] });
+		else if (repo === this.trunk) this.log.commit({ effects: [{ id: "trunk.observe", type: "trunk.observe", lane: "trunk" }] });
 	}
 
 	// ── hosted agents: Braid runs the agent itself, in a sandbox ─────────────
@@ -999,9 +1111,17 @@ export class Project extends DurableObject<BraidEnv> {
 				const paths: string[] = (args.paths ?? []).map(String).filter(Boolean);
 				if (!paths.length) throw new BraidError("claim needs at least one path");
 				me.claims = [...new Set([...me.claims, ...paths])];
-				this.saveAttempt(me);
-				this.note("claim", me.agent, `${me.agent} plans to change ${paths.join(", ")}${args.reason ? `: ${args.reason}` : ""}`, me.intentId, me.id);
-				await this.serial(() => this.recompute());
+				// Nothing is read for this: a claim is compared with what is already recorded about the others.
+				const live = new Map(this.attempts().filter((o) => LIVE.has(o.status)).map((o) => [o.id, o]));
+				live.set(me.id, me);
+				const kept = this.rows<Overlap>("SELECT a, b, path, severity, regions FROM overlaps WHERE (a = ? OR b = ?) AND severity != 'claim'", me.id, me.id);
+				const next = strongest([...kept, ...[...live.values()].filter((o) => o.id !== me.id).flatMap((o) => claimOverlaps(me, o))]);
+				this.log.commit({ events: [
+					{ type: "attempt.claimed", attemptId: me.id, intentId: me.intentId, actor: me.agent, data: { claims: me.claims } },
+					this.noted("claim", me.agent, `${me.agent} plans to change ${paths.join(", ")}${args.reason ? `: ${args.reason}` : ""}`, me.intentId, me.id),
+					...this.overlapEvents(me, next, live),
+				] });
+				this.broadcast();
 				return { claimed: me.claims, overlaps: this.overlapsFor(me.id) };
 			}
 			case "record": {
@@ -1016,12 +1136,13 @@ export class Project extends DurableObject<BraidEnv> {
 				return { recorded: true, ...(named.length || kind === "question" ? {} : { tip: "Name the files this is about in `files`, so it is shown on the lines it led to." }) };
 			}
 			case "checkpoint": {
-				await this.serial(() => this.recompute());
+				const fresh = await this.observed(me.id);
 				const a = this.attempt(me.id);
 				if (args.summary) { a.summary = redact(String(args.summary)); this.saveAttempt(a); }
 				return {
 					head: a.headSha, changed: a.files.map((f) => `${f.status} ${f.path}`), behind_trunk_by: a.behind,
 					would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a),
+					...(fresh ? {} : { note: STALE_NOTE }),
 				};
 			}
 			case "peek": {
@@ -1049,9 +1170,10 @@ export class Project extends DurableObject<BraidEnv> {
 				return { checks: me.checks };
 			}
 			case "ready": {
-				await this.serial(() => this.recompute());
+				const fresh = await this.observed(me.id);
 				const a = this.attempt(me.id);
-				if (a.headSha === a.baseSha) throw new BraidError("nothing pushed yet: push your commits to the attempt remote before marking ready");
+				if (!LIVE.has(a.status)) throw new BraidError(`attempt ${a.id} is ${a.status}`, 409);
+				if (a.headSha === a.baseSha) throw new BraidError(fresh ? "nothing pushed yet: push your commits to the attempt remote before marking ready" : "Braid has not seen a push to this attempt yet. If you have pushed, call `ready` again in a few seconds.");
 				const run = this.latestRun(a.id);
 				if (run?.sha === a.headSha && run.status === "fail") {
 					throw new BraidError(`commit ${short(a.headSha)} failed verification (${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}). Fix it and push before marking ready; \`checkpoint\` shows the result.`);
@@ -1060,7 +1182,7 @@ export class Project extends DurableObject<BraidEnv> {
 				if (args.summary) a.summary = redact(String(args.summary));
 				this.saveAttempt(a);
 				this.note("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id);
-				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a) };
+				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a), ...(fresh ? {} : { note: STALE_NOTE }) };
 			}
 			case "reconciliation": {
 				const r = this.openRecon(me.id);
@@ -1172,7 +1294,10 @@ export class Project extends DurableObject<BraidEnv> {
 	land(attemptId: string, by = "human", force = false, sha?: string): Promise<LandOutcome> {
 		return this.serial(async () => {
 			this.requireProject();
-			await this.recompute();
+			this.attempt(attemptId);
+			// A landing is for the commit that is there now, so this one reading is waited for.
+			await this.readTrunk();
+			await this.observe(attemptId);
 			const a = this.attempt(attemptId);
 			const intent = this.intent(a.intentId);
 			if (intent.status !== "open") throw new BraidError(`I${intent.id} is already ${intent.status}`);
@@ -1336,7 +1461,8 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		if (!result.ok && result.reason === "moved") {
 			// Something was pushed since this object last looked. Look again; the next pass decides with what is there now.
-			await this.recompute();
+			await this.readTrunk();
+			await this.observe(a.id);
 			return { kind: "wait", why: `${result.what === "trunk" ? "trunk" : `attempt ${a.id}`} moved while landing; trying again` };
 		}
 		if (!result.ok && result.reason === "nothing-to-land") return { kind: "refused", why: `attempt ${a.id} has nothing that trunk does not already have` };
@@ -1400,7 +1526,7 @@ export class Project extends DurableObject<BraidEnv> {
 				this.signal(other.id, "trunk-moved", { landed: landedWhy, files, note: "Trunk moved. Call `checkpoint` to see whether this affects you, and `sync` for how to merge trunk into your attempt." });
 			}
 		}
-		await this.recompute();
+		this.log.commit({ effects: this.trunkMovedEffects() });
 	}
 
 	/**
@@ -1436,7 +1562,7 @@ export class Project extends DurableObject<BraidEnv> {
 			for (const other of this.attempts()) {
 				if (LIVE.has(other.status)) this.signal(other.id, "trunk-moved", { reverted: `I${intent.id}: ${intent.title}`, reason: why, files: l.files, note: "A landing was taken back out of trunk. Call `checkpoint` to see whether this affects you." });
 			}
-			await this.recompute();
+			this.log.commit({ effects: this.trunkMovedEffects() });
 			await this.advance();
 			return { reverted: true, sha: result.sha };
 		});
@@ -1742,6 +1868,9 @@ function describeCall(tool: string, args: Record<string, any>): string {
 		default: return tool;
 	}
 }
+
+type Observed = Pick<Attempt, "baseSha" | "headSha" | "files" | "behind" | "trunkConflicts"> & { trunkSeen: string };
+const STALE_NOTE = "Braid has not finished reading your latest push, so this is what it knew before. Anything new arrives in heads_up on your next call.";
 
 const RECONCILE_HELP =
 	"Each conflicting file lists its `regions`: the places where trunk and your attempt changed the same lines. A region has trunk's text, your attempt's text, their common base, and a few unchanged lines `before` and `after` it. " +

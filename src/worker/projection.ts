@@ -16,6 +16,34 @@ export function applyEvent(sql: Sql, e: BraidEvent) {
 		case "context.repo.created":
 			sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('context_remote', ?)", e.data.remote);
 			break;
+		case "trunk.moved":
+			sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('head', ?)", e.data.head);
+			break;
+		// What a reading of an attempt's repository found. Written on its own columns, so it cannot undo a claim, a check or a status change.
+		case "attempt.observed":
+			sql.exec("UPDATE attempts SET base_sha = ?, head_sha = ?, files = ?, behind = ?, trunk_conflicts = ?, trunk_seen = ?, updated_at = ? WHERE id = ?",
+				e.data.baseSha, e.data.headSha, JSON.stringify(e.data.files), e.data.behind, JSON.stringify(e.data.trunkConflicts), e.data.trunkSeen, e.at, e.attemptId);
+			break;
+		case "attempt.status":
+			sql.exec("UPDATE attempts SET status = ?, updated_at = ? WHERE id = ?", e.data.status, e.at, e.attemptId);
+			break;
+		case "attempt.claimed":
+			sql.exec("UPDATE attempts SET claims = ?, updated_at = ? WHERE id = ?", JSON.stringify(e.data.claims), e.at, e.attemptId);
+			break;
+		case "reconciliation.dropped":
+			sql.exec("DELETE FROM reconciliations WHERE attempt_id = ? AND status IN ('open', 'resolving')", e.attemptId);
+			break;
+		// All of one attempt's overlaps at once: its pairs with everyone else.
+		case "overlaps.changed":
+			sql.exec("DELETE FROM overlaps WHERE a = ? OR b = ?", e.attemptId, e.attemptId);
+			for (const o of e.data.overlaps) sql.exec("INSERT OR REPLACE INTO overlaps (a, b, path, severity, regions) VALUES (?, ?, ?, ?, ?)", o.a, o.b, o.path, o.severity, o.regions);
+			break;
+		case "spare.ready":
+			sql.exec("INSERT OR REPLACE INTO spares (repo, remote, base_sha, at) VALUES (?, ?, ?, ?)", e.data.repo, e.data.remote, e.data.base, e.at);
+			break;
+		case "spare.taken": case "spare.dropped":
+			sql.exec("DELETE FROM spares WHERE repo = ?", e.data.repo);
+			break;
 		// An event this version does not know changes nothing here: it was written by a newer one.
 	}
 }

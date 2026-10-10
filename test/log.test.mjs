@@ -180,3 +180,30 @@ test("replaying the log into empty tables gives the same rows", () => {
 	for (const e of first.log.after(0)) applyEvent(second.sql, e);
 	for (const table of ["activity", "signals", "meta"]) assert.deepEqual(second.all(table), first.all(table));
 });
+
+test("work asked for while a slow effect runs starts at once in another lane", async () => {
+	const { log } = setup();
+	const order = [];
+	log.commit({ effects: [{ id: "slow", type: "slow", lane: "spares" }] });
+	await drain(log, {
+		slow: { replaySafe: true, run: async () => {
+			setTimeout(() => log.commit({ effects: [effect("quick", "repo:1.1")] }), 5);
+			await new Promise((r) => setTimeout(r, 60));
+			order.push("slow");
+		} },
+		work: { replaySafe: true, run: async () => { order.push("quick"); } },
+	});
+	assert.deepEqual(order, ["quick", "slow"]);
+});
+
+test("work that asks for itself again later, while it runs, waits until then", async () => {
+	const { log, clock } = setup();
+	let runs = 0;
+	log.commit({ effects: [effect("spare", "spares")] });
+	const executors = { work: { replaySafe: true, run: async () => { if (++runs === 1) log.commit({ effects: [{ ...effect("spare", "spares"), after: clock.t + 15_000 }] }); } } };
+	await drain(log, executors, { now: () => clock.t });
+	assert.deepEqual([runs, log.effect("spare").status, log.nextAt()], [1, "pending", 16_000]);
+	clock.t = 16_000;
+	await drain(log, executors, { now: () => clock.t });
+	assert.deepEqual([runs, log.effect("spare").status], [2, "succeeded"]);
+});

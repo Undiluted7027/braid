@@ -34,13 +34,25 @@ export class Log {
 	private now: () => number;
 	private woke: () => void;
 	private depth = 0;
+	private listening = new Set<() => void>();
 
 	constructor(opts: { sql: Sql; transaction: <T>(fn: () => T) => T; apply: (event: BraidEvent) => void; now?: () => number; onEffects?: () => void }) {
 		this.sql = opts.sql;
 		this.transaction = opts.transaction;
 		this.apply = opts.apply;
 		this.now = opts.now ?? Date.now;
-		this.woke = opts.onEffects ?? (() => {});
+		this.woke = () => {
+			for (const heard of [...this.listening]) heard();
+			opts.onEffects?.();
+		};
+	}
+
+	/** Resolves the next time the outbox changes: something was asked for, or something running settled. */
+	changed(): { promise: Promise<void>; stop: () => void } {
+		let heard = () => {};
+		const promise = new Promise<void>((resolve) => { heard = resolve; });
+		this.listening.add(heard);
+		return { promise, stop: () => this.listening.delete(heard) };
 	}
 
 	schema() {
@@ -131,7 +143,7 @@ export class Log {
 				effect.id, effect.type, effect.lane, data, available, at, at, commandId);
 		} else if (have.status === "running") {
 			// It is reading the world as it was a moment ago. Once it finishes it goes round again with what is asked now.
-			this.sql.exec("UPDATE effects SET again = 1, data = ?, command_id = ?, updated_at = ? WHERE id = ?", data, commandId, at, effect.id);
+			this.sql.exec("UPDATE effects SET again = 1, data = ?, command_id = ?, available_at = ?, updated_at = ? WHERE id = ?", data, commandId, available, at, effect.id);
 		} else if (have.status !== "pending") {
 			// Settled work asked for again is new work. It goes to the back of its lane.
 			this.sql.exec("DELETE FROM effects WHERE id = ?", effect.id);
@@ -175,7 +187,7 @@ export class Log {
 	succeed(id: string) {
 		const at = this.now();
 		// Asked for again while it ran: it is not done until it has seen what was asked last.
-		const again = this.rows(`UPDATE effects SET status = 'pending', again = 0, tries = 0, available_at = ?, updated_at = ? WHERE id = ? AND status = 'running' AND again = 1 RETURNING id`, at, at, id).length;
+		const again = this.rows(`UPDATE effects SET status = 'pending', again = 0, tries = 0, updated_at = ? WHERE id = ? AND status = 'running' AND again = 1 RETURNING id`, at, id).length;
 		if (!again) this.sql.exec("UPDATE effects SET status = 'succeeded', updated_at = ?, last_error = NULL WHERE id = ? AND status = 'running'", at, id);
 		this.woke();
 	}
@@ -267,6 +279,9 @@ export async function drain(log: Log, executors: Record<string, Executor>, opts:
 			}
 		}
 		if (!running.size) return ran;
-		await Promise.race(running);
+		// Wake when one finishes, and also when new work is asked for: it may be for a lane that is free.
+		const change = log.changed();
+		await Promise.race([...running, change.promise]);
+		change.stop();
 	}
 }

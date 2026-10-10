@@ -137,7 +137,46 @@ The design agreed: a command only records what was decided; its events, the rows
    - Open: nothing else goes through the log yet. Tool calls still re-read every attempt and wait in one line; that is step 2.
    - Open: failed effects are not shown under "Needs you", only in Activity and at `/events`.
    - Not verified: recovery after a real restart of the object in the middle of an effect. It is tested under Node only.
-2. **Observation and overlaps as effects**, and `claim`, `checkpoint`, `ready`, `join` and `land` answering from recorded state. Then the 40 agents again.
+2. **Observation and overlaps as effects.** Done locally on October 9, 2026, not deployed. The 40-agent run on the deployed instance is still owed.
+   - Done: a push is only written down; the worker reads that one attempt's repository (`attempt.observe`) and compares it with what is already recorded about the others (`src/worker/overlap.ts`, with tests). The loop over every pair, and re-reading every attempt on every call, are gone.
+   - Done: a reading is written down against what is true at that moment. If the attempt it was compared with moved meanwhile, or another reading of the same attempt got in first, it is read again.
+   - Done: `claim` reads nothing: claims are compared from recorded state in the call itself.
+   - Done: `checkpoint` and `ready` ask for the caller's own attempt to be read and wait up to four seconds for it. If it takes longer they answer with what was known and say so; the rest arrives in `heads_up`.
+   - Done: `join` no longer waits behind other calls. A few forks of trunk are kept ready (two, up to eight while attempts are being started quickly; `SPARE_FORKS` changes or turns this off) and one is taken when it starts from trunk's head. Otherwise the fork is made in the call, with one retry. Spares are replaced once trunk has been still for fifteen seconds and nothing is waiting to land.
+   - Done: trunk moving (a landing, a revert, a push from outside) asks for every live attempt to be read again, for trunk to be verified, and for the landing queue to move, all as effects. A read of trunk that names a commit already behind the recorded head is ignored.
+   - Done: an attempt that is over has its overlaps removed and its pending readings cancelled.
+   - Done: pages are told "changed" at most once per 100 ms.
+   - Done: the worker takes new work as soon as it is asked for, not only when something running finishes.
+   - Not done here: `land` still waits for its own reading and answers landed, queued or conflict as before. Answering "queued" always comes with step 3, when the queue itself moves onto effects.
+   - Checked locally: `pnpm test` (47), `pnpm typecheck`, `pnpm sim`, and twelve scripted agents six at a time, then all twelve landings through the queue (eight landed, four conflicted as that script intends, nothing left in the outbox).
+
+   | Call, 12 agents locally | Before (deployed, 19 live, one call at a time) | Now |
+   |---|---|---|
+   | `claim` | 1.1 s | under 0.05 s |
+   | `checkpoint` after a push | 5.8 s | 0.8 s typical, 1.1 s at worst, none answered early |
+   | `ready` | about the same as `checkpoint` | 0.2 s typical |
+   | `join` with a spare fork ready | 4.4 s | 0.2 to 0.45 s |
+   | `join` in a burst that outruns the spares | 4.4 s, and queued behind every other call | 2.5 s typical, 3.8 s at worst |
+
+   - Checked on the deployed instance on October 9, 2026: the 40-agent run from DIRECTION.md repeated in a new project, `scale-40` (the old `scale-probe` was deleted; `scale-40` is left there as the test bed). Forty agents, eight at a time, joins starting twenty seconds after the project was made.
+
+   | Measure, 40 agents on the deployed instance | Before | Now |
+   |---|---|---|
+   | Joined, pushed, verified, marked ready | all 40 | all 40 |
+   | `join` | about 13 s typical | 0.5 s typical, 3.3 s at worst (25 of 40 took a spare fork) |
+   | `claim` | not measured, about as slow as `checkpoint` | 0.1 s typical, 0.2 s at worst |
+   | `checkpoint` | 15 s typical, 29 s at worst | 0.9 s typical, 1.4 s at worst, none answered before its push was read |
+   | `ready` | about 13 s typical | 0.4 s typical, 0.7 s at worst |
+   | Overlaps found | 90 pairs, all correct | the same 90 |
+   | The forty agents' whole working phase | several minutes | 24 s |
+   | Asking for 40 landings | 22 landed, about 22 s each | the same 22 landed, about 9 s each (193 s in all) |
+   | The other 18 | open reconciliations | the same 18 |
+   | Project state sent to a page | 0.24 MB | 0.12 MB at the same point |
+
+   - Seen in that run: the log grew to 2,453 events, of which 672 were readings of attempts (each landing asks for every live attempt to be read again) and 1,005 were heads-up signals. Nothing was left in the outbox and no effect failed.
+   - Open: a burst of joins faster than Artifacts can fork still waits for forks. Five of twelve got a spare in the local run, 25 of 40 on the deployed one.
+   - Open: deleting a project and creating one with the same name seconds later failed once in Artifacts ("An internal error occurred" on fork). Not caused by this work; a fresh name was fine.
+   - Open: attempts are still inserted directly, not through an event. The replay test covers only the tables the log writes.
 3. **The landing queue, revert, model reconciliation and agent start and stop** on effects.
 4. **Tests of the project logic under Node**, with a crash forced between a push and its record.
 
