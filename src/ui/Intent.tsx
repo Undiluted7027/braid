@@ -6,6 +6,7 @@ import { Agent, IntentId, Link, useAction, useTitle } from "./App";
 import { FileDiff } from "./Diff";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Icon, Notice, Tabs, type IconName, type Tab } from "./Kit";
+import { forceable, landingVerdict, modelVerdict, neverStarted, outcomesOf, reason, revertVerdict, sentence, useAsked } from "./Later";
 import { HostedChip, JoinCommand } from "./Project";
 import { Session } from "./Session";
 
@@ -166,6 +167,10 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	const answerOf = (c: Conflict): Answer => answers[c.path] ?? { whole: null, pieces: [] };
 	const [rationale, setRationale] = useState("");
 	const act = useAction();
+	// Asking the model only starts it. The reconciliation says "resolving" while it works, then lands or goes back to open with a reason among the outcomes.
+	const failed = modelVerdict(state, r.id);
+	const lastModel = outcomesOf(state).find((o) => o.kind === "reconcile" && o.ref === `R${r.id}`);
+	const modelAsked = useAsked(r.status !== "open", lastModel?.id, 60_000);
 	const base = `/p/${state.project.slug}/reconciliations/${r.id}`;
 	const owner = attempt as Attempt | undefined;
 	const agentBusy = owner?.hosted === "starting" || owner?.hosted === "running";
@@ -185,12 +190,16 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 	}
 	const unanswered = r.conflicts.filter((c) => !complete(c, answers[c.path])).length;
 	const blocked = [unanswered > 0 && `answer the conflicts in ${unanswered} file${unanswered === 1 ? "" : "s"}`, !rationale.trim() && "say how both intents survive"].filter(Boolean) as string[];
-	const resolving = r.status === "resolving";
+	const resolving = r.status === "resolving" || modelAsked.pending;
+	const modelNote = resolving
+		? <p className="recon-model" role="status"><Icon name="running" className="spin" />{state.project.llm ?? "The model"} is reading both sides and their reasons. If it finds a resolution, that is run in a sandbox and then lands; if it cannot, the reason appears here.</p>
+		: failed ? <Notice small>{state.project.llm ?? "The model"} did not resolve this ({ago(failed.at)}): {sentence(failed.text)} The conflict is still open{state.viewer ? "." : ": try again, or resolve it below."}</Notice> : null;
 	if (state.viewer) {
 		return (
 			<section className="panel recon" aria-label={`Reconciliation ${r.id}`}>
 				<h2><span className="chip conflict">conflict</span>Attempt {r.attemptId} and trunk changed the same lines</h2>
 				<p className="lede">Landing stopped on {r.conflicts.map((c) => c.path).join(", ")}. Someone signed in has to resolve it with both intents in view.</p>
+				{modelNote}
 			</section>
 		);
 	}
@@ -201,8 +210,8 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 			<div className="recon-auto">
 				<span className="label">Let something else resolve it</span>
 				{state.project.llm && (
-					<button disabled={act.busy || resolving} onClick={() => act.run(() => api("POST", `${base}/auto`))}>
-						<Icon name="reconcile" />{act.busy || resolving ? "Reconciling…" : `Reconcile with ${state.project.llm}`}
+					<button disabled={act.busy || resolving} onClick={() => act.run(async () => { await api("POST", `${base}/auto`); modelAsked.mark(); })}>
+						<Icon name="reconcile" />{act.busy || resolving ? "Reconciling…" : failed ? `Try ${state.project.llm} again` : `Reconcile with ${state.project.llm}`}
 					</button>
 				)}
 				{canBringBack && (
@@ -212,6 +221,7 @@ function ReconPanel({ r, state }: { r: Reconciliation; state: State }) {
 				)}
 				<span className="dim">The agent on attempt {r.attemptId} can also answer through its <code>reconciliation</code> and <code>resolve</code> tools, or by merging trunk with git.</span>
 			</div>
+			{modelNote}
 			{r.conflicts.map((c) => (
 				<ConflictView key={c.path} c={c} attempt={attempt} answer={answerOf(c)} onChange={(v) => setAnswers({ ...answers, [c.path]: v })} markedUrl={`${base}/marked?path=${encodeURIComponent(c.path)}`}
 					attemptWhy={mine.filter((d) => touches(d, c.path)).length ? mine.filter((d) => touches(d, c.path)) : mine} />
@@ -279,6 +289,18 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 	const run = runFor(state, a.id);
 	const going = LIVE.has(a.status), hostedGoing = a.hosted === "starting" || a.hosted === "running";
 	const nothingPushed = a.headSha === a.baseSha;
+	const queued = state.queue.find((q) => q.attemptId === a.id);
+	// Asking to land only writes the request down. What became of it shows up later: in the queue, as a
+	// reconciliation, as a landing, or as a refusal among the outcomes.
+	const lastLanding = outcomesOf(state).find((o) => o.kind === "landing" && o.attemptId === a.id);
+	const landAsked = useAsked(!!queued || !going || a.status === "conflicted", lastLanding?.id);
+	const verdict = landAsked.pending ? null : landingVerdict(state, a);
+	const stopping = useAsked(!hostedGoing);
+	const force = (title: string, body: string) => land.run(async () => {
+		if (await ask({ title, body: <p>{body}</p>, confirm: "Land it anyway", danger: true }) === null) return;
+		await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true, sha: a.headSha });
+		landAsked.mark();
+	});
 	// The commit on screen is the one that lands: if the attempt has moved since, Braid refuses.
 	const landIt = () => land.run(async () => {
 		if (a.status === "working" && await ask({ title: `Land attempt ${a.id} as it is?`, body: <p>{a.agent} has not marked it ready, so it may be unfinished.</p>, confirm: "Land it" }) === null) return;
@@ -288,16 +310,13 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 			if (await ask({ title: "Land it without a passing run?", body: <p>{(e as Error).message.replace(/[.;] [Ll]and it anyway with force$/, "")}.</p>, confirm: "Land it anyway", danger: true }) === null) throw e;
 			await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true, sha: a.headSha });
 		}
+		landAsked.mark();
 	});
-	const queued = state.queue.find((q) => q.attemptId === a.id);
 	// A merge result only says something while trunk is still where the merge was made.
 	const candidate = state.candidates.find((c) => c.attemptId === a.id && c.attemptSha === a.headSha && c.trunkSha === state.project.head);
 	const mergeRun = candidate ? state.runs.find((r) => r.ref === `land:${a.id}` && r.sha === candidate.sha) ?? null : null;
 	const failing = run?.status === "fail" && run.sha === a.headSha ? "the failed checks" : mergeRun?.status === "fail" ? "the merge with trunk" : null;
-	const skipQueue = () => land.run(async () => {
-		if (await ask({ title: `Land attempt ${a.id} now?`, body: <p>It lands without waiting for its run to finish, so trunk may take something that does not pass.</p>, confirm: "Land now", danger: true }) === null) return;
-		await api("POST", `/p/${slug}/attempts/${a.id}/land`, { by: "human", force: true, sha: a.headSha });
-	});
+	const skipQueue = () => force(`Land attempt ${a.id} now?`, "It lands without waiting for its run to finish, so trunk may take something that does not pass.");
 	const abandon = () => drop.run(async () => {
 		if (await ask({ title: `Abandon attempt ${a.id}?`, body: <p>{hostedGoing ? `${a.agent} is running and will be stopped. ` : ""}You can reopen it while the intent is open.</p>, confirm: "Abandon attempt", danger: true }) === null) return;
 		await api("POST", `/p/${slug}/attempts/${a.id}/abandon`, {});
@@ -325,12 +344,12 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 					<HostedChip a={a} />
 					<span className="spacer" />
 					<div className="attempt-actions">
-						{!state.viewer && hostedGoing && <button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}))}><Icon name="stop" />Stop agent</button>}
+						{!state.viewer && hostedGoing && <button disabled={halt.busy || stopping.pending} onClick={() => halt.run(async () => { await api("POST", `/p/${slug}/attempts/${a.id}/stop`, {}); stopping.mark(); })}><Icon name="stop" />{stopping.pending ? "Stopping…" : "Stop agent"}</button>}
 						{!state.viewer && going && <button className="quiet" disabled={drop.busy} onClick={abandon}>Abandon</button>}
 						{a.status === "abandoned" && canLand && <button disabled={drop.busy} onClick={() => drop.run(() => api("POST", `/p/${slug}/attempts/${a.id}/restore`, {}))}><Icon name="undo" />Reopen</button>}
 						{canLand && going && a.status !== "conflicted" && (
-							<button className="primary" disabled={land.busy || !!queued || nothingPushed} onClick={landIt}>
-								<Icon name="land" />{land.busy ? "Landing…" : queued ? "Waiting to land" : "Land this"}
+							<button className="primary" disabled={land.busy || !!queued || landAsked.pending || nothingPushed} onClick={landIt}>
+								<Icon name="land" />{land.busy ? "Asking…" : queued || landAsked.pending ? "Waiting to land" : verdict ? "Land this again" : "Land this"}
 							</button>
 						)}
 					</div>
@@ -344,7 +363,31 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 				{canLand && a.status === "conflicted" && <Notice tone="warn" small>This attempt collided with trunk when it tried to land. Resolve the conflict above and it lands.</Notice>}
 				{canLand && going && a.status !== "conflicted" && nothingPushed && <p className="hint">Nothing has been pushed yet, so there is nothing to land.</p>}
 				{(land.error || drop.error || halt.error) && <Notice>{land.error ?? drop.error ?? halt.error}</Notice>}
-				{a.hosted === "failed" && <Notice tone="warn" small>The agent Braid was running failed: {a.hostedDetail}</Notice>}
+				{a.hosted === "failed" && (neverStarted(a)
+					? <Notice small>Braid could not start {a.agent} in a sandbox, so nobody is working on this attempt. {neverStarted(a)}{!state.viewer && going && " Add an agent to try again, or abandon this attempt."}</Notice>
+					: <Notice tone="warn" small>The agent Braid was running stopped with an error: {a.hostedDetail}</Notice>)}
+				{landAsked.pending && !queued && (
+					<div className="landing-wait" role="status">
+						<span className="chip working">asked to land</span>
+						<span>Braid has the request and is checking this commit. What happens next shows here: it waits for its checks, lands, collides with trunk, or is refused with the reason.</span>
+					</div>
+				)}
+				{verdict?.outcome === "refused" && (
+					<div className="verdict" role="status">
+						<Icon name="x" />
+						<div>
+							<p><strong>This did not land.</strong> <span className="dim">Asked by {verdict.by}, {ago(verdict.at)}.</span></p>
+							<p>{reason(verdict.text)}</p>
+							{canLand && forceable(verdict.text) && (
+								<p className="row">
+									<button disabled={land.busy} onClick={() => force("Land it without a passing run?", `${reason(verdict.text)} Trunk would take it as it is.`)}>Land it anyway</button>
+									<span className="hint">Or send it back for changes below.</span>
+								</p>
+							)}
+						</div>
+					</div>
+				)}
+				{verdict?.outcome === "cancelled" && <p className="hint" role="status">Landing was cancelled by {verdict.by}, {ago(verdict.at)}. Nothing changed on trunk.</p>}
 				{queued && (
 					<div className="landing-wait" role="status">
 						<span className="chip working">{WAITING[queued.state]}</span>
@@ -441,20 +484,25 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 	const [editing, setEditing] = useState(false);
 	const act = useAction();
 	const slug = state.project.slug;
+	const landing = state.landings.find((l) => l.intentId === intentId && !l.revertOf && !l.revertedBy);
+	// Asking for a revert only writes it down. Either the landing then shows as taken out, or a refusal arrives among the outcomes.
+	const lastRevert = landing ? outcomesOf(state).find((o) => o.kind === "revert" && o.ref === landing.sha) : undefined;
+	const reverting = useAsked(!landing, lastRevert?.id, 90_000);
 	if (!intent) return <main className="page narrow"><h1 className="sr-only">Intent not found</h1><Empty kind="broken" title={`There is no intent I${intentId} in this project`}><p><Link to={`/p/${slug}`} className="button"><Icon name="back" />Back to {state.project.name}</Link></p></Empty></main>;
 	const attempts = state.attempts.filter((a) => a.intentId === intentId).sort((a, b) => ORDER(a) - ORDER(b));
 	const recons = state.reconciliations.filter((r) => r.intentId === intentId);
-	const landing = state.landings.find((l) => l.intentId === intentId && !l.revertOf && !l.revertedBy);
 	const reverts = state.landings.filter((l) => l.intentId === intentId && l.revertOf);
 	const liveCount = attempts.filter((a) => LIVE.has(a.status)).length;
 	const abandon = () => act.run(async () => {
 		if (await ask({ title: `Abandon I${intent.id}?`, body: <p>{liveCount > 0 ? `Its ${liveCount} attempt${liveCount === 1 ? "" : "s"} in progress ${liveCount === 1 ? "is" : "are"} abandoned too, and their agents stopped.` : "Nothing lands for it. Its attempts stay readable."}</p>, confirm: "Abandon intent", danger: true }) === null) return;
 		await api("POST", `/p/${slug}/intents/${intent.id}/abandon`, {});
 	});
+	const notReverted = landing && !reverting.pending ? revertVerdict(state, landing.sha) : null;
 	const revert = () => act.run(async () => {
 		const reason = await ask({ title: `Take I${intent.id} back out of trunk?`, body: <p>Trunk gets a new commit that undoes it, and the intent opens again.</p>, confirm: "Revert landing", danger: true, input: { label: "Why? This is kept with the intent.", placeholder: "It broke…" } });
 		if (!reason) return;
 		await api("POST", `/p/${slug}/landings/${landing!.sha}/revert`, { by: "human", reason });
+		reverting.mark();
 	});
 	const open = intent.status === "open";
 	return (
@@ -468,7 +516,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 					{edits && <div className="ihead-actions">
 						{open && !editing && <button onClick={() => setEditing(true)}><Icon name="edit" />Edit</button>}
 						{open && <button className="quiet" disabled={act.busy} onClick={abandon}>Abandon</button>}
-						{landing && <button disabled={act.busy} onClick={revert}><Icon name="undo" />{act.busy ? "Reverting…" : "Revert landing"}</button>}
+						{landing && <button disabled={act.busy || reverting.pending} onClick={revert}><Icon name="undo" />{reverting.pending ? "Reverting…" : notReverted ? "Try the revert again" : "Revert landing"}</button>}
 						{open && <button className="primary" onClick={() => setJoining(!joining)} aria-expanded={joining}><Icon name={joining ? "x" : "plus"} />{joining ? "Close" : "Add an agent"}</button>}
 					</div>}
 				</div>
@@ -487,6 +535,8 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 							{state.project.contextRemote && <span className="dim context"> Its decisions and session transcript are committed to the context repository, <span className="mono">{state.project.contextRemote}</span>, under <span className="mono">intents/{intent.id}/</span>.</span>}</p>
 					</div>
 				)}
+				{reverting.pending && <p className="recon-model" role="status"><Icon name="running" className="spin" />Taking this landing back out of trunk. When it is done the intent opens again; if it cannot be done, the reason appears here.</p>}
+				{notReverted && <Notice small><strong>This landing was not taken back out.</strong> {sentence(notReverted.text)} <span className="notice-meta">Asked by {notReverted.by}, {ago(notReverted.at)}.</span></Notice>}
 				{joining && <JoinCommand slug={slug} intentId={intent.id} hosting={state.project.hosting} />}
 				{attempts.length > 0 && <div className="ihead-loom"><span className="label">This intent against trunk</span><MiniLoom state={state} intentId={intent.id} /></div>}
 			</header>

@@ -207,6 +207,17 @@ export class Log {
 		if (ids.length) this.woke();
 		return ids;
 	}
+	/** Give one failed effect another go. */
+	requeue(id: string): boolean {
+		const at = this.now();
+		const n = this.rows("UPDATE effects SET status = 'pending', tries = 0, available_at = ?, updated_at = ? WHERE status = 'failed' AND id = ? RETURNING id", at, at, id).length;
+		if (n) this.woke();
+		return n > 0;
+	}
+	/** Drop receipts whose ids start with `prefix` and are older than `before`: a retry that late is a new request. */
+	forget(prefix: string, before: number): number {
+		return this.rows("DELETE FROM receipts WHERE at < ? AND substr(command_id, 1, ?) = ? RETURNING command_id", before, prefix.length, prefix).length;
+	}
 	/** Give failed work of one kind another go. */
 	requeueFailed(type: string): number {
 		const at = this.now();

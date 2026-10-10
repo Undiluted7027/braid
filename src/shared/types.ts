@@ -147,6 +147,21 @@ export interface State {
 	reconciliations: Reconciliation[];
 	landings: Landing[];
 	activity: Activity[];
+	/** How things asked for turned out, newest first. A request only answers "queued"; this is where its result shows. */
+	outcomes: Outcome[];
+	/** Work Braid gave up on after several tries. Each can be tried again. */
+	stuck: { id: string; type: string; error: string; tries: number; at: number; attemptId: string | null }[];
+}
+/**
+ * The result of something that was asked for and done later by the worker.
+ * landing: landed, conflict, refused or cancelled. revert: reverted or refused. reconcile and agent: failed.
+ * `ref` is the landing commit, or "R<id>" for a reconciliation.
+ */
+export interface Outcome {
+	id: number; kind: "landing" | "revert" | "reconcile" | "agent"; outcome: string; text: string;
+	attemptId: string | null; intentId: number | null; by: string; ref: string; at: number;
+	/** For a landing: the attempt's head when this was decided. Once the attempt has a different head, the outcome is about an older commit. */
+	sha: string;
 }
 /**
  * A landing that has been asked for and not happened yet. An attempt lands once its own commit has passed

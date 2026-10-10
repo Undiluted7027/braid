@@ -28,7 +28,11 @@ export function useSignedIn() {
 }
 
 export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
-	const send = () => fetch(`/api${path}`, { method, body: body ? JSON.stringify(body) : undefined, headers: { "content-type": "application/json" } });
+	// Each thing asked for carries one key. If the connection drops it is sent once more with the same key,
+	// and the server does it once whichever of the two arrived.
+	const key = method === "GET" ? null : crypto.randomUUID();
+	const once = () => fetch(`/api${path}`, { method, body: body ? JSON.stringify(body) : undefined, headers: { "content-type": "application/json", ...(key ? { "idempotency-key": key } : {}) } });
+	const send = () => once().catch((e) => new Promise<Response>((done, fail) => setTimeout(() => once().then(done, () => fail(e)), 600)));
 	let res = await send();
 	if (res.status === 401 && await signIn()) res = await send();
 	if (res.status === 401) throw new Error("Sign in with this instance's admin token to do that.");

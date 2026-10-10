@@ -29,7 +29,8 @@ export interface RepoHost {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class ArtifactsHost implements RepoHost {
-	constructor(private ns: Artifacts) {}
+	private ns: Artifacts;
+	constructor(ns: Artifacts) { this.ns = ns; }
 
 	// Forks and creates are asynchronous; get() throws *_IN_PROGRESS until the repo is ready.
 	private async open(name: string, waitMs = 10_000): Promise<ArtifactsRepo> {

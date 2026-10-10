@@ -7,6 +7,7 @@ import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Command, Icon, Notice, type IconName } from "./Kit";
+import { landingVerdict, neverStarted, reason, stuckOf, stuckWords } from "./Later";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
@@ -14,7 +15,9 @@ const LIVE = new Set(["working", "ready", "conflicted"]);
 export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentId: number; hosting: State["project"]["hosting"] }) {
 	const [agent, setAgent] = useState("claude-code");
 	const start = useAction();
-	const run = (kind: "claude" | "codex") => start.run(() => api("POST", `/p/${slug}/intents/${intentId}/host`, { kind }));
+	// The request answers as soon as the attempt exists; the sandbox starts afterwards and the attempt's row says how that went.
+	const [asked, setAsked] = useState<string | null>(null);
+	const run = (kind: "claude" | "codex") => { setAsked(null); return start.run(async () => { await api("POST", `/p/${slug}/intents/${intentId}/host`, { kind }); setAsked(kind === "claude" ? "Claude Code" : "Codex"); }); };
 	const me = useMe();
 	// The launcher is one file served by this instance, so nothing has to be installed or published.
 	const cmd = `curl -fsSLO ${location.origin}/braid.mjs\nnode braid.mjs join ${location.origin}/p/${slug} --intent ${intentId} --agent ${agent}${agent === "agent" ? "" : " --run"}`;
@@ -27,10 +30,11 @@ export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentI
 					<div className="row">
 						<button className="primary" disabled={start.busy || !hosting.claude} onClick={() => run("claude")}>Run Claude Code</button>
 						<button className="primary" disabled={start.busy || !hosting.codex} onClick={() => run("codex")}>Run Codex</button>
-						{start.busy && <span className="dim" role="status">Starting the sandbox…</span>}
+						{start.busy && <span className="dim" role="status">Asking…</span>}
 					</div>
 					{(!hosting.claude || !hosting.codex) && <p className="hint">{!hosting.claude && !hosting.codex ? "Neither can start: no model credentials are set on this instance." : `${hosting.claude ? "Codex" : "Claude Code"} cannot start: this instance has no credentials for it.`}</p>}
 					{start.error && <Notice>{start.error}</Notice>}
+					{asked && !start.busy && <p className="sent" role="status"><Icon name="check" />A new attempt was made for {asked} and its sandbox is starting. It is listed with this intent's attempts, which also say so if it could not start.</p>}
 				</div>
 			)}
 			<div className="join-way">
@@ -50,7 +54,7 @@ export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentI
 /** Where Braid itself is running the agent, and how that is going. */
 export function HostedChip({ a }: { a: Attempt }) {
 	if (!a.hosted) return null;
-	return <span className={`chip ${a.hosted === "failed" ? "conflict" : a.hosted === "running" || a.hosted === "starting" ? "working" : "quiet"}`} title={a.hostedDetail || "Braid runs this agent in a sandbox on Cloudflare"}>sandbox {a.hosted}</span>;
+	return <span className={`chip ${a.hosted === "failed" ? "conflict" : a.hosted === "running" || a.hosted === "starting" ? "working" : "quiet"}`} title={a.hostedDetail || "Braid runs this agent in a sandbox on Cloudflare"}>{neverStarted(a) ? "agent did not start" : `sandbox ${a.hosted}`}</span>;
 }
 
 /** Trunk itself: where it is, how its last run went, and how to clone it (or fill it, when it is empty). */
@@ -82,7 +86,7 @@ function Trunk({ state }: { state: State }) {
 	);
 }
 
-type Need = { key: string; tone: string; icon: IconName; label: string; text: string; to: string };
+type Need = { key: string; tone: string; icon: IconName; label: string; text: string; to: string; stuck?: State["stuck"][number] };
 /** Everything in the project that is waiting for a person, most urgent first. Each item goes to where it is handled. */
 function needs(state: State): Need[] {
 	const slug = state.project.slug, to = (intentId: number) => `/p/${slug}/i/${intentId}`;
@@ -90,6 +94,11 @@ function needs(state: State): Need[] {
 	const items: Need[] = [];
 	const trunkRun = runFor(state, "trunk");
 	if (trunkRun?.sha === state.project.head && trunkRun.status === "fail") items.push({ key: "trunk", tone: "conflict", icon: "warning", label: "trunk is failing", text: `Braid's run of ${short(state.project.head)} failed (${trunkRun.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}). Only an attempt that fixes it will land.`, to: "#trunk" });
+	// Work Braid gave up on comes first: until it is tried again, other things here may not move.
+	for (const e of stuckOf(state)) {
+		const a = e.attemptId ? state.attempts.find((x) => x.id === e.attemptId) : undefined;
+		items.push({ key: `s${e.id}`, tone: "conflict", icon: "warning", label: "braid is stuck", text: stuckWords(e.type, e.attemptId).what, to: a ? to(a.intentId) : "", stuck: e });
+	}
 	for (const r of state.reconciliations.filter((r) => r.status === "open")) {
 		const a = state.attempts.find((x) => x.id === r.attemptId);
 		if (a && LIVE.has(a.status)) items.push({ key: `r${r.id}`, tone: "conflict", icon: "conflict", label: "conflict to resolve", text: `Landing ${a.agent}'s attempt ${a.id} collided with trunk on ${r.conflicts.map((c) => c.path).join(", ")}.`, to: to(r.intentId) });
@@ -98,21 +107,47 @@ function needs(state: State): Need[] {
 		const asked = state.decisions.filter((d) => d.attemptId === a.id && d.kind === "question");
 		const answered = new Set(state.decisions.filter((d) => d.attemptId === a.id && d.kind === "answer").map((d) => d.title.replace(/^Answer: /, "")));
 		for (const q of asked.filter((q) => !answered.has(q.title))) items.push({ key: `q${q.id}`, tone: "touch", icon: "question", label: "question for you", text: `${a.agent} asks: ${q.title}`, to: to(a.intentId) });
-		const run = runFor(state, a.id), queued = state.queue.some((q) => q.attemptId === a.id);
+		const run = runFor(state, a.id), queued = state.queue.some((q) => q.attemptId === a.id), verdict = landingVerdict(state, a);
+		if (verdict?.outcome === "refused") items.push({ key: `n${verdict.id}`, tone: "conflict", icon: "land", label: "landing refused", text: `${a.agent}'s attempt ${a.id} did not land. ${reason(verdict.text)}`, to: to(a.intentId) });
 		if (run?.sha === a.headSha && run.status === "fail") items.push({ key: `f${a.id}`, tone: "conflict", icon: "x", label: "checks failed", text: `${a.agent}'s attempt ${a.id} failed ${run.steps.filter((s) => s.status === "fail").map((s) => s.name).join(", ")}.`, to: to(a.intentId) });
-		else if (a.hosted === "failed") items.push({ key: `h${a.id}`, tone: "conflict", icon: "agent", label: "agent failed", text: `${a.agent} on attempt ${a.id}: ${a.hostedDetail}`, to: to(a.intentId) });
-		else if (a.status === "ready" && !queued) items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "ready to review", text: `${a.agent}'s attempt ${a.id}: ${a.summary || "marked ready"}`, to: to(a.intentId) });
+		else if (a.hosted === "failed") items.push({ key: `h${a.id}`, tone: "conflict", icon: "agent", label: neverStarted(a) ? "agent did not start" : "agent failed", text: neverStarted(a) ? `Braid could not start ${a.agent} on attempt ${a.id}. ${neverStarted(a)}` : `${a.agent} on attempt ${a.id}: ${a.hostedDetail}`, to: to(a.intentId) });
+		else if (a.status === "ready" && !queued && verdict?.outcome !== "refused") items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "ready to review", text: `${a.agent}'s attempt ${a.id}: ${a.summary || "marked ready"}`, to: to(a.intentId) });
 	}
 	return items;
 }
 
-function NeedsYou({ items }: { items: Need[] }) {
+/** Work Braid gave up on: what it could not do, what that means, the error, and a way to have it tried again. */
+function StuckRow({ item, state }: { item: Need; state: State }) {
+	const e = item.stuck!, slug = state.project.slug;
+	const act = useAction();
+	const [again, setAgain] = useState(false);
+	const words = stuckWords(e.type, e.attemptId);
+	return (
+		<div className="needs-row stuck">
+			<span className={`chip ${item.tone}`}><Icon name={item.icon} size={12} />{item.label}</span>
+			<div className="needs-text">
+				<p><strong>{words.what}</strong> {words.means}</p>
+				<p className="stuck-error"><span className="label">Error after {e.tries} tr{e.tries === 1 ? "y" : "ies"}, {ago(e.at)}</span><span className="mono">{e.error || "No message was recorded."}</span></p>
+				{item.to && <p><Link to={item.to}>Open attempt {e.attemptId}'s intent</Link></p>}
+				{act.error && <Notice small>{act.error}</Notice>}
+			</div>
+			{!state.viewer && (
+				<button disabled={act.busy || again} onClick={async () => { if (await act.run(() => api("POST", `/p/${slug}/effects/retry`, { id: e.id }))) { setAgain(true); window.setTimeout(() => setAgain(false), 20_000); } }}>
+					<Icon name={act.busy || again ? "running" : "undo"} className={act.busy || again ? "spin" : ""} />{act.busy ? "Asking…" : again ? "Trying again…" : "Try again"}
+				</button>
+			)}
+		</div>
+	);
+}
+
+function NeedsYou({ items, state }: { items: Need[]; state: State }) {
 	if (!items.length) return null;
 	return (
 		<section className="panel decide needs" aria-labelledby="needs-h">
 			<h2 id="needs-h"><span className="count solid">{items.length}</span>{items.length === 1 ? "One thing needs you" : "Things that need you"}</h2>
 			<ul>
 				{items.map((i) => {
+					if (i.stuck) return <li key={i.key}><StuckRow item={i} state={state} /></li>;
 					const inner = <><span className={`chip ${i.tone}`}><Icon name={i.icon} size={12} />{i.label}</span><span className="needs-text">{i.text}</span><Icon name="arrow" className="go" /></>;
 					return <li key={i.key}>{i.to.startsWith("#") ? <a href={i.to}>{inner}</a> : <Link to={i.to}>{inner}</Link>}</li>;
 				})}
@@ -148,6 +183,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 	const now = useNow(a.id, a.now);
 	const going = LIVE.has(a.status);
 	const queued = state.queue.some((q) => q.attemptId === a.id);
+	const verdict = landingVerdict(state, a);
 	return (
 		<li className={`attempt-row ${a.status}`}>
 			<span className="who"><Agent name={a.agent} kind={a.kind} model={a.model} /><span className="mono id" title={`Attempt ${a.id}`}>{a.id}</span></span>
@@ -158,6 +194,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 				<span className="facts">{a.files.length} file{a.files.length === 1 ? "" : "s"} changed · {decisions} decision{decisions === 1 ? "" : "s"} recorded</span>
 			</span>
 			<span className="signals">
+				{verdict?.outcome === "refused" && <span className="chip conflict" title={reason(verdict.text)}>landing refused</span>}
 				{going && <RunChip run={runFor(state, a.id)} head={a.headSha} />}
 				{going && a.behind > 0 && <span className="chip quiet" title="Changes that landed on trunk after this attempt forked from it">{a.behind} behind trunk</span>}
 				{going && a.trunkConflicts.length > 0 && <span className="chip conflict" title={a.trunkConflicts.join(", ")}>conflicts with trunk</span>}
@@ -239,7 +276,7 @@ export function ProjectPage({ state }: { state: State }) {
 				</dl>
 			</header>
 			{!state.project.head && <Notice tone="warn">Trunk is empty. Push a repository into it before starting attempts: <a href="#trunk">make a push command</a>.</Notice>}
-			<NeedsYou items={items} />
+			<NeedsYou items={items} state={state} />
 			<Braid state={state} />
 			<div className="columns">
 				<div className="col-main">

@@ -324,6 +324,14 @@ label.inline > select { margin-top: 0; }
 .needs .go { color: var(--ghost); transition: transform 0.12s var(--ease), color 0.12s var(--ease); }
 .needs a:hover .go { color: var(--ink); transform: translateX(3px); }
 .needs-text { min-width: 0; overflow-wrap: anywhere; }
+/* Stuck work is not a link to somewhere else: it is dealt with here, so the row carries its own explanation and button. */
+.needs-row { display: grid; grid-template-columns: 170px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 12px 16px; }
+.needs-row .needs-text { display: grid; gap: 6px; }
+.needs-row .chip { margin-top: 2px; }
+.needs .needs-row a { display: inline; padding: 0; text-decoration: underline; text-underline-offset: 3px; font-weight: 500; }
+.needs .needs-row a:hover { background: none; }
+.stuck-error { display: grid; gap: 2px; padding: 6px 8px; background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.stuck-error .mono { font-size: 12px; line-height: 18px; color: var(--muted); max-height: 72px; overflow-y: auto; }
 
 /* The loom: attempts braiding into trunk, on night in both themes. */
 .braid { background: var(--night); color: var(--night-ink); border: 1px solid var(--night-line); border-radius: var(--r); margin-bottom: 32px; overflow: hidden; }
@@ -489,6 +497,14 @@ circle.hit { fill: transparent; stroke: none; pointer-events: all; }
 .attempt-meta > span { display: inline-flex; align-items: center; gap: 6px; }
 .landing-wait { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px; background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm); }
 .landing-wait > span:nth-child(2) { flex: 1; min-width: 200px; }
+/* How something asked for earlier turned out, shown where it was asked. */
+.verdict { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 10px; padding: 10px 12px; border: 1px solid var(--bad); border-radius: var(--r-sm); background: var(--surface); box-shadow: 2px 2px 0 var(--bad); margin-right: 2px; }
+.verdict > .icon { color: var(--bad); margin-top: 2px; }
+.verdict > div { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.verdict strong { color: var(--bad); }
+.recon-model { display: flex; gap: 8px; align-items: flex-start; padding: 8px 12px; background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm); color: var(--muted); }
+.recon-model .icon { margin-top: 2px; color: var(--ink); }
+.notice-meta { opacity: 0.8; white-space: nowrap; }
 .tabs { display: flex; padding: 0 8px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--bg); overflow-x: auto; }
 .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; min-height: 40px; padding: 0 12px; margin-bottom: -1px; color: var(--faint); font: 500 11.5px/16px var(--mono); letter-spacing: 0.05em; text-transform: uppercase; }
 .tabs button:hover { color: var(--ink); background: none; }
@@ -793,6 +809,8 @@ p .mono, .ihead .mono { overflow-wrap: anywhere; }
 	.decisions li { grid-template-columns: minmax(0, 1fr); gap: 4px; }
 	.needs a { grid-template-columns: minmax(0, 1fr) auto; }
 	.needs .chip { grid-column: 1 / -1; }
+	.needs-row { grid-template-columns: minmax(0, 1fr); }
+	.needs-row > button { justify-self: start; }
 	.empty { flex-direction: column; align-items: flex-start; gap: 12px; padding: 16px; }
 	.state-art { width: 120px; }
 	.tabpanel, .attempt-head, .respond-bar, .intent-top, .attempt-row, .intent-foot, .join-way { padding-left: 14px; padding-right: 14px; }

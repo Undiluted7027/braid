@@ -13,7 +13,7 @@
     "build": "vite build && vite build --config vite.cli.config.ts",
     "deploy": "pnpm run build && wrangler deploy",
     "typecheck": "wrangler types && tsc --noEmit",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --import ./test/harness/register.mjs --test test/*.test.mjs",
     "sim": "node scripts/sim.mjs"
   },
   "dependencies": {

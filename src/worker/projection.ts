@@ -44,6 +44,13 @@ export function applyEvent(sql: Sql, e: BraidEvent) {
 		case "spare.taken": case "spare.dropped":
 			sql.exec("DELETE FROM spares WHERE repo = ?", e.data.repo);
 			break;
+		// Trunk gained one commit that changed nothing this attempt touches.
+		case "attempt.trunk-advanced":
+			sql.exec("UPDATE attempts SET behind = behind + 1, trunk_seen = ? WHERE id = ?", e.data.trunkSeen, e.attemptId);
+			break;
+		case "outcome.recorded":
+			sql.exec("INSERT INTO outcomes (kind, outcome, text, attempt_id, intent_id, by, ref, sha, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", e.data.kind, e.data.outcome, e.data.text, e.attemptId, e.intentId, e.actor, e.data.ref ?? "", e.data.sha ?? "", e.at);
+			break;
 		// An event this version does not know changes nothing here: it was written by a newer one.
 	}
 }

@@ -7,6 +7,7 @@ import type { Attempt, Overlap, State, TrunkCommit } from "../shared/types";
 import { ago, short, useNarrow, useNow } from "./api";
 import { Agent, IntentId, Link } from "./App";
 import { Icon, type IconName } from "./Kit";
+import { landingVerdict, neverStarted, reason } from "./Later";
 import { runFor } from "./Verify";
 
 export type CardTarget =
@@ -63,6 +64,7 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 	const asking = going ? decisions.filter((d) => d.kind === "question" && !answered.has(d.title)) : [];
 	const landing = state.landings.find((l) => l.attemptId === a.id && !l.revertOf);
 	const queued = state.queue.find((q) => q.attemptId === a.id);
+	const last = landingVerdict(state, a), refused = last?.outcome === "refused" ? last : null;
 	const run = checks(state, a);
 	const mine = state.overlaps.filter((o) => o.a === a.id || o.b === a.id);
 	const other = (o: Overlap) => (o.a === a.id ? o.b : o.a);
@@ -81,11 +83,12 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 				{asking.length > 0 && <Fact icon="question" tone="warn">Asks you: {asking[0].title}{asking.length > 1 ? ` (and ${asking.length - 1} more)` : ""}</Fact>}
 				{(going || a.status === "landed") && <Fact icon={run.icon} tone={run.tone}>{run.text}</Fact>}
 				{queued && <Fact icon="land">Waiting to land{queued.note ? `: ${queued.note}` : ""}</Fact>}
+				{refused && <Fact icon="land" tone="bad">It was asked to land and did not. {reason(refused.text)}</Fact>}
 				{going && <Fact icon="fork">{a.behind > 0 ? `${plural(a.behind, "landing")} behind trunk: trunk has moved since it forked` : "Up to date with trunk"}</Fact>}
 				{going && a.trunkConflicts.length > 0 && <Fact icon="conflict" tone="bad">Would conflict with trunk on {a.trunkConflicts.join(", ")}</Fact>}
 				{clash.length > 0 && <Fact icon="conflict" tone="bad">Will conflict with attempt{clash.length === 1 ? "" : "s"} {clash.join(", ")}</Fact>}
 				{hostedGoing && <Fact icon="sandbox">Braid is running this agent in a sandbox</Fact>}
-				{a.hosted === "failed" && <Fact icon="warning" tone="bad">The agent Braid was running failed{a.hostedDetail ? `: ${a.hostedDetail}` : ""}</Fact>}
+				{a.hosted === "failed" && <Fact icon="warning" tone="bad">{neverStarted(a) ? `Braid could not start the agent. ${neverStarted(a)}` : `The agent Braid was running stopped with an error${a.hostedDetail ? `: ${a.hostedDetail}` : ""}`}</Fact>}
 			</ul>
 			<p className="lc-links"><Link to={`/p/${slug}/i/${a.intentId}?attempt=${encodeURIComponent(a.id)}`}><Icon name="arrow" size={14} />Open the intent</Link></p>
 		</>

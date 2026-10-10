@@ -85,11 +85,14 @@ async function joinCommand() {
 	// Checked before anything is created, so a mistyped flag does not leave an empty attempt behind.
 	const asked = typeof flag("model") === "string" ? String(flag("model")) : null;
 	if (asked && !/^[\w.:\/-]{2,80}$/.test(asked)) fail(`--model "${asked}" does not look like a model name`);
-	const res = await fetch(`${url.origin}/api/p/${slug}/intents/${intent}/join`, {
+	// One key for this join: if the connection drops and it is sent again, it is still one attempt.
+	const ask = () => fetch(`${url.origin}/api/p/${slug}/intents/${intent}/join`, {
 		method: "POST",
-		headers: { "content-type": "application/json", ...(admin ? { authorization: `Bearer ${admin}` } : {}) },
+		headers: { "content-type": "application/json", "idempotency-key": joinKey, ...(admin ? { authorization: `Bearer ${admin}` } : {}) },
 		body: JSON.stringify({ agent, kind: agent.startsWith("codex") ? "codex" : agent.startsWith("claude") ? "claude" : "agent" }),
 	});
+	const joinKey = crypto.randomUUID();
+	const res = await ask().catch(() => new Promise((r) => setTimeout(r, 1000)).then(ask));
 	const joined = await res.json();
 	if (!res.ok) fail(joined.error ?? `join failed (${res.status})`);
 	// --model is handed to the agent and written on the attempt, so reviewers see what ran. Codex does not say
