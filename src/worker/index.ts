@@ -125,6 +125,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 			return Response.json(state);
 		}
 		if (rest[0] === "export") return Response.json(await p.exportState());
+		if (rest[0] === "events") return Response.json(await p.events(Number(q.get("after")) || 0, Number(q.get("limit")) || 500));
 		const read = await reads(p, rest, q);
 		if (read) return read;
 	}

@@ -121,6 +121,28 @@ Also from the reviews:
 - The 5 to 10 minute demo video.
 - A public source repository and a pass over the run instructions once deployed.
 
+## Decide, then do (item 1 of DIRECTION.md, begun October 9, 2026)
+
+The design agreed: a command only records what was decided; its events, the rows they change, its receipt and the effects it asks for are written in one transaction with no I/O; the project object's alarm carries out the effects and reports back. Four steps.
+
+1. **Log, receipts, outbox, worker, recovery.** Done locally, not deployed.
+   - Done: `src/worker/log.ts` holds the event log, command receipts (a command id seen before writes nothing and gets its first receipt back; a refusal is remembered too) and the effects outbox. It knows nothing about Cloudflare, so `test/log.test.mjs` runs it under Node's SQLite.
+   - Done: effects run in lanes. A lane does one thing at a time in the order asked, lanes run side by side (six at once), and an effect waiting out a retry holds its lane. Five tries with a growing wait, then it is marked failed and noted in Activity.
+   - Done: an effect's id names the work. Asked for again while it waits, nothing changes; while it runs, it runs once more afterwards; once settled, it is new work.
+   - Done: the worker is the project object's alarm, set whenever a commit leaves something to take. On a new process, effects marked running go back in line if their kind is safe to repeat and are dropped otherwise.
+   - Done: activity lines and `heads_up` signals are written only by applying events (`src/worker/projection.ts`), and a test replays a log into empty tables and compares the rows.
+   - Done: the first effect is the copy of a landing's why to the context repository. It replaces the `context_pending` list; a list left by the old version is moved into the outbox when the object starts.
+   - Done: `GET /api/p/<project>/events?after=<seq>` returns the log and any effects not settled, for the owner only.
+   - Checked locally: `pnpm test` (41), `pnpm typecheck`, and `pnpm sim`, where three landings each had their context saved by the worker and nothing was left in the outbox.
+   - Open: nothing else goes through the log yet. Tool calls still re-read every attempt and wait in one line; that is step 2.
+   - Open: failed effects are not shown under "Needs you", only in Activity and at `/events`.
+   - Not verified: recovery after a real restart of the object in the middle of an effect. It is tested under Node only.
+2. **Observation and overlaps as effects**, and `claim`, `checkpoint`, `ready`, `join` and `land` answering from recorded state. Then the 40 agents again.
+3. **The landing queue, revert, model reconciliation and agent start and stop** on effects.
+4. **Tests of the project logic under Node**, with a crash forced between a push and its record.
+
+Timings on `scale-probe` before any of this, one call at a time with 19 live attempts: `brief` and `record` 0.12 s, `claim` 1.1 s, `checkpoint` 1.3 s with nothing changed and 5.8 s after a change, `join` 4.4 s (the Artifacts fork itself).
+
 ## Interface overhaul (October 4, 2026)
 
 The interface was redone twice on this day. The first pass (navy shell, Instrument Sans, tabs on attempts) was judged not enough; its diff is not in the tree. What is there now follows `DESIGN.md` in the repository root, which records the measured references and every value.

@@ -8,6 +8,8 @@ import { CANDIDATE, commitFiles, prepare, promote, revert, seed } from "./land";
 import { llmName, resolveConflicts } from "./resolver";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
+import { drain, Log, type Effect, type Executor } from "./log.ts";
+import { applyEvent } from "./projection.ts";
 import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
@@ -30,7 +32,9 @@ const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
 const MAX_RESULT_TEXT = 800;
 const MAX_EVENTS = 20_000;
-const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity"];
+const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "receipts"];
+/** How long one alarm keeps taking new effects before handing over to the next. An alarm may run for fifteen minutes. */
+const DRAIN_MS = 8 * 60_000;
 const now = () => Date.now();
 const short = (sha: string) => sha.slice(0, 7);
 const json = (v: unknown) => JSON.stringify(v);
@@ -54,10 +58,19 @@ export class Project extends DurableObject<BraidEnv> {
 	private sql = this.ctx.storage.sql;
 	private host: RepoHost = new ArtifactsHost(this.env.ARTIFACTS);
 	private queue: Promise<unknown> = Promise.resolve();
+	/** What was decided, and the work that follows from it (see log.ts). */
+	private log = new Log({
+		sql: this.sql, transaction: (fn) => this.ctx.storage.transactionSync(fn), apply: (e) => applyEvent(this.sql, e),
+		onEffects: () => this.wake(),
+	});
 
 	constructor(ctx: DurableObjectState, env: BraidEnv) {
 		super(ctx, env);
 		this.schema();
+		// A new process: whatever was marked running was cut off with the old one.
+		const { lost } = this.log.recover((type) => this.executors[type]?.replaySafe ?? true);
+		for (const e of lost) console.warn("effect lost with its process", e.id);
+		this.wake();
 	}
 
 	/** Also run after the project is deleted: deleteAll drops the tables while this object lives on. */
@@ -95,6 +108,13 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN reverted_by TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE landings ADD COLUMN revert_of TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE registry ADD COLUMN public INTEGER DEFAULT 0"); } catch {}
+		this.log.schema();
+		// Before the outbox, landings whose context copy failed were kept on a list and tried at the next landing.
+		const owed: string[] = (() => { try { return JSON.parse(this.meta("context_pending") || "[]"); } catch { return []; } })();
+		if (owed.length) {
+			this.log.commit({ effects: owed.map((id) => this.contextEffect(id)) });
+			this.setMeta("context_pending", "");
+		}
 		try {
 			this.sql.exec("ALTER TABLE attempts ADD COLUMN model TEXT");
 			// Attempts from before the column existed: a hosted agent's first session line names its model.
@@ -176,11 +196,57 @@ export class Project extends DurableObject<BraidEnv> {
 	private setStatus(id: string, status: Attempt["status"]) { this.sql.exec("UPDATE attempts SET status = ?, updated_at = ? WHERE id = ?", status, now(), id); }
 
 	private note(kind: string, actor: string, text: string, intentId: number | null = null, attemptId: string | null = null) {
-		this.sql.exec("INSERT INTO activity (at, kind, actor, text, intent_id, attempt_id) VALUES (?, ?, ?, ?, ?, ?)", now(), kind, actor, redact(text), intentId, attemptId);
+		this.log.commit({ events: [{ type: "activity.noted", actor, intentId, attemptId, data: { kind, text: redact(text) } }] });
 		this.broadcast();
 	}
 	private signal(to: string, kind: string, body: unknown) {
-		this.sql.exec("INSERT INTO signals (to_attempt, kind, body, at) VALUES (?, ?, ?, ?)", to, kind, json(body), now());
+		this.log.commit({ events: [{ type: "signal.sent", attemptId: to, data: { kind, body } }] });
+	}
+
+	// ── the worker: effects recorded by a decision are carried out here ──────
+
+	/** Have the alarm look at the outbox as soon as there is something it can take. */
+	private wake() {
+		const next = this.log.nextAt();
+		if (next !== null) void this.ctx.storage.setAlarm(Math.max(next, now()));
+	}
+
+	async alarm() {
+		await drain(this.log, this.executors, {
+			until: now() + DRAIN_MS,
+			onFailed: (effect, error) => this.effectFailed(effect, error),
+		});
+		this.log.prune();
+		this.wake();
+	}
+
+	private contextEffect(attemptId: string) { return { id: `context.save:${attemptId}`, type: "context.save", lane: "context", data: { attemptId } }; }
+
+	/** Each kind of effect checks what is true before it acts, so one that runs twice does no harm. */
+	private executors: Record<string, Executor> = {
+		"context.save": {
+			replaySafe: true,
+			run: async (effect) => {
+				if (!this.trunk) return; // the project was deleted while this waited
+				const a = this.attempt(effect.data.attemptId), intent = this.intent(a.intentId);
+				await this.saveContext(intent, a, intent.landedSha ?? "");
+			},
+		},
+	};
+
+	private effectFailed(effect: Effect, error: string) {
+		if (!this.trunk) return;
+		if (effect.type === "context.save") {
+			const a = this.attempt(effect.data.attemptId);
+			// The landing already happened; losing the context copy must not undo or fail it.
+			this.note("context", "braid", `Could not save context for attempt ${a.id} after ${effect.tries} tries; it will be tried again at the next landing: ${splitError(error).message}`, a.intentId, a.id);
+		} else this.note("project", "braid", `Braid could not finish "${effect.type}" after ${effect.tries} tries: ${splitError(error).message}`);
+	}
+
+	/** What was decided here, in order, after `seq`. */
+	async events(after = 0, limit = 500) {
+		this.requireProject();
+		return { latest: this.log.latest(), events: this.log.after(after, limit), unsettled: this.log.effects().filter((e) => e.status === "pending" || e.status === "running" || e.status === "failed") };
 	}
 	private broadcast() {
 		for (const ws of this.ctx.getWebSockets()) {
@@ -327,6 +393,7 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const { ref } of this.rows<{ ref: string }>("SELECT DISTINCT ref FROM runs")) {
 			try { await this.runner(ref)?.clear(); } catch {}
 		}
+		await this.ctx.storage.deleteAlarm();
 		await this.ctx.storage.deleteAll();
 		this.schema();
 	}
@@ -890,7 +957,8 @@ export class Project extends DurableObject<BraidEnv> {
 		const repo = `${this.meta("slug")}--context`;
 		let empty = false;
 		if (!this.meta("context_remote")) {
-			this.setMeta("context_remote", (await this.host.create(repo, `Braid context (why and sessions) for ${this.meta("name")}`)).remote);
+			const created = await this.host.create(repo, `Braid context (why and sessions) for ${this.meta("name")}`);
+			this.log.commit({ events: [{ type: "context.repo.created", data: { remote: created.remote } }] });
 			empty = true;
 		}
 		const base = `intents/${intent.id}/attempt-${a.id}`;
@@ -901,6 +969,7 @@ export class Project extends DurableObject<BraidEnv> {
 			[`${base}/decisions.json`]: JSON.stringify(this.decisionsFor(a.id), null, "\t") + "\n",
 			[`${base}/session.jsonl`]: events.map((e) => JSON.stringify({ at: e.at, kind: e.kind, tool: e.tool, text: e.kind === "result" ? e.text.split("\n")[0].slice(0, 160) : e.text })).join("\n") + "\n",
 		}, `Context for I${intent.id}: ${intent.title} (attempt ${a.id}, landed ${short(landingSha)})`, { name: "Braid", email: "context@braid.dev" }, empty);
+		if (!this.trunk) return; // deleted while the copy was being made
 		this.note("context", "braid", `Saved the why and ${events.length} session events of attempt ${a.id} to ${repo} as ${short(sha)}`, intent.id, a.id);
 	}
 
@@ -918,7 +987,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.addEvents(me.id, [{ kind: "braid", tool, text: describeCall(tool, args ?? {}) }]);
 		const result = await this.runTool(me, tool, args ?? {});
 		const pending = this.rows<any>("SELECT * FROM signals WHERE to_attempt = ? AND seen = 0 ORDER BY id", me.id);
-		this.sql.exec("UPDATE signals SET seen = 1 WHERE to_attempt = ? AND seen = 0", me.id);
+		if (pending.length) this.log.commit({ events: [{ type: "signals.delivered", attemptId: me.id, data: { upTo: pending.at(-1).id } }] });
 		return { ...(result as object), heads_up: pending.map((s) => ({ kind: s.kind, ...JSON.parse(s.body) })) };
 	}
 
@@ -1315,8 +1384,9 @@ export class Project extends DurableObject<BraidEnv> {
 		this.note("land", by, `Landed I${intent.id} (${a.agent}, attempt ${a.id}) on trunk as ${short(sha)}${reconciled.length ? `, reconciled ${reconciled.join(", ")}` : ""}${unverified ? ", forced without waiting for verification" : ""}`, intent.id, a.id);
 		await this.retire(a.id);
 
-		this.setMeta("context_pending", json([...new Set([...this.pendingContext(), a.id])]));
-		await this.saveContexts();
+		// The why is copied to the context repository after the landing, not as part of it. A copy that failed before is tried again now.
+		this.log.requeueFailed("context.save");
+		this.log.commit({ effects: [this.contextEffect(a.id)] });
 
 		const landedWhy = this.describe(a);
 		for (const other of this.attempts()) {
@@ -1331,21 +1401,6 @@ export class Project extends DurableObject<BraidEnv> {
 			}
 		}
 		await this.recompute();
-	}
-
-	/** Landed attempts whose why has not reached the context repo yet. A failed copy stays here and is tried again at the next landing. */
-	private pendingContext(): string[] { try { return JSON.parse(this.meta("context_pending") || "[]"); } catch { return []; } }
-	private async saveContexts() {
-		for (const id of this.pendingContext()) {
-			const a = this.attempt(id), intent = this.intent(a.intentId);
-			try {
-				await this.saveContext(intent, a, intent.landedSha ?? "");
-				this.setMeta("context_pending", json(this.pendingContext().filter((x) => x !== id)));
-			} catch (e) {
-				// The landing already happened; losing the context copy must not undo or fail it.
-				this.note("context", "braid", `Could not save context for attempt ${id}; it will be tried again at the next landing: ${splitError(e).message}`, intent.id, id);
-			}
-		}
 	}
 
 	/**
