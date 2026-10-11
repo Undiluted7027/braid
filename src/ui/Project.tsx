@@ -8,6 +8,7 @@ import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Command, Icon, Notice, type IconName } from "./Kit";
+import { ClashRow, clashes, plannerOf, Proposals, SplitGoal, StandingLines } from "./Plan";
 import { landingVerdict, neverStarted, reason, sentence, stuckOf, stuckWords } from "./Later";
 import { currentReview, flagsOf, PolicyPanel, policyOf, reviewTag, tally } from "./Review";
 
@@ -88,7 +89,7 @@ function Trunk({ state }: { state: State }) {
 	);
 }
 
-type Need = { key: string; tone: string; icon: IconName; label: string; text: string; to: string; stuck?: State["stuck"][number] };
+type Need = { key: string; tone: string; icon: IconName; label: string; text: string; to: string; stuck?: State["stuck"][number]; clash?: ReturnType<typeof clashes>[number] };
 /** Everything in the project that is waiting for a person, most urgent first. Each item goes to where it is handled. */
 function needs(state: State): Need[] {
 	const slug = state.project.slug, to = (intentId: number) => `/p/${slug}/i/${intentId}`;
@@ -102,6 +103,8 @@ function needs(state: State): Need[] {
 		const a = e.attemptId ? state.attempts.find((x) => x.id === e.attemptId) : undefined;
 		items.push({ key: `s${e.id}`, tone: "conflict", icon: "warning", label: "braid is stuck", text: stuckWords(e.type, e.attemptId).what, to: a ? to(a.intentId) : "", stuck: e });
 	}
+	// Intents that cannot all land: one thing to decide per group, before agents spend work on both sides.
+	for (const g of clashes(state)) items.push({ key: `c${g.key}`, tone: "conflict", icon: "conflict", label: "intents clash", text: "", to: "", clash: g });
 	for (const r of state.reconciliations.filter((r) => r.status === "open")) {
 		const a = state.attempts.find((x) => x.id === r.attemptId);
 		if (a && LIVE.has(a.status)) items.push({ key: `r${r.id}`, tone: "conflict", icon: "conflict", label: "conflict to resolve", text: `Landing ${a.agent}'s attempt ${a.id} collided with trunk on ${r.conflicts.map((c) => c.path).join(", ")}.`, to: to(r.intentId) });
@@ -117,7 +120,8 @@ function needs(state: State): Need[] {
 		else if (a.status === "ready" && !queued && verdict?.outcome !== "refused") {
 			const who = `${a.agent}'s attempt ${a.id}`, flags = flagsOf(a), rv = currentReview(state, a), held = auto ? a.held ?? "" : "";
 			// Under a policy that lands by itself, an attempt it is about to land, or is still waiting on checks or a review for, is not a person's yet.
-			if (auto && (!held || a.heldFor === "checks" || a.heldFor === "review")) continue;
+			// So is one waiting for another intent to land first. One whose intent contradicts another is already listed above, as the clash.
+			if (auto && (!held || a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" || a.heldFor === "contradiction")) continue;
 			if (flags.length) items.push({ key: `g${a.id}`, tone: "touch", icon: "warning", label: "flagged for you", text: `${who}: ${sentence(flags[0].text)}${flags.length > 1 ? ` And ${flags.length - 1} more.` : ""}`, to: to(a.intentId) });
 			else if (auto) items.push({ key: `p${a.id}`, tone: "touch", icon: "agent", label: a.heldFor === "choice" ? "pick an attempt" : a.heldFor === "review-failed" ? "review failed" : a.heldFor === "reviewer" ? "reviewer: your call" : a.heldFor === "question" ? "question waiting" : a.heldFor === "landing" ? "landing stopped" : a.heldFor === "checks-failed" ? "checks failed" : "not landed by braid", text: `${who} was not landed by Braid. ${sentence(held)}`, to: to(a.intentId) });
 			else if (rv?.verdict === "approve") items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "review passed", text: `${who} meets ${tally(rv).of === 1 ? "its criterion" : `all ${tally(rv).of} criteria`}. ${a.summary || rv.summary}`, to: to(a.intentId) });
@@ -161,6 +165,7 @@ function NeedsYou({ items, state }: { items: Need[]; state: State }) {
 			<ul>
 				{items.map((i) => {
 					if (i.stuck) return <li key={i.key}><StuckRow item={i} state={state} /></li>;
+					if (i.clash) return <li key={i.key}><ClashRow state={state} group={i.clash} /></li>;
 					const inner = <><span className={`chip ${i.tone}`}><Icon name={i.icon} size={12} />{i.label}</span><span className="needs-text">{i.text}</span><Icon name="arrow" className="go" /></>;
 					return <li key={i.key}>{i.to.startsWith("#") ? <a href={i.to}>{inner}</a> : <Link to={i.to}>{inner}</Link>}</li>;
 				})}
@@ -207,7 +212,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 				{a.status === "working" && now ? <span className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</span>
 					: <span className="summary">{a.summary || (a.headSha === a.baseSha ? "Nothing pushed yet." : "No summary yet.")}</span>}
 				<span className="facts">{a.files.length} file{a.files.length === 1 ? "" : "s"} changed · {decisions} decision{decisions === 1 ? "" : "s"} recorded</span>
-				{going && !queued && policyOf(state).landing === "auto" && a.held && <span className="facts held-line"><Icon name={a.heldFor === "checks" || a.heldFor === "review" ? "clock" : "agent"} size={12} />{a.heldFor === "checks" || a.heldFor === "review" ? "Braid lands it by itself: " : "Not landed by Braid: "}{sentence(a.held).replace(/^./, (c) => c.toLowerCase())}</span>}
+				{going && !queued && policyOf(state).landing === "auto" && a.held && <span className="facts held-line"><Icon name={a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" ? "clock" : "agent"} size={12} />{a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" ? "Braid lands it by itself: " : "Not landed by Braid: "}{sentence(a.held).replace(/^./, (c) => c.toLowerCase())}</span>}
 			</span>
 			<span className="signals">
 				{flags.length > 0 && <span className="chip flagged" title={flags.map((f) => f.text).join(" ")}><Icon name="warning" size={12} />{flags.length} flag{flags.length === 1 ? "" : "s"}</span>}
@@ -236,6 +241,7 @@ function IntentCard({ intent, state }: { intent: Intent; state: State }) {
 				</div>
 				<p className="goal">{intent.goal}</p>
 				{attempts.length > 0 && <MiniLoom state={state} intentId={intent.id} className="spark" />}
+				{intent.status === "open" && <StandingLines state={state} intent={intent} />}
 			</div>
 			{attempts.length > 0 && <ul className="attempts">{attempts.map((a) => <AttemptRow key={a.id} a={a} state={state} />)}</ul>}
 			<div className="intent-foot">
@@ -268,13 +274,14 @@ function NewIntent({ slug, close }: { slug: string; close: () => void }) {
 	);
 }
 
-const ICON: Record<string, IconName> = { land: "land", conflict: "conflict", overlap: "overlap", why: "decision", push: "push", claim: "claim", ready: "check", reconcile: "reconcile", message: "message", intent: "intent", attempt: "fork", check: "check", project: "dot", feedback: "feedback", revert: "undo" };
+const ICON: Record<string, IconName> = { land: "land", conflict: "conflict", overlap: "overlap", why: "decision", push: "push", claim: "claim", ready: "check", reconcile: "reconcile", message: "message", intent: "intent", attempt: "fork", check: "check", project: "dot", plan: "search", feedback: "feedback", revert: "undo" };
 
 export function ProjectPage({ state }: { state: State }) {
 	const open = state.intents.filter((i) => i.status === "open"), done = state.intents.filter((i) => i.status !== "open");
 	const me = useMe();
 	const [shown, setShown] = useState(20);
 	const [adding, setAdding] = useState(false);
+	const [splitting, setSplitting] = useState(false);
 	useTitle(state.project.name);
 	const items = needs(state);
 	const live = state.attempts.filter((a) => LIVE.has(a.status)).length;
@@ -301,9 +308,14 @@ export function ProjectPage({ state }: { state: State }) {
 				<div className="col-main">
 					<div className="section-head">
 						<h2>Intents{state.intents.length > 0 && <span className="count">{open.length} open</span>}</h2>
-						{!state.viewer && !adding && <button className="primary" onClick={() => setAdding(true)}><Icon name="plus" />New intent</button>}
+						{!state.viewer && !adding && !splitting && <span className="row section-actions">
+							{plannerOf(state) && <button onClick={() => setSplitting(true)} title="Write a broad goal and have it split into intents for you to accept"><Icon name="fork" />Split a goal</button>}
+							<button className="primary" onClick={() => setAdding(true)}><Icon name="plus" />New intent</button>
+						</span>}
 					</div>
 					{adding && <NewIntent slug={state.project.slug} close={() => setAdding(false)} />}
+					{splitting && <SplitGoal state={state} close={() => setSplitting(false)} />}
+					<Proposals state={state} />
 					{state.intents.length === 0 && !adding && (
 						<Empty title="No intents yet">
 							<p>An intent is a goal, stated once. Agents attempt it; you choose what lands.</p>

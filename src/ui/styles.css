@@ -316,10 +316,10 @@ label.inline > select { margin-top: 0; }
 .stats .hot dd::after { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); margin-left: 8px; vertical-align: 3px; }
 .phead + .notice, .page > .notice { margin-bottom: 16px; }
 .needs h2 { padding: 14px 16px; font-size: 16px; display: flex; align-items: center; }
-.needs li { border-top: 1px solid var(--line); }
+.needs > ul > li { border-top: 1px solid var(--line); }
 .needs a { display: grid; grid-template-columns: 170px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 16px; text-decoration: none; transition: background-color 0.12s var(--ease); }
 .needs a:hover { background: var(--sunk); }
-.needs li:last-child a { border-radius: 0 0 var(--r) var(--r); }
+.needs > ul > li:last-child > a { border-radius: 0 0 var(--r) var(--r); }
 .needs .chip { justify-self: start; }
 .needs .go { color: var(--ghost); transition: transform 0.12s var(--ease), color 0.12s var(--ease); }
 .needs a:hover .go { color: var(--ink); transform: translateX(3px); }
@@ -868,6 +868,63 @@ button.cite:hover { border-color: var(--ink); }
 .kind.by-reviewer { color: var(--muted); border-style: dashed; border-color: var(--ghost); }
 .decisions li.from-reviewer { padding: 10px 12px; border: 1px dashed var(--line-strong); border-radius: var(--r-sm); }
 
+/* The planner: how intents stand to each other, and a goal split into intents. A clash is a decision; an order is only an order. */
+.iref { display: inline-flex; align-items: baseline; gap: 6px; text-decoration: none; font-weight: 500; min-width: 0; }
+.iref .intent-id { align-self: center; font-size: 11px; padding: 3px 5px; }
+.iref > span:last-child { text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; overflow-wrap: anywhere; }
+.iref:hover > span:last-child { text-decoration-color: currentColor; }
+.needs .needs-row .iref { display: inline-flex; text-decoration: none; }
+.clash-intents { display: grid; gap: 6px; }
+.clash-intents li { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+.clash-intents button { min-height: 26px; padding: 2px 8px; font-size: 13px; }
+.clash-why { padding: 8px 10px; background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.clash-why .label { display: block; margin-bottom: 2px; }
+.clash-pairs { display: grid; gap: 8px; }
+.clash-pairs li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: baseline; font-size: 13px; line-height: 18px; }
+.standing-lines { grid-column: 1 / -1; display: grid; gap: 4px; margin-top: 6px; }
+.stand { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 20px; color: var(--muted); }
+.stand > .icon { margin-top: 3px; }
+.stand > span { min-width: 0; overflow-wrap: anywhere; }
+.stand.clash { color: var(--bad); }
+.stand.clash .iref { color: var(--ink); }
+.stand.quiet { color: var(--faint); }
+.standing { display: grid; gap: 10px; min-width: 0; }
+.standing-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; min-height: 32px; }
+.stand-list { display: grid; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
+.stand-list > li { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 12px 14px; box-shadow: inset 3px 0 0 var(--line-strong); }
+.stand-list > li + li { border-top: 1px solid var(--line); }
+.stand-list > li.clash { box-shadow: inset 3px 0 0 var(--bad); }
+.stand-list > li.order { box-shadow: inset 3px 0 0 var(--ink); }
+.stand-list .chip { justify-self: start; margin-top: 2px; vertical-align: 0; }
+.stand-body { display: grid; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+.stand-other { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.stand-meta { color: var(--faint); font-size: 12.5px; line-height: 18px; }
+.stand-meta.strong { color: var(--muted); font-size: 13px; }
+.add-relation { max-width: 640px; }
+.crit-clash { margin-left: 10px; vertical-align: 1px; }
+.criteria-table tbody th.clashing { box-shadow: inset 3px 0 0 var(--bad); }
+.section-actions { gap: 8px; margin-left: auto; }
+.proposals { display: grid; gap: 12px; }
+.proposal { padding: 16px 20px; display: grid; gap: 12px; min-width: 0; }
+.proposal.decide { margin-bottom: 8px; }
+.proposal > * { min-width: 0; }
+.proposal-goal { font-size: 16px; line-height: 24px; overflow-wrap: anywhere; }
+.proposal-goal .label { display: block; margin-bottom: 2px; }
+.proposal-lede { color: var(--muted); max-width: 90ch; }
+.proposal-lede strong { color: var(--ink); }
+.proposal-list { display: grid; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.proposal-list > li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 12px; padding: 14px; }
+.proposal-list > li + li { border-top: 1px solid var(--line); }
+.proposal-list > li > .crit-n { margin: 1px 0 0; align-self: start; }
+.proposal-item { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.proposal-title { font-size: 16px; line-height: 22px; font-weight: 600; letter-spacing: -0.015em; }
+.proposal-criteria { display: grid; gap: 2px; padding-left: 18px; list-style: disc; color: var(--muted); }
+.proposal-edit { min-width: 0; }
+.proposal-after { display: grid; gap: 6px; }
+.proposal-after legend { font-size: 13px; font-weight: 600; margin-bottom: 4px; padding: 0; }
+.proposal-done { display: flex; gap: 8px; align-items: flex-start; color: var(--faint); font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
+.proposal-done .icon { margin-top: 2px; color: var(--good); }
+
 /* Dialogs */
 .dialog { border: 1px solid var(--ink); border-radius: var(--r); padding: 24px; width: min(460px, calc(100vw - 32px)); background: var(--surface); color: var(--ink); box-shadow: var(--offset); }
 .dialog::backdrop { background: rgb(10 10 10 / 0.55); }
@@ -925,6 +982,11 @@ p .mono, .ihead .mono { overflow-wrap: anywhere; }
 	.needs a { grid-template-columns: minmax(0, 1fr) auto; }
 	.needs .chip { grid-column: 1 / -1; }
 	.needs-row { grid-template-columns: minmax(0, 1fr); }
+	.stand-list > li { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+	.stand-list > li > button { justify-self: start; }
+	.clash-pairs li { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+	.proposal { padding: 14px; }
+	.crit-clash { margin: 4px 0 0; display: flex; width: fit-content; }
 	.criteria > li { grid-template-columns: minmax(0, 1fr); gap: 4px; }
 	.criteria-table tbody th { min-width: 180px; }
 	.criteria-table td, .criteria-table thead th + th { width: 130px; }

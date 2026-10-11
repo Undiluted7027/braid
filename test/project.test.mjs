@@ -681,7 +681,7 @@ test("an attempt marked ready is reviewed against the intent's criteria, and the
 	const intent = await w.project.createIntent({ title: "Notes", goal: "Add notes.", acceptance: "- There is a notes file\n- It says hello" });
 	const a = await finished(w, intent, "ana", { "notes.md": "hello\n" });
 	const s = await w.state(), review = s.reviews[0];
-	assert.deepEqual([s.intents[0].criteria, s.project.policy], [["There is a notes file", "It says hello"], { landing: "person", review: true, conflicts: "person", reviewers: ["claude-opus-5-5"] }]);
+	assert.deepEqual([s.intents[0].criteria, s.project.policy], [["There is a notes file", "It says hello"], { landing: "person", review: true, conflicts: "person", reviewers: ["claude-opus-5-5"], plan: true, planner: "claude-opus-5-5" }]);
 	assert.deepEqual([review.attemptId, review.sha, review.status, review.verdict, review.by, review.criteria.map((c) => [c.text, c.verdict, c.evidence])],
 		[a.attemptId, a.sha, "done", "approve", "stand-in", [["There is a notes file", "met", [{ path: "notes.md", line: 1 }]], ["It says hello", "met", [{ path: "notes.md", line: 1 }]]]]);
 	assert.deepEqual(review.criteria.map((c) => c.basis), ["diff", "diff"]);
@@ -816,7 +816,7 @@ test("without a model to review with, nothing is reviewed and a project that lan
 	const { w, intents } = await withApp(t, ["One"], { landing: { policy: "auto" } });
 	const a = await finished(w, intents[0], "ana", { "a.md": "a\n" });
 	const s = await w.state();
-	assert.deepEqual([s.reviews.length, s.project.policy, (await row(w, a)).status, (await row(w, a)).held], [0, { landing: "auto", review: false, conflicts: "person", reviewers: [] }, "ready", "This instance has no model to review with, so a person lands it."]);
+	assert.deepEqual([s.reviews.length, s.project.policy, (await row(w, a)).status, (await row(w, a)).held], [0, { landing: "auto", review: false, conflicts: "person", reviewers: [], plan: false, planner: null }, "ready", "This instance has no model to review with, so a person lands it."]);
 });
 
 test("a criterion about the checks is met by the checks having passed, not by the reviewer saying so", async (t) => {
@@ -848,4 +848,124 @@ test("an attempt is reviewed by a model from a different maker than its agent, u
 		const said = w.tool(x, "ready", { summary: "done" }); await w.settle(); await said; await w.settle();
 	}
 	assert.deepEqual(asked.map((i) => [i.agent, i.pick.provider]), [["claude-code", "openai"], ["codex", "claude"]]);
+});
+
+// ── planning: how intents stand to each other before anyone works on them ────
+
+/** A project whose planner is a stand-in: `says(input)` returns the relations it finds for the intent it is shown. */
+async function planned(t, says, landing) {
+	const { w } = await withApp(t, [], landing ? { landing } : null, { ANTHROPIC_API_KEY: "k" });
+	const shown = [];
+	w.project.planner = async (_env, input) => { shown.push(input); return { relations: says ? says(input) : [], model: "stand-in" }; };
+	w.project.reviewer = async (_env, input) => ({ verdict: "approve", summary: "Fine.", concerns: [], changes: "", model: "stand-in", criteria: input.criteria.map((_, i) => ({ n: i + 1, verdict: "met", basis: "diff", why: "Shown.", evidence: [{ path: input.files[0].path, line: 1 }] })) });
+	const open = async (title, acceptance = "") => { const i = await w.project.createIntent({ title, goal: `${title}.`, acceptance }); await w.settle(); return i; };
+	return { w, shown, open };
+}
+const clash = (other) => ({ other, kind: "contradicts", why: "They set the accent colour to different values.", mine: [1], theirs: [1] });
+const needs = (other) => ({ other, kind: "depends_on", why: "It restyles the button that intent adds.", mine: [], theirs: [] });
+
+test("an intent is looked at next to the others when it is opened, and a contradiction is recorded on both", async (t) => {
+	const { w, shown, open } = await planned(t, (input) => (input.intent.title === "Blue accent" ? [clash(1)] : []));
+	const red = await open("Red accent", "The accent colour is red");
+	assert.equal(shown.length, 0, "with nothing to stand next to, the planner is not asked");
+	const blue = await open("Blue accent", "The accent colour is blue");
+	const s = await w.state();
+	assert.deepEqual([shown.length, shown[0].intent.id, shown[0].others.map((o) => [o.id, o.status, o.criteria])], [1, blue.id, [[red.id, "open", ["The accent colour is red"]]]]);
+	assert.deepEqual(s.relations.map((r) => [r.kind, r.from, r.to, r.fromCriteria, r.toCriteria, r.by, r.source]), [["contradicts", blue.id, red.id, [1], [1], "stand-in", "planner"]]);
+	assert.match(s.activity.map((x) => x.text).join("\n"), /I2 "Blue accent" contradicts I1 "Red accent": They set the accent colour to different values\./);
+	// An agent that joins either is told in its brief, before it writes a line.
+	const a = await agent(w, red, "ana");
+	assert.match(a.brief, /## How this intent stands with the others\n- It CONTRADICTS I2 "Blue accent": They set the accent colour to different values\./);
+});
+
+test("a contradiction found while agents are working reaches them, and the policy leaves both to a person", async (t) => {
+	const { w, open } = await planned(t, (input) => (input.intent.title === "Blue accent" ? [clash(1)] : []), { policy: "auto" });
+	const red = await open("Red accent", "The accent colour is red");
+	const a = await agent(w, red, "ana");
+	const blue = await open("Blue accent", "The accent colour is blue");
+	const heard = w.tool(a, "brief"); await w.settle();
+	assert.deepEqual((await heard).heads_up.filter((h) => h.kind === "plan").map((h) => [h.with, h.why]), [["I2: Blue accent", "They set the accent colour to different values."]]);
+	const b = await finished(w, blue, "ben", { "blue.md": "blue\n" });
+	assert.deepEqual([(await row(w, b)).status, (await row(w, b)).heldFor], ["ready", "contradiction"]);
+	assert.match((await row(w, b)).held, /^Its intent contradicts I1 "Red accent": They set the accent colour to different values\. A person chooses\.$/);
+	// A person decides it is not a contradiction after all: the policy lands it.
+	await w.project.dismissRelation((await w.state()).relations[0].id, "rev"); await w.settle();
+	assert.deepEqual([(await row(w, b)).status, (await w.state()).relations.length], ["landed", 0]);
+	// And the planner does not find the dismissed one again when the intent is looked at afresh.
+	await w.project.plan(red.id); await w.settle();
+	assert.equal((await w.state()).relations.length, 0);
+});
+
+test("an intent that needs another first is not landed before it, by the policy or by a person, and lands once it has", async (t) => {
+	const { w, open } = await planned(t, (input) => (input.intent.title === "Style the button" ? [needs(1)] : []), { policy: "auto" });
+	const add = await open("Add the button"), style = await open("Style the button");
+	assert.deepEqual((await w.state()).relations.map((r) => [r.kind, r.from, r.to]), [["depends", style.id, add.id]]);
+	const first = await agent(w, add, "ana");
+	const b = await finished(w, style, "ben", { "style.md": "s\n" });
+	assert.deepEqual([(await row(w, b)).status, (await row(w, b)).heldFor, (await row(w, b)).held], ["ready", "dependency", "Waiting for I1 to land first: It restyles the button that intent adds."]);
+	assert.match(b.brief, /It needs I1 "Add the button" to land first/);
+	// A person asking does not jump the order either.
+	const asked = await land(w, b.attemptId);
+	assert.deepEqual([asked.queued, asked.note], ["waiting", "waits for I1 to land first"]);
+	// The first lands (by policy, once finished); the second follows by itself.
+	await w.tool(first, "claim", { paths: ["button.md"] });
+	first.sha = work(w, first, { "button.md": "b\n" }); await w.project.onPush(first.repo); await w.settle(); await w.finish(first.attemptId, "pass"); await w.settle();
+	const said = w.tool(first, "ready", { summary: "done" }); await w.settle(); await said; await w.settle();
+	for (let i = 0; i < 6 && (await w.state()).queue.length; i++) { const q = (await w.state()).batches[0]; if (q) await w.finish(`batch:${q.id}`, "pass"); await w.settle(); }
+	const s = await w.state();
+	assert.deepEqual([s.intents.map((i) => i.status), s.relations.length, s.landings.map((l) => l.intentId)], [["landed", "landed"], 0, [add.id, style.id]]);
+});
+
+test("a person can say how two intents stand; a circle of dependencies is refused; dropping an intent frees what waited on it", async (t) => {
+	const { w, open } = await planned(t, null, { policy: "auto" });
+	const one = await open("One"), two = await open("Two");
+	await assert.rejects(() => w.project.relateIntents(two.id, { kind: "depends", other: one.id }), /say why/);
+	await w.project.relateIntents(two.id, { kind: "depends", other: one.id, why: "Two builds on what One adds.", by: "rev" });
+	await assert.rejects(() => w.project.relateIntents(one.id, { kind: "depends", other: two.id, why: "And back again." }), /go round in a circle/);
+	assert.deepEqual((await w.state()).relations.map((r) => [r.kind, r.from, r.to, r.by, r.source]), [["depends", two.id, one.id, "rev", "person"]]);
+	const b = await finished(w, two, "ben", { "two.md": "2\n" });
+	assert.equal((await row(w, b)).heldFor, "dependency");
+	await w.project.abandonIntent(one.id); await w.settle();
+	assert.deepEqual([(await row(w, b)).status, (await w.state()).relations.length], ["landed", 0]);
+});
+
+test("editing an intent has it looked at again; an intent that would undo a landed one is said to contradict it", async (t) => {
+	const { w, shown, open } = await planned(t, (input) => (/blue/i.test(input.intent.goal + input.intent.criteria.join()) ? [clash(1)] : []));
+	const red = await open("Red accent", "The accent colour is red");
+	const a = await ready(w, red, "ana", { "red.md": "red\n" });
+	await land(w, a.attemptId);
+	const next = await open("Accent again", "The accent colour stays as it is");
+	assert.deepEqual([(await w.state()).relations.length, shown.at(-1).others.map((o) => [o.id, o.status])], [0, [[red.id, "landed"]]]);
+	await w.project.editIntent(next.id, { acceptance: "The accent colour is blue" }); await w.settle();
+	assert.deepEqual((await w.state()).relations.map((r) => [r.kind, r.from, r.to]), [["contradicts", next.id, red.id]]);
+});
+
+test("a planner that fails says so and nothing is held up; planning can be turned off", async (t) => {
+	const { w, shown, open } = await planned(t, () => { throw new Error("[502] the model declined to plan this intent"); });
+	await open("One"); await open("Two");
+	assert.match((await w.state()).activity[0].text, /I2 could not be looked at next to the others: the model declined to plan this intent/);
+	await w.project.setPlan(false);
+	await open("Three");
+	assert.deepEqual([shown.length, (await w.state()).project.policy.plan], [1, false]);
+});
+
+test("a broad goal is split into a proposal; accepting it opens the intents in order, and nothing is opened before that", async (t) => {
+	const { w, shown } = await planned(t);
+	w.project.splitter = async (_env, input) => ({ model: "stand-in", note: "Split by part of the page.", intents: [
+		{ title: "Add a reset-all button", goal: "A button that sets every counter to zero.", done_when: ["There is a Reset all button", "Pressing it zeroes every counter"], depends_on: [] },
+		{ title: "Confirm before resetting", goal: "Ask before the reset happens.", done_when: ["A confirmation is shown first"], depends_on: [1] },
+	], seen: input });
+	const { id } = await w.project.proposeSplit("Let people reset every counter at once, safely.", "rev");
+	assert.equal((await w.state()).proposals[0].status, "running");
+	await w.settle();
+	let s = await w.state();
+	assert.deepEqual([s.proposals[0].status, s.proposals[0].by, s.proposals[0].note, s.proposals[0].intents.map((i) => [i.title, i.acceptance, i.dependsOn]), s.intents.length],
+		["done", "stand-in", "Split by part of the page.", [["Add a reset-all button", "- There is a Reset all button\n- Pressing it zeroes every counter", []], ["Confirm before resetting", "- A confirmation is shown first", [1]]], 0]);
+	const made = await w.project.acceptProposal(id, { by: "rev" }); await w.settle();
+	s = await w.state();
+	assert.deepEqual([made.intents, s.intents.map((i) => [i.title, i.criteria.length, i.createdBy]), s.relations.map((r) => [r.kind, r.from, r.to]), s.proposals[0].status],
+		[[1, 2], [["Add a reset-all button", 2, "rev"], ["Confirm before resetting", 1, "rev"]], [["depends", 2, 1]], "accepted"]);
+	assert.equal(shown.length, 0, "the proposal already says how its intents stand, so they are not each planned again");
+	await assert.rejects(() => w.project.acceptProposal(id), /that proposal is accepted/);
+	await assert.rejects(() => w.project.proposeSplit("short"), /write the goal to split/);
 });

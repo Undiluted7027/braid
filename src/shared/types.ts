@@ -17,6 +17,21 @@ export interface Intent {
 	/** "Done when" as separate things to check. Every attempt at the intent is reviewed against these. */
 	criteria: string[];
 }
+/**
+ * How two intents stand to each other, found before work starts. "contradicts": both cannot be true of one codebase
+ * (`fromCriteria` and `toCriteria` are the criteria that clash, 1-based). "depends": `from` needs `to` to land first.
+ * "duplicates": `from` asks for what `to` already does. `by` is the model that found it, or a person's name.
+ */
+export interface Relation {
+	id: number; kind: "contradicts" | "depends" | "duplicates"; from: number; to: number; why: string;
+	fromCriteria: number[]; toCriteria: number[]; by: string; source: "planner" | "person"; at: number;
+}
+/** A broad goal split into intents by the planner, for a person to accept, edit or drop. `dependsOn` are 1-based places in the same list. */
+export interface Proposal {
+	id: number; goal: string; status: "running" | "done" | "failed" | "accepted" | "dropped";
+	intents: { title: string; goal: string; acceptance: string; dependsOn: number[] }[]; note: string;
+	by: string; error: string | null; at: number;
+}
 /** Something about an attempt a person should look at whatever a reviewer says. Raised from the diff and the session, with no model. */
 export interface Flag {
 	kind: "tests-deleted" | "tests-changed" | "checks" | "lockfile" | "outside-claims" | "history" | "destructive";
@@ -58,10 +73,10 @@ export interface Attempt {
 	/** Under a project that lands by itself: why this attempt has not been landed, in words. Empty when that does not apply. */
 	held: string;
 	/**
-	 * What kind of thing is holding it. "checks" and "review" are things Braid is waiting for and will act on by itself;
+	 * What kind of thing is holding it. "checks", "review" and "dependency" are things Braid is waiting for and will act on by itself;
 	 * every other kind needs a person. Empty when `held` is.
 	 */
-	heldFor: "" | "checks" | "review" | "checks-failed" | "review-failed" | "no-reviewer" | "flags" | "question" | "choice" | "landing" | "reviewer" | "person";
+	heldFor: "" | "checks" | "review" | "checks-failed" | "review-failed" | "no-reviewer" | "flags" | "question" | "choice" | "landing" | "reviewer" | "contradiction" | "dependency" | "person";
 	/** Landings on trunk since this attempt's base. */
 	behind: number;
 	/** Paths that would conflict with trunk if this landed now. */
@@ -154,8 +169,9 @@ export interface ProjectInfo { slug: string; name: string; description: string; 
 	 * its checks pass, its review finds every criterion met and nothing is flagged. `review`: attempts are reviewed when marked ready.
 	 * `conflicts`: "auto" sends a conflict to the agent and then the model before a person.
 	 * `reviewers`: the models this instance can review with. With two, an attempt is read by one from a different maker than its agent.
+	 * `plan`: each intent is looked at next to the others when it is opened or edited, by `planner`.
 	 */
-	policy: { landing: "person" | "auto"; review: boolean; conflicts: "person" | "auto"; reviewers: string[] };
+	policy: { landing: "person" | "auto"; review: boolean; conflicts: "person" | "auto"; reviewers: string[]; plan: boolean; planner: string | null };
 }
 /** One command run in the sandbox for a commit. `tail` is the end of its output. */
 export interface RunStep { name: string; command: string; status: "running" | "pass" | "fail"; exitCode: number | null; ms: number; tail: string }
@@ -188,6 +204,10 @@ export interface State {
 	reconciliations: Reconciliation[];
 	landings: Landing[];
 	activity: Activity[];
+	/** How open intents stand to each other and to what has landed. Relations a person dismissed, or whose intents are gone, are left out. */
+	relations: Relation[];
+	/** Goals the planner was asked to split, newest first. */
+	proposals: Proposal[];
 	/** The latest review of each attempt. */
 	reviews: Review[];
 	/** How things asked for turned out, newest first. A request only answers "queued"; this is where its result shows. */

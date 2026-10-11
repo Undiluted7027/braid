@@ -83,7 +83,7 @@ function AttemptCard({ state, a }: { state: State; a: Attempt }) {
 			<ul className="lc-facts">
 				{going && flagsOf(a).length > 0 && <Fact icon="warning" tone="warn">Braid flagged {plural(flagsOf(a).length, "thing")} for a person: {flagsOf(a)[0].text}</Fact>}
 				{going && tag && <Fact icon="search" tone={tag.tone === "pass" ? "good" : tag.tone === "conflict" ? "bad" : tag.tone === "touch" ? "warn" : ""}>Review: {tag.title}</Fact>}
-				{going && policyOf(state).landing === "auto" && a.held && <Fact icon="clock">{a.heldFor === "checks" || a.heldFor === "review" ? "Braid lands it by itself. " : "Not landed by Braid. "}{a.held}</Fact>}
+				{going && policyOf(state).landing === "auto" && a.held && <Fact icon="clock">{a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" ? "Braid lands it by itself. " : "Not landed by Braid. "}{a.held}</Fact>}
 				<Fact icon="changes">{a.files.length ? `${plural(a.files.length, "file")} changed` : "No files changed yet"} · {plural(decisions.length, "decision")} recorded</Fact>
 				{asking.length > 0 && <Fact icon="question" tone="warn">Asks you: {asking[0].title}{asking.length > 1 ? ` (and ${asking.length - 1} more)` : ""}</Fact>}
 				{(going || a.status === "landed") && <Fact icon={run.icon} tone={run.tone}>{run.text}</Fact>}

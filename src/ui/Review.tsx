@@ -6,6 +6,7 @@ import { api, ago, short } from "./api";
 import { Agent, useAction } from "./App";
 import { ask, Icon, Notice, type IconName } from "./Kit";
 import { sentence, useAsked } from "./Later";
+import { clashingCriteria } from "./Plan";
 import { runFor } from "./Verify";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
@@ -72,7 +73,7 @@ export function FlagBox({ a }: { a: Attempt }) {
 /** Under a project that lands by itself: why this attempt has not been landed. */
 export function Held({ state, a }: { state: State; a: Attempt }) {
 	if (policyOf(state).landing !== "auto" || !a.held || !LIVE.has(a.status)) return null;
-	const waiting = a.heldFor === "checks" || a.heldFor === "review";
+	const waiting = a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency";
 	return (
 		<p className={`held ${waiting ? "waiting" : "person"}`} role="status">
 			<Icon name={waiting ? "clock" : "agent"} />
@@ -187,6 +188,7 @@ export function CriteriaTable({ state, intent, attempts }: { state: State; inten
 	const cols = attempts.filter((a) => a.status !== "abandoned" || reviewOf(state, a)).map((a) => ({ a, r: reviewOf(state, a) }));
 	const any = cols.some((c) => c.r);
 	const fromGoal = !intent.acceptance.trim();
+	const clash = clashingCriteria(state, intent.id);
 	const go = (id: string) => document.getElementById(`attempt-${id}`)?.scrollIntoView({ block: "start" });
 	return (
 		<section className="criteria-box" aria-labelledby="crit-h">
@@ -212,7 +214,7 @@ export function CriteriaTable({ state, intent, attempts }: { state: State; inten
 					<tbody>
 						{criteria.map((text, i) => (
 							<tr key={i}>
-								<th scope="row"><span className="crit-n">{i + 1}</span>{text}</th>
+								<th scope="row" className={clash.has(i + 1) ? "clashing" : ""}><span className="crit-n">{i + 1}</span>{text}{clash.has(i + 1) && <span className="chip conflict crit-clash" title="Another intent asks for the opposite; see how this intent stands, below"><Icon name="conflict" size={12} />clashes with {[...new Set(clash.get(i + 1))].map((o) => `I${o}`).join(", ")}</span>}</th>
 								{any && cols.map(({ a, r }) => {
 									const c = r?.status === "done" ? r.criteria[i] : undefined, m = c ? MARK[c.verdict] : null;
 									return (
@@ -252,6 +254,11 @@ export function PolicyPanel({ state }: { state: State }) {
 		if (policy.review && policy.landing === "auto" && await ask({ title: "Turn reviews off?", body: <p>This project lands by itself only what a review has passed. With reviews off, nothing lands by itself and every attempt waits for a person.</p>, confirm: "Turn reviews off" }) === null) return;
 		await api("POST", `/p/${slug}/review`, { review: !policy.review });
 	});
+	const planning = useAction(), planner = policy.planner ?? null;
+	const togglePlan = () => planning.run(async () => {
+		if (!policy.plan && await ask({ title: "Turn planning on?", body: <p>Every intent will be read by {planner} next to the project's other intents when it is opened or edited, to find goals that clash, must land in order, or repeat each other. Each reading is a call to the model, which this instance pays for.</p>, confirm: "Turn planning on" }) === null) return;
+		await api("POST", `/p/${slug}/planning`, { plan: !policy.plan });
+	});
 	return (
 		<section className="panel side-panel policy" aria-labelledby="policy-h">
 			<h2 id="policy-h" className="label">How this project is run</h2>
@@ -261,6 +268,12 @@ export function PolicyPanel({ state }: { state: State }) {
 					<dd>{policy.landing === "auto"
 						? <><strong>Braid, when it is plainly good.</strong> It lands an attempt by itself when the agent marked it ready, its checks passed, the review found every criterion met, nothing is flagged, no question is open, and it is the only attempt at its intent. Everything else waits for a person.</>
 						: <><strong>A person.</strong> Nothing lands until someone asks for it.</>}</dd>
+				</div>
+				<div>
+					<dt><Icon name="strands" size={14} />Planning</dt>
+					<dd>{!planner ? <><strong>None.</strong> No model is set up on this instance, so nobody reads intents next to each other.</>
+						: policy.plan ? <><strong>On.</strong> Each intent is read by <span className="mono">{planner}</span> next to the others when it is opened or edited, to find goals that clash, must land in order, or repeat each other, before any agent starts.</>
+						: <><strong>Off.</strong> Intents are not read next to each other. A person can still say how two stand, or split a goal.</>}</dd>
 				</div>
 				<div>
 					<dt><Icon name="search" size={14} />Reviews</dt>
@@ -275,7 +288,9 @@ export function PolicyPanel({ state }: { state: State }) {
 				</div>
 			</dl>
 			{!state.viewer && model && <button disabled={act.busy} onClick={toggle}>{act.busy ? "Saving…" : policy.review ? "Turn reviews off" : "Turn reviews on"}</button>}
+			{!state.viewer && planner && <button disabled={planning.busy} onClick={togglePlan}>{planning.busy ? "Saving…" : policy.plan ? "Turn planning off" : "Turn planning on"}</button>}
 			{act.error && <Notice small>{act.error}</Notice>}
+			{planning.error && <Notice small>{planning.error}</Notice>}
 			<p className="hint">Who lands and who resolves conflicts are set in trunk's <code>braid.json</code>, under <code>landing</code>.</p>
 		</section>
 	);

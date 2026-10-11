@@ -110,13 +110,20 @@ export async function world(env = {}) {
 		AGENT: namespace((name) => ({ async start(job) { failIfAsked("agent.start"); agents.push({ what: "start", name, job }); }, async stop(why) { agents.push({ what: "stop", name, why }); }, async clear() {} })),
 		...env,
 	};
-	let project = new Project(ctx, fullEnv);
+	// No test calls a real model. A test that is about reviewing or planning puts its own stand-in in these places.
+	const standIns = (p) => {
+		p.planner = async () => ({ relations: [], model: "stand-in" });
+		p.splitter = async () => { throw new Error("[501] no stand-in for splitting a goal in this test"); };
+		p.reviewer = async () => { throw new Error("[501] no stand-in for reviewing in this test"); };
+		return p;
+	};
+	let project = standIns(new Project(ctx, fullEnv));
 
 	const w = {
 		root, origin, remote, runs, agents, db,
 		get project() { return project; },
 		/** The same storage, a new process: what a restart of the object looks like. */
-		restart() { project = new Project(ctx, fullEnv); return project; },
+		restart() { const before = project; project = standIns(new Project(ctx, fullEnv)); Object.assign(project, { planner: before.planner, splitter: before.splitter, reviewer: before.reviewer }); return project; },
 		/** Make the next `times` calls of an Artifacts operation fail. */
 		fail(op, times = 1) { failing.set(op, times); },
 		/** Fire the alarm until no work is left that is due now. Work scheduled for later stays, unless `later` is given. */

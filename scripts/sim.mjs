@@ -6,7 +6,7 @@
 //   pnpm sim                     # against http://localhost:8787
 //   BRAID_URL=https://... pnpm sim
 //   pnpm sim --pause             # stop before each landing so you can watch the UI
-//   pnpm sim --review            # have a model review each attempt (needs one configured; off by default, so no model is needed)
+//   pnpm sim --review --plan     # have a model review each attempt and look at each intent (needs one configured; off by default, so no model is needed)
 //   pnpm sim --until=conflict    # leave the project mid-flight (also: --until=ready, --keep)
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -148,7 +148,7 @@ async function resetButton(a) {
 // ── run ──────────────────────────────────────────────────────────────────────
 
 console.log(`Braid at ${BASE}, project "${slug}"\n`);
-await http("POST", "/api/projects", { slug, name: "Tally", description: "Simulated run: four agents, three intents", review: process.argv.includes("--review") });
+await http("POST", "/api/projects", { slug, name: "Tally", description: "Simulated run: four agents, three intents", review: process.argv.includes("--review"), plan: process.argv.includes("--plan") });
 const api = (method, path, body) => http(method, `/api/p/${slug}${path}`, body);
 
 const dark = await api("POST", "/intents", { title: "Add a dark mode", goal: "Users can switch the app to a dark color scheme.", acceptance: "A visible control switches themes; all colors come from CSS variables." });

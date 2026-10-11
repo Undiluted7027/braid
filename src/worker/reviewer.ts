@@ -1,9 +1,8 @@
 // The models that write a review. One call with a structured answer; see review.ts for what the reviewer is shown and what is kept.
 // Two providers, so that an attempt can be read by a model from a different maker than the agent that wrote it.
-import Anthropic from "@anthropic-ai/sdk";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import { BraidError, type BraidEnv } from "./project";
+import { models, structured, type ModelPick, type Provider } from "./model";
 import { prompt, SYSTEM, type ReviewAnswer, type ReviewInput } from "./review.ts";
 
 const Answer = z.object({
@@ -30,21 +29,9 @@ const ANSWER_SCHEMA = {
 	},
 };
 
-export type Provider = "claude" | "openai";
-export interface Reviewer { provider: Provider; model: string }
-const viaGateway = (env: BraidEnv) => !!(env.AI_GATEWAY_TOKEN && env.AI_GATEWAY_ID && env.AI_GATEWAY_ACCOUNT_ID);
-const gateway = (env: BraidEnv) => `https://gateway.ai.cloudflare.com/v1/${env.AI_GATEWAY_ACCOUNT_ID}/${env.AI_GATEWAY_ID}`;
-
-/**
- * The models this instance can review with. Only ones that can be held to a structured answer and read a
- * whole diff: the small Workers AI model that can stand in for reconciliation is not asked to judge work.
- */
-export function reviewers(env: BraidEnv): Reviewer[] {
-	return [
-		...(env.ANTHROPIC_API_KEY || viaGateway(env) ? [{ provider: "claude" as const, model: env.BRAID_REVIEW_MODEL ?? env.BRAID_MODEL ?? "claude-opus-5-5" }] : []),
-		...(env.OPENAI_API_KEY || viaGateway(env) ? [{ provider: "openai" as const, model: env.BRAID_REVIEW_OPENAI_MODEL ?? env.HOSTED_CODEX_MODEL ?? "gpt-6.1-sol" }] : []),
-	];
-}
+export type { Provider };
+export type Reviewer = ModelPick;
+export const reviewers = models;
 
 /**
  * Who reviews an attempt. A project can name a provider (trunk's braid.json: "reviewer": "claude" | "openai").
@@ -63,43 +50,6 @@ export const reviewerName = (env: BraidEnv): string | null => reviewerFor(env)?.
 export async function reviewAttempt(env: BraidEnv, input: ReviewInput, pick?: Reviewer | null): Promise<ReviewAnswer & { model: string }> {
 	const who = pick ?? reviewerFor(env);
 	if (!who) throw new BraidError("no model configured to review with: set up AI Gateway, or set ANTHROPIC_API_KEY or OPENAI_API_KEY", 501);
-	const user = prompt(input);
-	return who.provider === "openai" ? { ...(await askOpenAI(env, who.model, user)), model: who.model } : { ...(await askClaude(env, who.model, user)), model: who.model };
-}
-
-async function askClaude(env: BraidEnv, model: string, user: string): Promise<ReviewAnswer> {
-	// Through AI Gateway the provider key lives in the gateway: send the gateway token and no key of our own.
-	const client = viaGateway(env)
-		? new Anthropic({ apiKey: "held-by-the-gateway", baseURL: `${gateway(env)}/anthropic`, defaultHeaders: { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}`, "x-api-key": null } })
-		: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
-	const response = await client.messages.parse({
-		model, max_tokens: 8000,
-		output_config: { effort: "high", format: zodOutputFormat(Answer) },
-		system: SYSTEM,
-		messages: [{ role: "user", content: user }],
-	});
-	if (response.stop_reason === "refusal") throw new BraidError("the model declined to review this attempt", 502);
-	if (response.stop_reason === "max_tokens" || !response.parsed_output) throw new BraidError("the review did not fit in one response", 502);
-	return response.parsed_output;
-}
-
-async function askOpenAI(env: BraidEnv, model: string, user: string): Promise<ReviewAnswer> {
-	const through = viaGateway(env);
-	const res = await fetch(through ? `${gateway(env)}/openai/responses` : "https://api.openai.com/v1/responses", {
-		method: "POST",
-		headers: { "content-type": "application/json", ...(through ? { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}` } : { authorization: `Bearer ${env.OPENAI_API_KEY}` }) },
-		body: JSON.stringify({
-			model, instructions: SYSTEM, input: user, max_output_tokens: 8000, store: false,
-			text: { format: { type: "json_schema", name: "review", strict: true, schema: ANSWER_SCHEMA } },
-		}),
-	});
-	const body: any = await res.json().catch(() => null);
-	if (!res.ok) throw new BraidError(`the reviewing model answered ${res.status}${body?.error?.message ? `: ${String(body.error.message).slice(0, 300)}` : ""}`, 502);
-	const parts: any[] = (body?.output ?? []).flatMap((item: any) => (item?.type === "message" ? item.content ?? [] : []));
-	if (parts.some((p) => p?.type === "refusal")) throw new BraidError("the model declined to review this attempt", 502);
-	if (body?.status === "incomplete") throw new BraidError("the review did not fit in one response", 502);
-	let parsed;
-	try { parsed = Answer.safeParse(JSON.parse(parts.filter((p) => p?.type === "output_text").map((p) => p.text).join(""))); } catch { parsed = null; }
-	if (!parsed?.success) throw new BraidError("the model returned an unusable review", 502);
-	return parsed.data;
+	const answer = await structured<ReviewAnswer>(env, who, { system: SYSTEM, user: prompt(input), shape: Answer as any, schema: ANSWER_SCHEMA, name: "review", what: "review this attempt" });
+	return { ...answer, model: who.model };
 }

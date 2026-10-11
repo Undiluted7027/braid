@@ -10,6 +10,8 @@ import { llmName, resolveConflicts } from "./resolver";
 import { diffFlags, sessionFlags } from "./flags.ts";
 import { criteriaOf, settle, type ReviewInput } from "./review.ts";
 import { reviewAttempt, reviewerFor, reviewerName, reviewers, type Reviewer } from "./reviewer";
+import { reaches, settleRelations, settleSplit, type PlanInput, type SplitInput, type Standing } from "./plan.ts";
+import { planIntent, plannerFor, splitGoal } from "./planner";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
 import { drain, Log, type Effect, type Executor, type NewEffect, type NewEvent } from "./log.ts";
@@ -18,7 +20,7 @@ import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
 	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Flag, Intent, JoinResult, Landing, LandOutcome, LineOrigin, Outcome, Overlap, Review, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
+	Flag, Intent, JoinResult, Landing, LandOutcome, LineOrigin, Outcome, Overlap, Proposal, Relation, Review, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
@@ -45,7 +47,7 @@ const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
 const MAX_RESULT_TEXT = 800;
 const MAX_EVENTS = 20_000;
-const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "outcomes", "reviews"];
+const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "outcomes", "reviews", "relations", "proposals"];
 /** How long one alarm keeps taking new effects before handing over to the next. An alarm may run for fifteen minutes. */
 const DRAIN_MS = 8 * 60_000;
 const now = () => Date.now();
@@ -123,6 +125,8 @@ export class Project extends DurableObject<BraidEnv> {
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN flags TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN held TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN held_for TEXT"); } catch {}
+		this.sql.exec("CREATE TABLE IF NOT EXISTS relations (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, a INTEGER, b INTEGER, why TEXT, a_criteria TEXT, b_criteria TEXT, by TEXT, source TEXT, dismissed INTEGER DEFAULT 0, at INTEGER)");
+		this.sql.exec("CREATE TABLE IF NOT EXISTS proposals (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT, status TEXT, intents TEXT, note TEXT, by TEXT, error TEXT, at INTEGER)");
 		this.sql.exec(`CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT, intent_id INTEGER, sha TEXT, status TEXT, verdict TEXT,
 			criteria TEXT, summary TEXT, concerns TEXT, changes TEXT, by TEXT, error TEXT, at INTEGER, finished_at INTEGER)`);
 		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN auto TEXT"); } catch {}
@@ -299,6 +303,8 @@ export class Project extends DurableObject<BraidEnv> {
 		"landing.revert": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doRevert(effect.data.sha, effect.data.by, effect.data.reason); } },
 		"model.reconcile": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doModelReconcile(effect.data.reconId); } },
 		"agent.start": { replaySafe: true, run: async (effect, ctx) => { if (this.trunk) await this.doStartAgent(effect.data.attemptId, effect.data.kind, effect.data.task, ctx.willRetry); } },
+		"plan.run": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doPlan(effect.data.intentId, !!effect.data.again); } },
+		"plan.split": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doSplit(effect.data.proposalId); } },
 		"review.run": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doReview(effect.data.attemptId, !!effect.data.again); } },
 		"policy.consider": { replaySafe: true, run: async (effect) => { if (this.trunk) { await this.policy(); this.consider(effect.data.attemptId); } } },
 		"agent.stop": { replaySafe: true, run: async (effect) => { await this.agentHost(effect.data.attemptId)?.stop(effect.data.why); } },
@@ -401,7 +407,7 @@ export class Project extends DurableObject<BraidEnv> {
 	 * Create the trunk repo. `starter` seeds a small demo app, `import` copies an existing
 	 * git repository, and `empty` waits for a first push (see trunkCredentials).
 	 */
-	async init(input: { slug: string; name: string; description: string; source?: "starter" | "empty" | "import"; url?: string; branch?: string; review?: boolean }) {
+	async init(input: { slug: string; name: string; description: string; source?: "starter" | "empty" | "import"; url?: string; branch?: string; review?: boolean; plan?: boolean }) {
 		if (this.trunk) throw new BraidError("project already exists", 409);
 		const repo = `${input.slug}--trunk`;
 		// Never clear a repository of that name first: the Artifacts namespace can be shared with another
@@ -442,6 +448,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.setMeta("branch", branch);
 		this.setMeta("head", head);
 		if (input.review === false) this.setMeta("review", "off");
+		if (input.plan === false) this.setMeta("plan", "off");
 		this.note("project", "braid", head ? `Project created with trunk ${repo} at ${short(head)}` : `Project created with an empty trunk ${repo}; waiting for a first push`);
 		if (head) this.log.commit({ effects: [this.runEffect("trunk"), this.spareEffect()] });
 	}
@@ -457,6 +464,14 @@ export class Project extends DurableObject<BraidEnv> {
 		return { public: on };
 	}
 	async isPublic() { return this.meta("public") === "1"; }
+
+	/** Turn planning on or off for this project: whether each intent is looked at next to the others when it is opened or edited. */
+	async setPlan(on: boolean, by = "human") {
+		this.requireProject();
+		this.setMeta("plan", on ? "" : "off");
+		this.note("project", by, on ? "Intents are looked at next to each other when they are opened" : "Intents are no longer looked at by the planner");
+		return { plan: on };
+	}
 
 	/** Turn reviews of attempts on or off for this project, whatever trunk's braid.json says. Off is for projects where calling a model is not wanted. */
 	async setReview(on: boolean, by = "human") {
@@ -528,12 +543,13 @@ export class Project extends DurableObject<BraidEnv> {
 
 	async state(): Promise<State> {
 		this.requireProject();
-		const { landing, review } = ((await this.policy().catch(() => null))?.config ?? {}) as { landing?: any; review?: unknown };
+		const { landing, review, plan } = ((await this.policy().catch(() => null))?.config ?? {}) as { landing?: any; review?: unknown; plan?: unknown };
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
 				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env), public: this.meta("public") === "1",
-				policy: { landing: landing?.policy === "auto" ? "auto" : "person", review: review !== false && this.meta("review") !== "off" && !!reviewerName(this.env), reviewers: reviewers(this.env).map((r) => r.model), conflicts: landing?.conflicts === "auto" ? "auto" : "person" },
+				policy: { landing: landing?.policy === "auto" ? "auto" : "person", review: review !== false && this.meta("review") !== "off" && !!reviewerName(this.env), reviewers: reviewers(this.env).map((r) => r.model),
+					plan: plan !== false && this.meta("plan") !== "off" && !!plannerFor(this.env), planner: plannerFor(this.env)?.model ?? null, conflicts: landing?.conflicts === "auto" ? "auto" : "person" },
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
 			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note, batch: q.batch_id ?? null })),
@@ -553,6 +569,8 @@ export class Project extends DurableObject<BraidEnv> {
 			activity: this.rows<any>("SELECT * FROM activity ORDER BY id DESC LIMIT 200").map((r): Activity => ({
 				id: r.id, at: r.at, kind: r.kind, actor: r.actor, text: r.text, intentId: r.intent_id, attemptId: r.attempt_id,
 			})),
+			relations: this.relations(),
+			proposals: this.rows("SELECT * FROM proposals ORDER BY id DESC LIMIT 5").map(this.toProposal),
 			reviews: this.rows("SELECT * FROM reviews WHERE id IN (SELECT MAX(id) FROM reviews GROUP BY attempt_id) ORDER BY id").map(this.toReview),
 			outcomes: this.rows<any>("SELECT * FROM outcomes ORDER BY id DESC LIMIT 80").map((r): Outcome => ({
 				id: r.id, kind: r.kind, outcome: r.outcome, text: r.text, attemptId: r.attempt_id, intentId: r.intent_id, by: r.by, ref: r.ref, sha: r.sha ?? "", at: r.at,
@@ -570,7 +588,8 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("INSERT INTO intents (title, goal, acceptance, status, created_by, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
 			input.title.trim(), input.goal.trim(), input.acceptance?.trim() ?? "", by, now());
 		const intent = this.toIntent(this.rows("SELECT * FROM intents ORDER BY id DESC LIMIT 1")[0]);
-		this.note("intent", by, `Opened I${intent.id}: ${intent.title}`, intent.id);
+		this.log.commit({ events: [this.noted("intent", by, `Opened I${intent.id}: ${intent.title}`, intent.id)], effects: [this.planEffect(intent.id)] });
+		this.broadcast();
 		return intent;
 	}
 
@@ -585,7 +604,10 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const a of this.attempts()) {
 			if (a.intentId === id && LIVE.has(a.status)) this.signal(a.id, "intent-changed", { ...next, note: "A person edited the intent you are working on. Read it again and adjust your work to it." });
 		}
-		this.note("intent", input.by ?? "human", `Edited I${id}: ${next.title}`, id);
+		// What it asks for changed, so how it stands with the others is worked out again. What a person said about it stays.
+		this.sql.exec("DELETE FROM relations WHERE source = 'planner' AND dismissed = 0 AND (a = ? OR b = ?)", id, id);
+		this.log.commit({ events: [this.noted("intent", input.by ?? "human", `Edited I${id}: ${next.title}`, id)], effects: [this.planEffect(id)] });
+		this.broadcast();
 		return this.intent(id);
 	}
 
@@ -596,6 +618,7 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("UPDATE attempts SET status = 'abandoned' WHERE intent_id = ? AND status IN ('working','ready','conflicted')", id);
 		this.note("intent", by, `Abandoned I${id}`, id);
 		for (const a of live) await this.retire(a.id);
+		this.unblocked(id);
 	}
 
 	/**
@@ -1201,6 +1224,217 @@ export class Project extends DurableObject<BraidEnv> {
 		};
 	}
 
+	// ── planning: how intents stand to each other, before anyone works on them ──
+
+	/** Look at an intent next to the others. */
+	private planEffect(intentId: number, again = false): NewEffect { return { id: `plan.run:${intentId}`, type: "plan.run", lane: "plan", data: { intentId, again } }; }
+	/** The models that plan. Fields, so a test can put stand-ins here. */
+	planner: typeof planIntent = planIntent;
+	splitter: typeof splitGoal = splitGoal;
+
+	private toRelation = (r: any): Relation => ({ id: r.id, kind: r.kind, from: r.a, to: r.b, why: r.why, fromCriteria: JSON.parse(r.a_criteria || "[]"), toCriteria: JSON.parse(r.b_criteria || "[]"), by: r.by, source: r.source, at: r.at });
+	private toProposal = (r: any): Proposal => ({ id: r.id, goal: r.goal, status: r.status, intents: JSON.parse(r.intents || "[]"), note: r.note ?? "", by: r.by ?? "", error: r.error ?? null, at: r.at });
+
+	/**
+	 * The relations that still mean something: not dismissed, and between intents where it matters. A contradiction or a
+	 * duplicate holds while one side is open and the other is open or has landed. A dependency holds while both are open.
+	 */
+	private relations(): Relation[] {
+		const status = new Map(this.rows<{ id: number; status: string }>("SELECT id, status FROM intents").map((i) => [i.id, i.status]));
+		return this.rows("SELECT * FROM relations WHERE dismissed = 0 ORDER BY id").map(this.toRelation).filter((r) => {
+			const [a, b] = [status.get(r.from), status.get(r.to)];
+			if (r.kind === "depends") return a === "open" && b === "open";
+			return (a === "open" && (b === "open" || b === "landed")) || (b === "open" && a === "landed");
+		});
+	}
+
+	/** How one intent stands with the others: what it clashes with, and what it waits for. */
+	private standing(intentId: number) {
+		const all = this.relations(), title = (id: number) => ({ id, title: this.rows<{ title: string }>("SELECT title FROM intents WHERE id = ?", id)[0]?.title ?? "" });
+		return {
+			clashes: all.filter((r) => r.kind === "contradicts" && (r.from === intentId || r.to === intentId)).map((r) => ({ ...r, other: title(r.from === intentId ? r.to : r.from) })),
+			waitsFor: all.filter((r) => r.kind === "depends" && r.from === intentId).map((r) => ({ ...r, other: title(r.to) })),
+			neededBy: all.filter((r) => r.kind === "depends" && r.to === intentId).map((r) => ({ ...r, other: title(r.from) })),
+			same: all.filter((r) => r.kind === "duplicates" && (r.from === intentId || r.to === intentId)).map((r) => ({ ...r, other: title(r.from === intentId ? r.to : r.from) })),
+		};
+	}
+
+	/** What an agent is told about its intent's standing, in its brief. */
+	private standingText(intentId: number): string[] {
+		const s = this.standing(intentId);
+		if (!s.clashes.length && !s.waitsFor.length && !s.neededBy.length && !s.same.length) return [];
+		return ["## How this intent stands with the others",
+			...s.clashes.map((r) => `- It CONTRADICTS I${r.other.id} "${r.other.title}": ${r.why} Both cannot land as written. Do not work around it: \`record\` a question for a person, and \`message\` the agent on I${r.other.id} if one is working.`),
+			...s.waitsFor.map((r) => `- It needs I${r.other.id} "${r.other.title}" to land first: ${r.why} Your attempt will not be landed before that. \`peek\` at the attempt on I${r.other.id} to see what you will be building on.`),
+			...s.neededBy.map((r) => `- I${r.other.id} "${r.other.title}" is waiting for this intent to land: ${r.why}`),
+			...s.same.map((r) => `- It may be the same as I${r.other.id} "${r.other.title}": ${r.why}`),
+			""];
+	}
+
+	/** An intent landed or was dropped: whatever waited on it, or clashed with it, is looked at again. */
+	private unblocked(intentId: number) {
+		const others = this.rows<{ a: number; b: number }>("SELECT a, b FROM relations WHERE dismissed = 0 AND (a = ? OR b = ?)", intentId, intentId).map((r) => (r.a === intentId ? r.b : r.a));
+		this.reconsider(others);
+	}
+	/** Have the policy and the queue look again at the ready attempts of these intents. */
+	private reconsider(intentIds: number[]) {
+		if (!intentIds.length) return;
+		const ready = this.rows<{ id: string }>(`SELECT id FROM attempts WHERE status = 'ready' AND intent_id IN (${intentIds.map(() => "?").join(", ")})`, ...intentIds);
+		this.log.commit({ effects: [...ready.map((a) => this.considerEffect(a.id)), ...this.advanceEffect()] });
+	}
+
+	/** Write a relation down, tell the agents working on either intent, and have the policy look again. */
+	private relate(found: { kind: Relation["kind"]; from: number; to: number; why: string; fromCriteria: number[]; toCriteria: number[] }, by: string, source: Relation["source"]) {
+		// One relation of a kind per pair, whichever way round it was found. One a person dismissed is not found again.
+		const symmetric = found.kind !== "depends";
+		const had = this.rows("SELECT 1 FROM relations WHERE kind = ? AND ((a = ? AND b = ?)" + (symmetric ? " OR (a = ? AND b = ?))" : ")"), found.kind, found.from, found.to, ...(symmetric ? [found.to, found.from] : []));
+		if (had.length) return false;
+		this.sql.exec("INSERT INTO relations (kind, a, b, why, a_criteria, b_criteria, by, source, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", found.kind, found.from, found.to, redact(found.why), json(found.fromCriteria), json(found.toCriteria), by, source, now());
+		const [from, to] = [this.intent(found.from), this.intent(found.to)];
+		const said = found.kind === "contradicts" ? `I${from.id} "${from.title}" contradicts I${to.id} "${to.title}"` : found.kind === "depends" ? `I${from.id} "${from.title}" needs I${to.id} "${to.title}" to land first` : `I${from.id} "${from.title}" looks like the same as I${to.id} "${to.title}"`;
+		const live = this.attempts().filter((a) => LIVE.has(a.status) && (a.intentId === from.id || a.intentId === to.id));
+		this.log.commit({
+			events: [
+				this.noted("plan", by, `${said}: ${found.why}`, from.id),
+				...live.map((a) => this.signalled(a.id, "plan", { relation: found.kind, with: a.intentId === from.id ? `I${to.id}: ${to.title}` : `I${from.id}: ${from.title}`, why: found.why,
+					note: found.kind === "contradicts" ? "Your intent and this one cannot both land as written. Do not work around it: record a question for a person." : found.kind === "depends" ? "One of these two must land before the other. Call `brief` to see which, and `peek` at the other attempt." : "These two intents may ask for the same thing. Call `peek` on the other attempt before going further." })),
+			],
+			effects: live.filter((a) => a.status === "ready").map((a) => this.considerEffect(a.id)),
+		});
+		return true;
+	}
+
+	private planning(config: { plan?: unknown } | null) { return config?.plan !== false && this.meta("plan") !== "off" && !!plannerFor(this.env); }
+
+	private async doPlan(intentId: number, again: boolean) {
+		const config = (await this.policy()).config as { plan?: unknown } | null;
+		if (!again && !this.planning(config)) return;
+		const row = this.rows("SELECT * FROM intents WHERE id = ? AND status = 'open'", intentId)[0];
+		if (!row) return;
+		const intent = this.toIntent(row), stand = (i: Intent): Standing => ({ id: i.id, title: i.title, goal: i.goal, criteria: i.criteria, status: i.status === "landed" ? "landed" : "open" });
+		// The other open intents, and the last few that landed: a new intent can undo or repeat those.
+		const others = [...this.intents().filter((i) => i.id !== intent.id && i.status === "open"), ...this.intents().filter((i) => i.status === "landed").slice(-15)].map(stand);
+		if (!others.length) return;
+		const input: PlanInput = { intent: stand(intent), others };
+		try {
+			const answer = await this.planner(this.env, input);
+			// The intent may have been edited or closed while the model was reading it: that edit asked for its own planning.
+			const still = this.rows("SELECT * FROM intents WHERE id = ? AND status = 'open'", intentId)[0];
+			if (!still || this.toIntent(still).goal !== intent.goal || this.toIntent(still).acceptance !== intent.acceptance) return;
+			const depends = this.rows<{ a: number; b: number }>("SELECT a, b FROM relations WHERE kind = 'depends' AND dismissed = 0").map((r) => [r.a, r.b] as [number, number]);
+			const found = settleRelations(answer, input, depends);
+			let n = 0;
+			for (const f of found) if (this.relate(f, answer.model, "planner")) n++;
+			if (again && !n) this.note("plan", answer.model, `Looked at I${intent.id} next to ${others.length} other intent${others.length === 1 ? "" : "s"}: nothing stands in its way`, intent.id);
+		} catch (e) {
+			// Not tried again by itself: planning is advice, and a person can ask for it again.
+			this.note("plan", "braid", `I${intent.id} could not be looked at next to the others: ${splitError(e).message}`, intent.id);
+		}
+		this.broadcast();
+	}
+
+	/** Ask for an intent to be looked at next to the others (again). */
+	async plan(intentId: number) {
+		this.requireProject();
+		if (this.intent(intentId).status !== "open") throw new BraidError(`I${intentId} is ${this.intent(intentId).status}`);
+		if (!plannerFor(this.env)) throw new BraidError("this Braid instance has no model to plan with", 501);
+		this.sql.exec("DELETE FROM relations WHERE source = 'planner' AND dismissed = 0 AND (a = ? OR b = ?)", intentId, intentId);
+		this.log.commit({ effects: [this.planEffect(intentId, true)] });
+		return { queued: true };
+	}
+
+	/** A person says how two intents stand: that one needs the other first, that they contradict, or that they are the same. */
+	async relateIntents(intentId: number, input: { kind?: string; other?: number; why?: string; by?: string }) {
+		this.requireProject();
+		const from = this.intent(intentId), to = this.intent(Number(input.other)), by = String(input.by || "human").slice(0, 40), why = redact(String(input.why ?? "")).trim();
+		const kind = input.kind === "depends" || input.kind === "contradicts" || input.kind === "duplicates" ? input.kind : null;
+		if (!kind) throw new BraidError("say how they stand: depends, contradicts or duplicates");
+		if (from.id === to.id) throw new BraidError("an intent cannot stand in a relation to itself");
+		if (from.status !== "open") throw new BraidError(`I${from.id} is ${from.status}`);
+		if (!why) throw new BraidError("say why, in a sentence: it is shown to the agents and to whoever lands these");
+		if (kind === "depends") {
+			if (to.status !== "open") throw new BraidError(`I${to.id} is ${to.status}, so nothing can wait for it`);
+			const depends = this.rows<{ a: number; b: number }>("SELECT a, b FROM relations WHERE kind = 'depends' AND dismissed = 0").map((r) => [r.a, r.b] as [number, number]);
+			if (reaches(depends, to.id, from.id)) throw new BraidError(`I${to.id} already needs I${from.id} to land first, so this would go round in a circle`, 409);
+		}
+		// A person's word replaces whatever was there for this pair, a dismissal included.
+		this.sql.exec("DELETE FROM relations WHERE kind = ? AND ((a = ? AND b = ?) OR (a = ? AND b = ?))", kind, from.id, to.id, to.id, from.id);
+		this.relate({ kind, from: from.id, to: to.id, why, fromCriteria: [], toCriteria: [] }, by, "person");
+		this.reconsider([from.id, to.id]);
+		this.broadcast();
+		return { ok: true };
+	}
+
+	/** A person says a relation does not hold. It is kept, dismissed, so the planner does not find it again. */
+	async dismissRelation(id: number, by = "human") {
+		this.requireProject();
+		const row = this.rows<any>("SELECT * FROM relations WHERE id = ?", id)[0];
+		if (!row) throw new BraidError("no such relation", 404);
+		this.sql.exec("UPDATE relations SET dismissed = 1 WHERE id = ?", id);
+		this.note("plan", by, `${by} said I${row.a} and I${row.b} ${row.kind === "contradicts" ? "do not contradict each other" : row.kind === "depends" ? "do not need to land in order" : "are not the same"}`, row.a);
+		this.reconsider([row.a, row.b]);
+		return { ok: true };
+	}
+
+	/** Ask the planner to split a broad goal into intents. The proposal is for a person to accept, edit or drop; nothing is opened by itself. */
+	async proposeSplit(goal: string, by = "human") {
+		this.requireProject();
+		const text = redact(String(goal ?? "")).trim();
+		if (text.length < 10) throw new BraidError("write the goal to split, in a sentence or more");
+		if (!plannerFor(this.env)) throw new BraidError("this Braid instance has no model to plan with", 501);
+		const id = this.rows<{ id: number }>("INSERT INTO proposals (goal, status, intents, note, by, at) VALUES (?, 'running', '[]', '', ?, ?) RETURNING id", text.slice(0, 4000), String(by).slice(0, 40), now())[0].id;
+		this.log.commit({ effects: [{ id: `plan.split:${id}`, type: "plan.split", lane: "plan", data: { proposalId: id } }] });
+		this.broadcast();
+		return { queued: true, id };
+	}
+
+	private async doSplit(proposalId: number) {
+		const row = this.rows<any>("SELECT * FROM proposals WHERE id = ? AND status = 'running'", proposalId)[0];
+		if (!row) return;
+		try {
+			const files = this.meta("head") ? (await this.tree("trunk")).slice(0, 400) : [];
+			const input: SplitInput = { goal: row.goal, files, open: this.intents().filter((i) => i.status === "open").map((i) => ({ id: i.id, title: i.title })) };
+			const answer = await this.splitter(this.env, input), kept = settleSplit(answer);
+			if (!kept.intents.length) throw new BraidError("the planner proposed nothing usable", 502);
+			this.sql.exec("UPDATE proposals SET status = 'done', intents = ?, note = ?, by = ? WHERE id = ? AND status = 'running'", json(kept.intents), redact(kept.note), answer.model, proposalId);
+		} catch (e) {
+			this.sql.exec("UPDATE proposals SET status = 'failed', error = ? WHERE id = ? AND status = 'running'", splitError(e).message.slice(0, 500), proposalId);
+		}
+		this.broadcast();
+	}
+
+	/** Open the intents of a proposal, as the planner wrote them or as a person edited them, with their order kept as dependencies. */
+	async acceptProposal(id: number, input: { intents?: { title?: string; goal?: string; acceptance?: string; dependsOn?: number[] }[]; by?: string } = {}) {
+		this.requireProject();
+		const row = this.rows<any>("SELECT * FROM proposals WHERE id = ?", id)[0];
+		if (!row) throw new BraidError("no such proposal", 404);
+		if (row.status !== "done") throw new BraidError(`that proposal is ${row.status}`, 409);
+		const list = (Array.isArray(input.intents) && input.intents.length ? input.intents : JSON.parse(row.intents)) as Proposal["intents"], by = String(input.by || "human").slice(0, 40);
+		if (!list.length || list.length > 12 || list.some((i) => !String(i.title ?? "").trim() || !String(i.goal ?? "").trim())) throw new BraidError("every intent needs a title and a goal, and there can be at most twelve");
+		this.sql.exec("UPDATE proposals SET status = 'accepted' WHERE id = ?", id);
+		// Opened without each being planned against the others: the proposal already says how they stand.
+		const made: Intent[] = [];
+		for (const i of list) {
+			this.sql.exec("INSERT INTO intents (title, goal, acceptance, status, created_by, created_at) VALUES (?, ?, ?, 'open', ?, ?)", String(i.title).trim().slice(0, 200), String(i.goal).trim(), String(i.acceptance ?? "").trim(), by, now());
+			made.push(this.toIntent(this.rows("SELECT * FROM intents ORDER BY id DESC LIMIT 1")[0]));
+		}
+		this.note("intent", by, `Opened ${made.map((i) => `I${i.id}`).join(", ")} from the plan for: ${String(row.goal).slice(0, 120)}`, made[0].id);
+		list.forEach((i, n) => {
+			for (const d of [...new Set(i.dependsOn ?? [])]) {
+				if (Number.isInteger(d) && d >= 1 && d <= list.length && d - 1 < n) this.relate({ kind: "depends", from: made[n].id, to: made[d - 1].id, why: "The plan this came from put it after that one.", fromCriteria: [], toCriteria: [] }, row.by || "planner", "planner");
+			}
+		});
+		this.broadcast();
+		return { intents: made.map((i) => i.id) };
+	}
+
+	async dropProposal(id: number) {
+		this.requireProject();
+		this.sql.exec("UPDATE proposals SET status = 'dropped' WHERE id = ? AND status IN ('done', 'failed', 'running')", id);
+		this.broadcast();
+		return { ok: true };
+	}
+
 	// ── review: a reading of an attempt against its intent, and a policy that may act on it ──
 
 	/** The model that reviews. A field, so a test can put a stand-in here. */
@@ -1281,6 +1515,9 @@ export class Project extends DurableObject<BraidEnv> {
 		const a = this.toAttempt(row), auto = this.policyAt?.policy.config?.landing?.policy === "auto";
 		const hold = (why: string, kind: Attempt["heldFor"] = "") => { if (a.held !== why || a.heldFor !== kind) { this.sql.exec("UPDATE attempts SET held = ?, held_for = ? WHERE id = ?", why, kind, a.id); this.broadcast(); } };
 		if (!auto || !LIVE.has(a.status) || a.status !== "ready" || this.intent(a.intentId).status !== "open") return hold("");
+		const stands = this.standing(a.intentId);
+		if (stands.clashes.length) return hold(`Its intent ${stands.clashes.map((r) => `contradicts I${r.other.id} "${r.other.title}"`).join(" and ")}: ${stands.clashes[0].why} A person chooses.`, "contradiction");
+		if (stands.waitsFor.length) return hold(`Waiting for ${stands.waitsFor.map((r) => `I${r.other.id}`).join(" and ")} to land first: ${stands.waitsFor[0].why}`, "dependency");
 		if (this.rows("SELECT 1 FROM queue WHERE attempt_id = ?", a.id).length) return hold("");
 		const run = this.env.RUNNER ? this.latestRun(a.id) : null;
 		if (this.env.RUNNER && (!run || run.sha !== a.headSha || run.status === "queued" || run.status === "running")) return hold("Waiting for its checks.", "checks");
@@ -1545,6 +1782,7 @@ export class Project extends DurableObject<BraidEnv> {
 			`Goal: ${intent.goal}`,
 			intent.acceptance ? `Done when (your attempt is reviewed against each of these):\n${intent.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : "",
 			"",
+			...this.standingText(intent.id),
 			"You are one of several agents working in this project at the same time. Your working copy is a private fork of trunk.",
 			"Other agents cannot see your files, only what you tell Braid and what you push. Protocol:",
 			"1. `brief` first: see who else is working and why.",
@@ -1664,6 +1902,9 @@ export class Project extends DurableObject<BraidEnv> {
 		const a = this.attempt(entry.attempt_id), intent = this.intent(a.intentId);
 		if (!LIVE.has(a.status) || intent.status !== "open") return { kind: "gone" };
 		if (a.headSha !== entry.attempt_sha) return { kind: "refused", why: `attempt ${a.id} moved to ${short(a.headSha)} after landing was asked for at ${short(entry.attempt_sha)}; review it and land again` };
+		// An intent that needs another to land first waits for it, whoever asked. "Land now" is a person saying otherwise.
+		const first = entry.force ? [] : this.standing(a.intentId).waitsFor;
+		if (first.length) return { kind: "wait", why: `waits for ${first.map((r) => `I${r.other.id}`).join(" and ")} to land first` };
 		if (!this.env.RUNNER || entry.force) return { kind: "ready" };
 		const own = this.latestRun(a.id);
 		if (!own || own.sha !== a.headSha || own.status === "queued" || own.status === "running") return { kind: "wait", why: `waiting for ${short(a.headSha)} to be verified` };
@@ -2054,6 +2295,7 @@ export class Project extends DurableObject<BraidEnv> {
 			this.settled("landing", "landed", `Landed on trunk as ${short(sha)}`, a, by, sha, a.headSha),
 		] });
 		await this.retire(a.id);
+		this.unblocked(intent.id);
 
 		// The why is copied to the context repository after the landing, not as part of it. A copy that failed before is tried again now.
 		this.log.requeueFailed("context.save");
@@ -2465,7 +2707,7 @@ function describeCall(tool: string, args: Record<string, any>): string {
 }
 
 /** Requests that may carry an Idempotency-Key. */
-const KEYED = new Set(["createIntent", "join", "hostAgent", "rehost", "respond", "revertLanding", "land", "cancelLanding", "resolve", "resolveWithModel", "abandonIntent", "abandonAttempt", "restoreAttempt", "editIntent", "stopHosted", "review"]);
+const KEYED = new Set(["createIntent", "join", "hostAgent", "rehost", "respond", "revertLanding", "land", "cancelLanding", "resolve", "resolveWithModel", "abandonIntent", "abandonAttempt", "restoreAttempt", "editIntent", "stopHosted", "review", "plan", "relateIntents", "dismissRelation", "proposeSplit", "acceptProposal", "dropProposal"]);
 type Resolutions = { recon: Reconciliation | null; map: Map<string, string> };
 type Observed = Pick<Attempt, "baseSha" | "headSha" | "files" | "behind" | "trunkConflicts"> & { trunkSeen: string };
 const STALE_NOTE = "Braid has not finished reading your latest push, so this is what it knew before. Anything new arrives in heads_up on your next call.";

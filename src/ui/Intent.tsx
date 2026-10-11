@@ -8,6 +8,7 @@ import { FileDiff } from "./Diff";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Icon, Notice, Tabs, type IconName, type Tab } from "./Kit";
 import { forceable, landingVerdict, modelVerdict, neverStarted, outcomesOf, reason, revertVerdict, sentence, useAsked } from "./Later";
+import { Standing } from "./Plan";
 import { HostedChip, JoinCommand } from "./Project";
 import { CriteriaTable, FlagBox, flagsOf, Held, policyOf, ReviewPanel, reviewOf, reviewTag } from "./Review";
 import { Session } from "./Session";
@@ -574,6 +575,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 					</div>
 				)}
 				{!editing && <CriteriaTable state={state} intent={intent} attempts={attempts} />}
+				{!editing && intent.status !== "abandoned" && <Standing state={state} intent={intent} />}
 				{reverts.map((r) => <Notice key={r.sha} tone="warn" small>A landing of this intent was taken back out of trunk as <span className="mono">{short(r.sha)}</span> by {r.agent}, {ago(r.at)}. The reason is in that attempt's decisions.</Notice>)}
 				{landing && (
 					<div className="landed-note">

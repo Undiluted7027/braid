@@ -94,7 +94,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 			if (!SLUG.test(slug)) return Response.json({ error: "slug must be 3-40 characters: lowercase letters, digits, single hyphens" }, { status: 400 });
 			await registry.registerProject(slug, String(b.name || slug), String(b.description ?? ""));
 			try {
-				await project(env, slug).init({ slug, name: String(b.name || slug), description: String(b.description ?? ""), source: b.source, url: b.url, branch: b.branch, review: b.review });
+				await project(env, slug).init({ slug, name: String(b.name || slug), description: String(b.description ?? ""), source: b.source, url: b.url, branch: b.branch, review: b.review, plan: b.plan });
 			} catch (e) {
 				await registry.unregisterProject(slug);
 				throw e;
@@ -163,6 +163,13 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "trunk-credentials") return Response.json(await p.trunkCredentials());
 		if (rest[0] === "clone-credentials") return Response.json(await p.cloneCredentials());
 		if (rest[0] === "review") return Response.json(await p.setReview(b.review === true, b.by));
+		if (rest[0] === "planning") return Response.json(await p.setPlan(b.plan === true, b.by));
+		if (rest[0] === "plan" && rest.length === 1) return Response.json(await once("proposeSplit", String(b.goal ?? ""), b.by), { status: 201 });
+		if (rest[0] === "proposals" && rest[2] === "accept") return Response.json(await once("acceptProposal", Number(rest[1]), b), { status: 201 });
+		if (rest[0] === "proposals" && rest[2] === "drop") return Response.json(await once("dropProposal", Number(rest[1])));
+		if (rest[0] === "relations" && rest[2] === "dismiss") return Response.json(await once("dismissRelation", Number(rest[1]), b.by));
+		if (rest[0] === "intents" && rest[2] === "plan") return Response.json(await once("plan", Number(rest[1])));
+		if (rest[0] === "intents" && rest[2] === "relations") return Response.json(await once("relateIntents", Number(rest[1]), b), { status: 201 });
 		if (rest[0] === "public") {
 			const made = await p.setPublic(b.public === true, b.by);
 			await registry.markPublic(slug, made.public);
