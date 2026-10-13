@@ -822,7 +822,7 @@ export class Project extends DurableObject<BraidEnv> {
 				// A landing that was asked for is off: the person wants something else first.
 				this.sql.exec("DELETE FROM queue WHERE attempt_id = ? AND state != 'pushing'", a.id);
 				if (a.status === "ready") this.setStatus(a.id, "working");
-				this.signal(a.id, "feedback", { from: by, body, note: "A person reviewed your attempt and sent it back. Do what the note asks, `record` how you addressed it, push, checkpoint, and mark the attempt ready again." });
+				this.signal(a.id, "feedback", { from: by, body, note: `${by === "reviewer" ? "The project's reviewer read your attempt and sent it back" : "A person reviewed your attempt and sent it back"}. Do what the note asks, \`claim\` any file you will change that you have not claimed, \`record\` how you addressed it, push, checkpoint, and mark the attempt ready again.` });
 				this.note("feedback", by, `${by} sent attempt ${a.id} back: ${body}`, a.intentId, a.id);
 			} else {
 				this.signal(a.id, "answer", { from: by, question: q.title, body });
@@ -1157,7 +1157,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (row.hosted === "starting" || row.hosted === "running") throw new BraidError(`${a.agent} is already running for attempt ${a.id}`, 409);
 		this.sql.exec("UPDATE attempts SET hosted = 'starting', hosted_detail = '' WHERE id = ?", a.id);
 		this.log.commit({ effects: [{ id: `agent.start:${a.id}`, type: "agent.start", lane: `agent:${a.id}`, data: { attemptId: a.id, kind, task } }] });
-		this.note("attempt", "braid", `Bringing ${a.agent} back to attempt ${a.id} in a Cloudflare sandbox to ${task === "reconcile" ? "reconcile with trunk" : task === "respond" ? "act on a person's note" : "fix failed verification"}`, a.intentId, a.id);
+		this.note("attempt", "braid", `Bringing ${a.agent} back to attempt ${a.id} in a Cloudflare sandbox to ${task === "reconcile" ? "reconcile with trunk" : task === "respond" ? "act on the note it was sent" : "fix failed verification"}`, a.intentId, a.id);
 		return { attemptId: a.id };
 	}
 

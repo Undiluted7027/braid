@@ -754,6 +754,8 @@ test("when the reviewer asks for changes the attempt is sent back with them, twi
 	assert.deepEqual([(await row(w, a)).status, s.decisions.filter((d) => d.kind === "feedback").map((d) => [d.agent, d.body])], ["working", [["reviewer", "Say hello in the notes."]]]);
 	const heard = w.tool(a, "brief"); await w.settle();
 	assert.ok((await heard).heads_up.some((h) => h.kind === "feedback" && h.from === "reviewer" && h.body === "Say hello in the notes."));
+	// It is told who sent it back, and to claim what it goes on to change: an unclaimed change is flagged and would stop it landing by itself.
+	assert.match((await heard).heads_up.find((h) => h.kind === "feedback").note, /^The project's reviewer read your attempt and sent it back\. .*`claim` any file you will change that you have not claimed/);
 	for (const text of ["two\n", "three\n"]) {
 		a.sha = work(w, a, { "notes.md": text }); await w.project.onPush(a.repo); await w.settle(); await w.finish(a.attemptId, "pass"); await w.settle();
 		const said = w.tool(a, "ready", { summary: "again" }); await w.settle(); await said; await w.settle();

@@ -111,9 +111,10 @@ const TASKS = {
 Landing this attempt conflicted with trunk: another intent changed the same lines. Call the braid \`reconciliation\` tool to get both versions, their base, and the intent and decisions behind the trunk side.
 Write a version of each conflicted file that satisfies BOTH intents, then call \`resolve\` with the resolutions and a rationale that says concretely how each side's intent survives. Record the decision. Do not start other work.`,
 	fix: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
-Braid ran your last commit in a clean sandbox and it failed, either on its own or once merged with trunk. Call \`checkpoint\` to see which steps failed and their output (\`verification\`, and \`merged_with_trunk\` inside it). If it is the merge that fails, merge trunk into your attempt first (see \`sync\`). Fix the cause, commit, push, checkpoint again, wait for verification to pass, then mark the attempt ready. Record what you changed and why.`,
+Braid ran your last commit in a clean sandbox and it failed, either on its own or once merged with trunk. Call \`checkpoint\` to see which steps failed and their output (\`verification\`, and \`merged_with_trunk\` inside it). If it is the merge that fails, merge trunk into your attempt first (see \`sync\`). Before you edit a file you have not claimed, \`claim\` it: a change outside what an attempt said it would touch is flagged for a person. Fix the cause, commit, push, checkpoint again, wait for verification to pass, then mark the attempt ready. Record what you changed and why.`,
 	respond: `You are back on a Braid attempt you already worked on, in a sandbox on Cloudflare. Read BRAID.md first.
-A person reviewed the attempt and responded: their notes are at the end of BRAID.md, and arrive in \`heads_up\` on your first tool call. Call \`brief\`, then do what they ask. If a note answers a question you recorded, carry on from it.
+The attempt was read and sent back with a note, by a person or by the project's reviewer, or a question you recorded was answered: the notes are at the end of BRAID.md, and arrive in \`heads_up\` on your first tool call. Call \`brief\`, then do what they ask. If a note answers a question you recorded, carry on from it.
+Before you edit a file you have not claimed, \`claim\` it: a change outside what an attempt said it would touch is flagged for a person, and would stop this attempt landing by itself.
 Record how you addressed each note, commit, push, checkpoint, wait for verification to pass, then mark the attempt ready again. Do not start other work.`,
 };
 
@@ -279,7 +280,7 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 		}
 		// Not awaited to completion: the script outlives this call and the alarm follows it through its files.
 		await container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", TASK, ...argv], { cwd: REPO, env: { HOME: "/root", CI: "true", ...TRUST, ...agentEnv }, stdout: "ignore", stderr: "ignore" });
-		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : job.task === "respond" ? ", to act on a person's note" : ", to fix failed verification"}` }], "running", job.kind === "selftest" ? undefined : model);
+		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : job.task === "respond" ? ", to act on the note it was sent" : ", to fix failed verification"}` }], "running", job.kind === "selftest" ? undefined : model);
 	}
 
 	/** Read what the agent has printed since last time and pass it on as session events. */

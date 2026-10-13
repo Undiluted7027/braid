@@ -310,6 +310,29 @@ The design agreed: a command only records what was decided; its events, the rows
    | A comment claiming success, 2 | 2 | 1 | 1 |
    | Median time | 0.3 s | 0.2 s | 0.1 s |
 
+Checked on the deployed instance on October 12, 2026, which was running the code of entry 6 (batching, the smarter merge and review; found by its deployment time and by what its state contains, since a deployment records no commit):
+
+   | Forty scripted agents | After entry 3 (`scale-40b`) | Now (`scale-40c`) |
+   |---|---|---|
+   | Landed / left as conflicts | 22 / 18 | 31 / 9 |
+   | From the first landing asked to the queue empty | about 6 minutes, 9 s per landing | 63 s, 2 s per landing |
+   | Batches | none | 6, of 7, 5, 5, 5, 5 and 3 |
+   | Landings that kept both sides' additions | 0 | 9 |
+   | `join` / `checkpoint` / `ready`, typical | 0.6 / 1.1 / 0.4 s | 0.4 / 0.6 / 0.2 s |
+
+   - The nine left over are the accent-colour intents that ask for different colours: the planner's case, not the merge's. Trunk passed at the end and nothing was stuck.
+   - A batch that fails (`dep-batch`): of three landings verified together, the third's new test fails only on top of the second's change. The batch failed, each step was run, the first two landed, the third was refused with "passes on its own but failed verification when merged with trunk", and a landing asked after it went into the next batch and landed. 21 s in all.
+   - A landing cancelled while its batch was being verified stayed off trunk; the other two landed.
+   - Two attempts each adding a function at the same place in `app.js` both landed with no reconciliation, with the note and the "Combined:" line in the commit.
+   - The batch display, in Chrome: the queue showed trunk, the two landings in order and "one run: running".
+   - Reviews (`dep-review`, policy and conflicts both "auto"): a Claude Code attempt was read by `gpt-6.1-sol` and a Codex attempt by `claude-opus-5-5`; both were approved and landed by the policy within 16 s of being ready.
+   - Sent back: an attempt that only added a button was reviewed as "changes"; the reviewer's note brought a hosted Claude Code back; it wired the button and added a test in 13 turns; the second review found all three criteria met. It then did not land: the agent had changed `app.js` and the test file without claiming them, and an existing test file was changed, so two flags left it to a person.
+   - Conflicts sent on, two sides that fit together (three changes to the same `<h1>`): the model reconciled one in 10 s and it landed; a hosted Codex reconciled the other, trunk moved meanwhile so its answer was not used, the model reconciled the new conflict, and it landed. Trunk's line carries all three changes.
+   - Conflicts sent on, two sides that cannot both hold (accent colours): Codex recorded a question and changed nothing; the model's answer kept one side and was refused; both were left for a person. Nothing wrong landed.
+   - Found, and fixed locally afterwards: a hosted agent brought back to fix something did not claim the further files it changed, so the "changed files it did not say it would" flag stopped the policy after a successful second round. An agent brought back to act on a note or to fix failed checks is now told to claim a file before editing it, in its task and in the note itself. Not re-run with a real agent. The "changed tests that were already there" flag still leaves such an attempt to a person when the fix adds to an existing test file.
+   - Found, and fixed locally afterwards: an agent brought back by the reviewer was described as acting "on a person's note"; the note now says whether a person or the reviewer sent it back.
+   - Still not verified on the deployed instance: the planner and race and compare, which are not deployed.
+
 Timings on `scale-probe` before any of this, one call at a time with 19 live attempts: `brief` and `record` 0.12 s, `claim` 1.1 s, `checkpoint` 1.3 s with nothing changed and 5.8 s after a change, `join` 4.4 s (the Artifacts fork itself).
 
 ## Interface overhaul (October 4, 2026)
