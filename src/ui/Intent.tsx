@@ -10,6 +10,7 @@ import { ask, Icon, Notice, Tabs, type IconName, type Tab } from "./Kit";
 import { forceable, landingVerdict, modelVerdict, neverStarted, outcomesOf, reason, revertVerdict, sentence, useAsked } from "./Later";
 import { Standing } from "./Plan";
 import { HostedChip, JoinCommand } from "./Project";
+import { isRace, OneOfSeveral, RaceView } from "./Race";
 import { CriteriaTable, FlagBox, flagsOf, Held, policyOf, ReviewPanel, reviewOf, reviewTag } from "./Review";
 import { Session } from "./Session";
 
@@ -440,6 +441,7 @@ function AttemptColumn({ a, state, canLand }: { a: Attempt; state: State; canLan
 					<p className="row"><button disabled={halt.busy} onClick={() => halt.run(() => api("POST", `/p/${slug}/attempts/${a.id}/rehost`, { task: "fix" }))}><Icon name="agent" />Have {a.agent} fix {failing}</button></p>
 				)}
 				{going && <FlagBox a={a} />}
+				<OneOfSeveral state={state} a={a} />
 				<Held state={state} a={a} />
 				{going && a.status !== "conflicted" && a.trunkConflicts.length > 0 && <Notice tone="warn" small>Landing now would conflict with trunk on <span className="mono">{a.trunkConflicts.join(", ")}</span>. Braid will open a reconciliation so you can resolve it.</Notice>}
 			</header>
@@ -536,6 +538,8 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 	// Asking for a revert only writes it down. Either the landing then shows as taken out, or a refusal arrives among the outcomes.
 	const lastRevert = landing ? outcomesOf(state).find((o) => o.kind === "revert" && o.ref === landing.sha) : undefined;
 	const reverting = useAsked(!landing, lastRevert?.id, 90_000);
+	// A link from the project page or from an attempt goes straight to the comparison.
+	useEffect(() => { if (location.hash === "#compare") { const t = window.setTimeout(() => document.getElementById("compare")?.scrollIntoView({ block: "start" }), 80); return () => window.clearTimeout(t); } }, [intentId]);
 	if (!intent) return <main className="page narrow"><h1 className="sr-only">Intent not found</h1><Empty kind="broken" title={`There is no intent I${intentId} in this project`}><p><Link to={`/p/${slug}`} className="button"><Icon name="back" />Back to {state.project.name}</Link></p></Empty></main>;
 	const attempts = state.attempts.filter((a) => a.intentId === intentId).sort((a, b) => ORDER(a) - ORDER(b));
 	const recons = state.reconciliations.filter((r) => r.intentId === intentId);
@@ -553,6 +557,8 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 		reverting.mark();
 	});
 	const open = intent.status === "open";
+	// Several attempts at one intent are read side by side first, and one by one after.
+	const race = isRace(state, intent.id);
 	return (
 		<main className="page">
 			<header className="ihead">
@@ -574,7 +580,7 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 						<div><span className="label">Goal</span><p className="goal">{intent.goal}</p></div>
 					</div>
 				)}
-				{!editing && <CriteriaTable state={state} intent={intent} attempts={attempts} />}
+				{!editing && !race && <CriteriaTable state={state} intent={intent} attempts={attempts} />}
 				{!editing && intent.status !== "abandoned" && <Standing state={state} intent={intent} />}
 				{reverts.map((r) => <Notice key={r.sha} tone="warn" small>A landing of this intent was taken back out of trunk as <span className="mono">{short(r.sha)}</span> by {r.agent}, {ago(r.at)}. The reason is in that attempt's decisions.</Notice>)}
 				{landing && (
@@ -586,11 +592,12 @@ export function IntentPage({ state, intentId }: { state: State; intentId: number
 				)}
 				{reverting.pending && <p className="recon-model" role="status"><Icon name="running" className="spin" />Taking this landing back out of trunk. When it is done the intent opens again; if it cannot be done, the reason appears here.</p>}
 				{notReverted && <Notice small><strong>This landing was not taken back out.</strong> {sentence(notReverted.text)} <span className="notice-meta">Asked by {notReverted.by}, {ago(notReverted.at)}.</span></Notice>}
-				{joining && <JoinCommand slug={slug} intentId={intent.id} hosting={state.project.hosting} />}
+				{joining && <JoinCommand slug={slug} intentId={intent.id} hosting={state.project.hosting} state={state} />}
 				{attempts.length > 0 && <div className="ihead-loom"><span className="label">This intent against trunk</span><MiniLoom state={state} intentId={intent.id} /></div>}
 			</header>
 			{recons.filter((r) => r.status !== "resolved").map((r) => <ReconPanel key={r.id} r={r} state={state} />)}
-			<div className="section-head"><h2>Attempts{attempts.length > 0 && <span className="count">{attempts.length}</span>}</h2>{attempts.length > 1 && <span className="dim">Each is one agent's try at this goal. Compare them, then land one.{policyOf(state).landing === "auto" && liveCount > 1 ? " Braid does not choose between attempts: with more than one going, a person lands." : ""}</span>}</div>
+			{race && <RaceView state={state} intent={intent} />}
+			<div className="section-head"><h2>{race ? "Each attempt in full" : "Attempts"}{attempts.length > 0 && <span className="count">{attempts.length}</span>}</h2>{attempts.length > 1 && <span className="dim">Each is one agent's try at this goal. Compare them, then land one.{policyOf(state).landing === "auto" && liveCount > 1 ? " Braid does not choose between attempts: with more than one going, a person lands." : ""}</span>}</div>
 			{attempts.length === 0 && (
 				<Empty title="No attempts yet">
 					<p>{open ? "Add an agent to start one. Add several to compare approaches." : "This intent was closed before any agent attempted it."}</p>

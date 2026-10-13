@@ -16,6 +16,8 @@ export interface HostJob {
 	agentToken: string; brief: string;
 	/** Why the agent is being started: a new attempt, or brought back to an attempt that needs something. */
 	task: "work" | "reconcile" | "fix" | "respond";
+	/** The model to run the agent on, when the attempt was started with one. Otherwise the instance's model for that agent. */
+	model?: string;
 }
 interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string; kind: HostedKind }
 
@@ -257,7 +259,7 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 `);
 		await this.must("write mcp config", ["sh", "-c", "cat > .mcp.json"], REPO, JSON.stringify({ mcpServers: { braid: { type: "http", url: mcp } } }));
 
-		const model = job.kind === "codex" ? (env.HOSTED_CODEX_MODEL || "gpt-6.1-sol") : (env.HOSTED_CLAUDE_MODEL || "claude-sonnet-5-5");
+		const model = job.model || (job.kind === "codex" ? (env.HOSTED_CODEX_MODEL || "gpt-6.1-sol") : (env.HOSTED_CLAUDE_MODEL || "claude-sonnet-5-5"));
 		let argv: string[], agentEnv: Record<string, string> = {};
 		if (job.kind === "selftest") {
 			await this.must("write self-test", ["sh", "-c", `cat > ${TASK}/selftest.mjs`], REPO, SELFTEST);

@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { handleMcp } from "./mcp";
 import { splitError, type BraidEnv, type Project } from "./project";
+import { previewKey, SHOT_MIME } from "./shot";
 
 export { Project } from "./project";
 export { GitGateway, RegistryGateway, Runner } from "./runner";
@@ -45,11 +46,6 @@ function same(a: string, b: string) {
 }
 /** What the browser holds after signing in: derived from the admin token, so the token itself is not kept in a cookie. */
 const sessionValue = (token: string) => sha256(`braid-session:${token}`);
-/** Lets a sandboxed preview frame load one ref. Its requests carry no cookie, so the key travels in the path. */
-async function previewKey(token: string, slug: string, ref: string) {
-	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-	return hex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`preview:${slug}:${ref}`))).slice(0, 32);
-}
 
 /**
  * Who may use this instance. With BRAID_ADMIN_TOKEN set, everything needs it: reads too, because
@@ -119,7 +115,7 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 	if (rest[0] === "ws") return p.fetch(request);
 	if (method === "GET") {
 		if (rest.length === 0) {
-			const state = await p.state();
+			const state = await p.state(url.origin);
 			const token = env.BRAID_ADMIN_TOKEN;
 			if (token) state.previewKeys = Object.fromEntries(await Promise.all(["trunk", ...state.attempts.map((a) => a.id)].map(async (ref) => [ref, await previewKey(token, slug, ref)])));
 			return Response.json(state);
@@ -142,7 +138,9 @@ async function api(request: Request, env: BraidEnv, url: URL): Promise<Response>
 		if (rest[0] === "effects" && rest[1] === "retry") return Response.json(await p.retryEffect(String(b.id ?? "")));
 		if (rest[0] === "intents" && rest.length === 1) return Response.json(await once("createIntent", b), { status: 201 });
 		if (rest[0] === "intents" && rest[2] === "join") return Response.json(await once("join", { intentId: Number(rest[1]), agent: b.agent, kind: b.kind, origin: url.origin }), { status: 201 });
-		if (rest[0] === "intents" && rest[2] === "host") return Response.json(await once("hostAgent", Number(rest[1]), b.kind === "codex" ? "codex" : b.kind === "selftest" ? "selftest" : "claude"), { status: 201 });
+		if (rest[0] === "intents" && rest[2] === "host") return Response.json(await once("hostAgent", Number(rest[1]), b.kind === "codex" ? "codex" : b.kind === "selftest" ? "selftest" : "claude", typeof b.model === "string" ? b.model : undefined), { status: 201 });
+		if (rest[0] === "intents" && rest[2] === "race") return Response.json(await once("race", Number(rest[1]), Array.isArray(b.agents) ? b.agents : undefined, b.by), { status: 201 });
+		if (rest[0] === "intents" && rest[2] === "compare") return Response.json(await once("compare", Number(rest[1])));
 		if (rest[0] === "attempts" && rest[2] === "rehost") return Response.json(await once("rehost", rest[1], b.task === "fix" ? "fix" : b.task === "respond" ? "respond" : "reconcile"), { status: 201 });
 		if (rest[0] === "attempts" && rest[2] === "stop") return Response.json(await once("stopHosted", rest[1]));
 		if (rest[0] === "intents" && rest[2] === "edit") return Response.json(await once("editIntent", Number(rest[1]), b));
@@ -205,6 +203,11 @@ async function visitor(request: Request, env: BraidEnv, url: URL, seg: string[])
 async function reads(p: Project, rest: string[], q: URLSearchParams): Promise<Response | null> {
 	if (rest[0] === "attempts" && rest[2] === "session") return Response.json(await p.session(rest[1], Number(q.get("after") ?? 0)));
 	if (rest[0] === "attempts" && rest[2] === "diff") return Response.json(await p.diff(rest[1]));
+	if (rest[0] === "attempts" && rest[2] === "against" && rest[3]) return Response.json(await p.against(rest[1], rest[3]));
+	if (rest[0] === "attempts" && rest[2] === "shot") {
+		const shot = await p.shot(rest[1]);
+		return shot ? new Response(shot.bytes as Uint8Array<ArrayBuffer>, { headers: { "content-type": SHOT_MIME, "cache-control": "private, max-age=31536000, immutable", etag: `"${shot.sha}"` } }) : new Response("no picture of this attempt", { status: 404 });
+	}
 	if (rest[0] === "reconciliations" && rest[2] === "marked") return Response.json(await p.marked(Number(rest[1]), q.get("path") ?? ""));
 	if (rest[0] === "tree") return Response.json(await p.tree(q.get("ref") ?? "trunk"));
 	if (rest[0] === "history") return Response.json(await p.history(Number(q.get("limit") ?? 200), q.get("inside") === "1"));

@@ -8,6 +8,7 @@ import { Braid } from "./Braid";
 import { DeleteProject } from "./DeleteProject";
 import { Empty, MiniLoom } from "./Graphics";
 import { ask, Command, Icon, Notice, type IconName } from "./Kit";
+import { isRace, raceNeed, raceUnderWay, RaceLine, StartRace } from "./Race";
 import { ClashRow, clashes, plannerOf, Proposals, SplitGoal, StandingLines } from "./Plan";
 import { landingVerdict, neverStarted, reason, sentence, stuckOf, stuckWords } from "./Later";
 import { currentReview, flagsOf, PolicyPanel, policyOf, reviewTag, tally } from "./Review";
@@ -15,7 +16,7 @@ import { currentReview, flagsOf, PolicyPanel, policyOf, reviewTag, tally } from 
 const LIVE = new Set(["working", "ready", "conflicted"]);
 
 /** The two ways to put an agent on an intent: Braid runs it in a sandbox, or you run it where you like. */
-export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentId: number; hosting: State["project"]["hosting"] }) {
+export function JoinCommand({ slug, intentId, hosting, state }: { slug: string; intentId: number; hosting: State["project"]["hosting"]; /** With the state, starting several agents at once is offered too. */ state?: State }) {
 	const [agent, setAgent] = useState("claude-code");
 	const start = useAction();
 	// The request answers as soon as the attempt exists; the sandbox starts afterwards and the attempt's row says how that went.
@@ -40,6 +41,7 @@ export function JoinCommand({ slug, intentId, hosting }: { slug: string; intentI
 					{asked && !start.busy && <p className="sent" role="status"><Icon name="check" />A new attempt was made for {asked} and its sandbox is starting. It is listed with this intent's attempts, which also say so if it could not start.</p>}
 				</div>
 			)}
+			{hosting.available && state && !state.viewer && <StartRace state={state} intentId={intentId} />}
 			<div className="join-way">
 				<h4><Icon name="terminal" />{hosting.available ? "Or run one yourself" : "Run an agent yourself"}</h4>
 				<p className="dim">Run this where the agent should work. It forks trunk into a new Artifacts repository, clones it, connects the agent to Braid over MCP{agent === "agent" ? ", and prints the directory to start your agent in" : ", and starts it"}. Needs Node 22.18 or newer and git.{me?.protected ? <> Set <code>BRAID_ADMIN_TOKEN</code> to this instance's admin token first.</> : ""}</p>
@@ -104,6 +106,13 @@ function needs(state: State): Need[] {
 		items.push({ key: `s${e.id}`, tone: "conflict", icon: "warning", label: "braid is stuck", text: stuckWords(e.type, e.attemptId).what, to: a ? to(a.intentId) : "", stuck: e });
 	}
 	// Intents that cannot all land: one thing to decide per group, before agents spend work on both sides.
+	// A race is one thing to decide, not one per attempt: it is listed once, and only when it is waiting for a person.
+	const raced = new Set<number>();
+	for (const i of state.intents.filter((i) => i.status === "open" && isRace(state, i.id))) {
+		const need = raceNeed(state, i);
+		if (raceUnderWay(state, i)) raced.add(i.id);
+		if (need) { raced.add(i.id); items.push({ key: `race${i.id}`, tone: need.tone, icon: need.icon, label: need.label, text: need.text, to: `${to(i.id)}#compare` }); }
+	}
 	for (const g of clashes(state)) items.push({ key: `c${g.key}`, tone: "conflict", icon: "conflict", label: "intents clash", text: "", to: "", clash: g });
 	for (const r of state.reconciliations.filter((r) => r.status === "open")) {
 		const a = state.attempts.find((x) => x.id === r.attemptId);
@@ -121,7 +130,9 @@ function needs(state: State): Need[] {
 			const who = `${a.agent}'s attempt ${a.id}`, flags = flagsOf(a), rv = currentReview(state, a), held = auto ? a.held ?? "" : "";
 			// Under a policy that lands by itself, an attempt it is about to land, or is still waiting on checks or a review for, is not a person's yet.
 			// So is one waiting for another intent to land first. One whose intent contradicts another is already listed above, as the clash.
-			if (auto && (!held || a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" || a.heldFor === "contradiction")) continue;
+			if (auto && (!held || a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" || a.heldFor === "contradiction" || a.heldFor === "race")) continue;
+			// An attempt in a race that is already listed above, or that the decision model is holding, is covered by the race's own line.
+			if (raced.has(a.intentId) || a.heldFor === "signal") continue;
 			if (flags.length) items.push({ key: `g${a.id}`, tone: "touch", icon: "warning", label: "flagged for you", text: `${who}: ${sentence(flags[0].text)}${flags.length > 1 ? ` And ${flags.length - 1} more.` : ""}`, to: to(a.intentId) });
 			else if (auto) items.push({ key: `p${a.id}`, tone: "touch", icon: "agent", label: a.heldFor === "choice" ? "pick an attempt" : a.heldFor === "review-failed" ? "review failed" : a.heldFor === "reviewer" ? "reviewer: your call" : a.heldFor === "question" ? "question waiting" : a.heldFor === "landing" ? "landing stopped" : a.heldFor === "checks-failed" ? "checks failed" : "not landed by braid", text: `${who} was not landed by Braid. ${sentence(held)}`, to: to(a.intentId) });
 			else if (rv?.verdict === "approve") items.push({ key: `l${a.id}`, tone: "ready", icon: "check", label: "review passed", text: `${who} meets ${tally(rv).of === 1 ? "its criterion" : `all ${tally(rv).of} criteria`}. ${a.summary || rv.summary}`, to: to(a.intentId) });
@@ -212,7 +223,7 @@ function AttemptRow({ a, state }: { a: Attempt; state: State }) {
 				{a.status === "working" && now ? <span className="now mono" title={now.text}>{now.tool ? `${now.tool}: ` : ""}{now.text.split("\n")[0].slice(0, 140)}</span>
 					: <span className="summary">{a.summary || (a.headSha === a.baseSha ? "Nothing pushed yet." : "No summary yet.")}</span>}
 				<span className="facts">{a.files.length} file{a.files.length === 1 ? "" : "s"} changed · {decisions} decision{decisions === 1 ? "" : "s"} recorded</span>
-				{going && !queued && policyOf(state).landing === "auto" && a.held && <span className="facts held-line"><Icon name={a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" ? "clock" : "agent"} size={12} />{a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" ? "Braid lands it by itself: " : "Not landed by Braid: "}{sentence(a.held).replace(/^./, (c) => c.toLowerCase())}</span>}
+				{going && !queued && policyOf(state).landing === "auto" && a.held && <span className="facts held-line"><Icon name={a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" || a.heldFor === "race" ? "clock" : "agent"} size={12} />{a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" || a.heldFor === "race" ? "Braid lands it by itself: " : "Not landed by Braid: "}{sentence(a.held).replace(/^./, (c) => c.toLowerCase())}</span>}
 			</span>
 			<span className="signals">
 				{flags.length > 0 && <span className="chip flagged" title={flags.map((f) => f.text).join(" ")}><Icon name="warning" size={12} />{flags.length} flag{flags.length === 1 ? "" : "s"}</span>}
@@ -242,6 +253,7 @@ function IntentCard({ intent, state }: { intent: Intent; state: State }) {
 				<p className="goal">{intent.goal}</p>
 				{attempts.length > 0 && <MiniLoom state={state} intentId={intent.id} className="spark" />}
 				{intent.status === "open" && <StandingLines state={state} intent={intent} />}
+				<RaceLine state={state} intent={intent} />
 			</div>
 			{attempts.length > 0 && <ul className="attempts">{attempts.map((a) => <AttemptRow key={a.id} a={a} state={state} />)}</ul>}
 			<div className="intent-foot">
@@ -249,7 +261,7 @@ function IntentCard({ intent, state }: { intent: Intent; state: State }) {
 				{attempts.length > 0 && <Link to={to} className="button"><Icon name="arrow" />{intent.status !== "open" ? "Open" : attempts.length > 1 ? `Compare ${attempts.length} attempts` : "Review the attempt"}</Link>}
 				{intent.status === "open" && !state.viewer && <button onClick={() => setJoining(!joining)} aria-expanded={joining}><Icon name={joining ? "x" : "plus"} />{joining ? "Close" : "Add an agent"}</button>}
 			</div>
-			{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} hosting={state.project.hosting} />}
+			{joining && <JoinCommand slug={state.project.slug} intentId={intent.id} hosting={state.project.hosting} state={state} />}
 		</section>
 	);
 }
@@ -274,7 +286,7 @@ function NewIntent({ slug, close }: { slug: string; close: () => void }) {
 	);
 }
 
-const ICON: Record<string, IconName> = { land: "land", conflict: "conflict", overlap: "overlap", why: "decision", push: "push", claim: "claim", ready: "check", reconcile: "reconcile", message: "message", intent: "intent", attempt: "fork", check: "check", project: "dot", plan: "search", feedback: "feedback", revert: "undo" };
+const ICON: Record<string, IconName> = { land: "land", conflict: "conflict", overlap: "overlap", why: "decision", push: "push", claim: "claim", ready: "check", reconcile: "reconcile", message: "message", intent: "intent", attempt: "fork", check: "check", project: "dot", compare: "strands", plan: "search", feedback: "feedback", revert: "undo" };
 
 export function ProjectPage({ state }: { state: State }) {
 	const open = state.intents.filter((i) => i.status === "open"), done = state.intents.filter((i) => i.status !== "open");

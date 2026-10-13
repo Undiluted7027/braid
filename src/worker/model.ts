@@ -25,7 +25,7 @@ export function models(env: BraidEnv): ModelPick[] {
  * One call, one answer in the given shape. `schema` is the same shape as `shape` written as a JSON Schema with every
  * property required and nothing extra allowed, for the provider that wants that. `what` names the task in error messages.
  */
-export async function structured<T>(env: BraidEnv, who: ModelPick, ask: { system: string; user: string; shape: z.ZodType<T>; schema: object; name: string; what: string; maxTokens?: number }): Promise<T> {
+export async function structured<T>(env: BraidEnv, who: ModelPick, ask: { system: string; user: string; shape: z.ZodType<T>; schema: object; name: string; what: string; maxTokens?: number; /** Pictures shown with the prompt, each named by a line of text before it. */ images?: { label: string; mime: string; base64: string }[] }): Promise<T> {
 	const max = ask.maxTokens ?? 8000;
 	if (who.provider === "claude") {
 		// Through AI Gateway the provider key lives in the gateway: send the gateway token and no key of our own.
@@ -36,7 +36,9 @@ export async function structured<T>(env: BraidEnv, who: ModelPick, ask: { system
 			model: who.model, max_tokens: max,
 			output_config: { effort: "high", format: zodOutputFormat(ask.shape as any) },
 			system: ask.system,
-			messages: [{ role: "user", content: ask.user }],
+			messages: [{ role: "user", content: ask.images?.length
+				? [...ask.images.flatMap((i) => [{ type: "text" as const, text: `${i.label}:` }, { type: "image" as const, source: { type: "base64" as const, media_type: i.mime as "image/jpeg", data: i.base64 } }]), { type: "text" as const, text: ask.user }]
+				: ask.user }],
 		});
 		if (response.stop_reason === "refusal") throw new BraidError(`the model declined to ${ask.what}`, 502);
 		if (response.stop_reason === "max_tokens" || !response.parsed_output) throw new BraidError(`the model's answer did not fit in one response (${ask.what})`, 502);
@@ -47,7 +49,10 @@ export async function structured<T>(env: BraidEnv, who: ModelPick, ask: { system
 		method: "POST",
 		headers: { "content-type": "application/json", ...(through ? { "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}` } : { authorization: `Bearer ${env.OPENAI_API_KEY}` }) },
 		body: JSON.stringify({
-			model: who.model, instructions: ask.system, input: ask.user, max_output_tokens: max, store: false,
+			model: who.model, instructions: ask.system, max_output_tokens: max, store: false,
+			input: ask.images?.length
+				? [{ role: "user", content: [...ask.images.flatMap((i) => [{ type: "input_text", text: `${i.label}:` }, { type: "input_image", image_url: `data:${i.mime};base64,${i.base64}` }]), { type: "input_text", text: ask.user }] }]
+				: ask.user,
 			text: { format: { type: "json_schema", name: ask.name, strict: true, schema: ask.schema } },
 		}),
 	});

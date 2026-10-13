@@ -12,6 +12,12 @@ import { criteriaOf, settle, type ReviewInput } from "./review.ts";
 import { reviewAttempt, reviewerFor, reviewerName, reviewers, type Reviewer } from "./reviewer";
 import { reaches, settleRelations, settleSplit, type PlanInput, type SplitInput, type Standing } from "./plan.ts";
 import { planIntent, plannerFor, splitGoal } from "./planner";
+import { facts, raceKey, settleJudgement, together, type Entrant, type JudgeInput } from "./race.ts";
+import { judgeRace, judges } from "./judge";
+import { likelihoods, passage, signalName, supports, type SignalInput } from "./signal.ts";
+import { previewKey, SHOT_MIME, takeShot } from "./shot";
+import { diffText } from "./review.ts";
+import type { ModelPick } from "./model";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
 import { drain, Log, type Effect, type Executor, type NewEffect, type NewEvent } from "./log.ts";
@@ -19,8 +25,8 @@ import { applyEvent } from "./projection.ts";
 import type { RunJob, RunPolicy, Runner } from "./runner";
 import { hosting, type AgentHost, type HostJob, type HostedKind } from "./agent";
 import type {
-	Activity, Attempt, BlameLine, Check, Conflict, ConflictContext, Decision, DecisionKind, DiffFile, FileView,
-	Flag, Intent, JoinResult, Landing, LandOutcome, LineOrigin, Outcome, Overlap, Proposal, Relation, Review, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
+	Activity, Attempt, BlameLine, Check, Comparison, Conflict, ConflictContext, CriterionVerdict, Decision, DecisionKind, DiffFile, FileView,
+	Flag, Intent, Judgement, Likelihood, JoinResult, Landing, LandOutcome, LineOrigin, Outcome, Overlap, Proposal, Relation, Review, QueuedLanding, Reconciliation, Run, SessionEvent, State, TrunkCommit,
 } from "../shared/types";
 
 export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string; BRAID_ADMIN_TOKEN?: string; BRAID_OPEN?: string;
@@ -42,15 +48,20 @@ const OBSERVE_WAIT_MS = 4000;
 const BATCH = 8;
 /** A merge that has not been verified in this long is given up on. */
 const VERIFY_LIMIT_MS = 45 * 60_000;
+/** Once one attempt at an intent is ready, how many minutes the others are waited for before they are compared without them, unless trunk's braid.json says otherwise (race.wait). */
+const RACE_WAIT_MIN = 30;
+/** Under a policy that lands by itself, the least the decision model must give every criterion of the attempt picked in a race, unless trunk's braid.json says otherwise (landing.likelihood). Set from a trial of 30 patches on one small app, so a setting and not a constant of nature. */
+const LIKELIHOOD_BAR = 0.9;
 const MAX_TEXT = 400_000;
 const MAX_EVENT_TEXT = 4000;
 // Command output is not the why, and it is where secrets turn up: keep a short excerpt, never the whole thing.
 const MAX_RESULT_TEXT = 800;
 const MAX_EVENTS = 20_000;
-const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "outcomes", "reviews", "relations", "proposals"];
+const MOVED_TABLES = ["meta", "intents", "attempts", "decisions", "overlaps", "signals", "reconciliations", "landings", "session", "activity", "events", "outcomes", "reviews", "relations", "proposals", "likelihoods", "comparisons"];
 /** How long one alarm keeps taking new effects before handing over to the next. An alarm may run for fifteen minutes. */
 const DRAIN_MS = 8 * 60_000;
 const now = () => Date.now();
+const base64 = (bytes: Uint8Array) => { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s); };
 const short = (sha: string) => sha.slice(0, 7);
 const json = (v: unknown) => JSON.stringify(v);
 
@@ -130,6 +141,13 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec(`CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT, intent_id INTEGER, sha TEXT, status TEXT, verdict TEXT,
 			criteria TEXT, summary TEXT, concerns TEXT, changes TEXT, by TEXT, error TEXT, at INTEGER, finished_at INTEGER)`);
 		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN auto TEXT"); } catch {}
+		this.sql.exec("CREATE TABLE IF NOT EXISTS likelihoods (attempt_id TEXT PRIMARY KEY, sha TEXT, by TEXT, criteria TEXT, at INTEGER)");
+		this.sql.exec(`CREATE TABLE IF NOT EXISTS comparisons (id INTEGER PRIMARY KEY AUTOINCREMENT, intent_id INTEGER, key TEXT, status TEXT, attempts TEXT, left TEXT, facts TEXT, judges TEXT,
+			pick TEXT, agreed INTEGER, error TEXT, at INTEGER, finished_at INTEGER)`);
+		this.sql.exec("CREATE TABLE IF NOT EXISTS shots (attempt_id TEXT PRIMARY KEY, sha TEXT, image BLOB, error TEXT, at INTEGER)");
+		try { this.sql.exec("ALTER TABLE intents ADD COLUMN race_at INTEGER"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN ask_model TEXT"); } catch {}
+		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN ready_at INTEGER"); } catch {}
 		try {
 			this.sql.exec("ALTER TABLE queue ADD COLUMN batch_id INTEGER");
 			this.sql.exec("ALTER TABLE queue ADD COLUMN position INTEGER");
@@ -176,7 +194,23 @@ export class Project extends DurableObject<BraidEnv> {
 	private toIntent = (r: any): Intent => ({
 		id: r.id, title: r.title, goal: r.goal, acceptance: r.acceptance, status: r.status, createdBy: r.created_by,
 		createdAt: r.created_at, landedSha: r.landed_sha, landedAttempt: r.landed_attempt, criteria: criteriaOf(r),
+		// Only while someone is still being waited for.
+		raceUntil: r.status === "open" && r.race_at && this.racers(r.id).some((a) => a.status === "working" && !this.gone(a)) ? r.race_at + this.raceWait() : null,
 	});
+	private toComparison = (r: any): Comparison => ({
+		id: r.id, intentId: r.intent_id, status: r.status, attempts: JSON.parse(r.attempts || "[]"), left: JSON.parse(r.left || "[]"), facts: JSON.parse(r.facts || "[]"),
+		judges: JSON.parse(r.judges || "[]"), pick: r.pick ?? null, agreed: !!r.agreed, error: r.error ?? null, at: r.at, finishedAt: r.finished_at ?? null,
+	});
+	/** The latest comparison of an intent's attempts, whatever commits it was for. */
+	private comparisonOf(intentId: number): (Comparison & { key: string }) | null {
+		const r = this.rows("SELECT * FROM comparisons WHERE intent_id = ? ORDER BY id DESC LIMIT 1", intentId)[0];
+		return r ? { ...this.toComparison(r), key: r.key } : null;
+	}
+	private toLikelihood = (r: any): Likelihood => ({ attemptId: r.attempt_id, sha: r.sha, by: r.by, criteria: JSON.parse(r.criteria || "[]"), at: r.at });
+	private likelihoodOf(attemptId: string): Likelihood | null {
+		const r = this.rows("SELECT * FROM likelihoods WHERE attempt_id = ?", attemptId)[0];
+		return r ? this.toLikelihood(r) : null;
+	}
 	private toReview = (r: any): Review => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, sha: r.sha, status: r.status, verdict: r.verdict ?? null, criteria: JSON.parse(r.criteria || "[]"),
 		summary: r.summary ?? "", concerns: JSON.parse(r.concerns || "[]"), changes: r.changes ?? "", by: r.by ?? "", error: r.error ?? null, at: r.at, finishedAt: r.finished_at ?? null,
@@ -190,7 +224,7 @@ export class Project extends DurableObject<BraidEnv> {
 		id: r.id, intentId: r.intent_id, agent: r.agent, kind: r.kind, repo: r.repo, remote: r.remote, baseSha: r.base_sha, headSha: r.head_sha,
 		status: r.status, summary: r.summary, files: JSON.parse(r.files), claims: JSON.parse(r.claims), behind: r.behind,
 		trunkConflicts: JSON.parse(r.trunk_conflicts), checks: JSON.parse(r.checks), createdAt: r.created_at, updatedAt: r.updated_at,
-		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "", model: r.model ?? null, flags: JSON.parse(r.flags || "[]"), held: r.held ?? "", heldFor: r.held ? r.held_for ?? "person" : "",
+		hosted: r.hosted ?? null, hostedDetail: r.hosted_detail ?? "", model: r.model ?? null, flags: JSON.parse(r.flags || "[]"), held: r.held ?? "", heldFor: r.held ? r.held_for ?? "person" : "", readyAt: r.ready_at ?? null,
 	});
 	private toDecision = (r: any): Decision => ({
 		id: r.id, attemptId: r.attempt_id, intentId: r.intent_id, agent: r.agent, kind: r.kind, title: r.title, body: r.body,
@@ -271,6 +305,14 @@ export class Project extends DurableObject<BraidEnv> {
 	private reviewEffect(attemptId: string, again = false): NewEffect { return { id: `review.run:${attemptId}`, type: "review.run", lane: `review:${attemptId}`, data: { attemptId, again } }; }
 	/** See whether the project's landing policy has something to do for an attempt. */
 	private considerEffect(attemptId: string): NewEffect { return { id: `policy.consider:${attemptId}`, type: "policy.consider", lane: `policy:${attemptId}`, data: { attemptId } }; }
+	/** Ask the decision model how likely each criterion is met by an attempt's current commit. */
+	private signalEffect(attemptId: string): NewEffect { return { id: `signal.run:${attemptId}`, type: "signal.run", lane: `signal:${attemptId}`, data: { attemptId } }; }
+	/**
+	 * Compare the attempts at an intent, if they are ready to be. `late` is the same thing asked for the moment the wait for the
+	 * others runs out; it has a lane of its own, because work put off at the head of a lane holds back what is asked for after it.
+	 */
+	private judgeEffect(intentId: number, late?: number): NewEffect { return { id: `race.judge${late ? ".late" : ""}:${intentId}`, type: "race.judge", lane: `race${late ? ".late" : ""}:${intentId}`, data: { intentId }, ...(late ? { after: late } : {}) }; }
+	private shotEffect(attemptId: string): NewEffect { return { id: `shot.take:${attemptId}`, type: "shot.take", lane: "shots", data: { attemptId } }; }
 	private stopEffect(attemptId: string, why: string): NewEffect { return { id: `agent.stop:${attemptId}`, type: "agent.stop", lane: `agent:${attemptId}`, data: { attemptId, why } }; }
 
 	/** Each kind of effect checks what is true before it acts, so one that runs twice does no harm. */
@@ -306,7 +348,17 @@ export class Project extends DurableObject<BraidEnv> {
 		"plan.run": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doPlan(effect.data.intentId, !!effect.data.again); } },
 		"plan.split": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doSplit(effect.data.proposalId); } },
 		"review.run": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doReview(effect.data.attemptId, !!effect.data.again); } },
-		"policy.consider": { replaySafe: true, run: async (effect) => { if (this.trunk) { await this.policy(); this.consider(effect.data.attemptId); } } },
+		"policy.consider": { replaySafe: true, run: async (effect) => {
+			if (!this.trunk) return;
+			await this.policy();
+			// Whatever moved this attempt may also be what the comparison of its intent's attempts was waiting for.
+			const intentId = this.rows<{ intent_id: number }>("SELECT intent_id FROM attempts WHERE id = ?", effect.data.attemptId)[0]?.intent_id;
+			if (intentId) this.raceCheck(intentId);
+			this.consider(effect.data.attemptId);
+		} },
+		"signal.run": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doSignal(effect.data.attemptId); } },
+		"race.judge": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doJudge(effect.data.intentId, !!effect.data.again); } },
+		"shot.take": { replaySafe: true, run: async (effect) => { if (this.trunk) await this.doShot(effect.data.attemptId); } },
 		"agent.stop": { replaySafe: true, run: async (effect) => { await this.agentHost(effect.data.attemptId)?.stop(effect.data.why); } },
 		"fork.spare": { replaySafe: true, run: () => this.keepSpares() },
 		"repo.remove": { replaySafe: true, run: async (effect) => { await this.host.remove(effect.data.repo).catch((e) => { if (!/not.?found|does not exist/i.test(String(e?.message ?? e))) throw e; }); } },
@@ -541,15 +593,18 @@ export class Project extends DurableObject<BraidEnv> {
 		this.schema();
 	}
 
-	async state(): Promise<State> {
+	async state(origin?: string): Promise<State> {
 		this.requireProject();
+		// Where this instance is reached, for the browser that takes pictures of previews: only a request can say.
+		if (origin && /^https?:\/\//.test(origin) && origin !== this.meta("origin")) this.setMeta("origin", origin);
 		const { landing, review, plan } = ((await this.policy().catch(() => null))?.config ?? {}) as { landing?: any; review?: unknown; plan?: unknown };
 		return {
 			project: {
 				slug: this.meta("slug"), name: this.meta("name"), description: this.meta("description"),
 				repo: this.trunk, remote: this.meta("remote"), branch: this.branch, head: this.meta("head"), contextRemote: this.meta("context_remote") || null, llm: llmName(this.env), hosting: hosting(this.env), public: this.meta("public") === "1",
 				policy: { landing: landing?.policy === "auto" ? "auto" : "person", review: review !== false && this.meta("review") !== "off" && !!reviewerName(this.env), reviewers: reviewers(this.env).map((r) => r.model),
-					plan: plan !== false && this.meta("plan") !== "off" && !!plannerFor(this.env), planner: plannerFor(this.env)?.model ?? null, conflicts: landing?.conflicts === "auto" ? "auto" : "person" },
+					plan: plan !== false && this.meta("plan") !== "off" && !!plannerFor(this.env), planner: plannerFor(this.env)?.model ?? null, conflicts: landing?.conflicts === "auto" ? "auto" : "person",
+					signal: this.signalOn() ? signalName(this.env) ?? "stand-in" : null, likelihood: this.likelihoodBar(), race: { agents: this.lineUp(), wait: this.raceWait() / 60_000 }, shots: !!this.shooter },
 			},
 			runs: this.rows("SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY ref)").map(this.toRun),
 			queue: this.rows<any>("SELECT * FROM queue ORDER BY force DESC, at, attempt_id").map((q): QueuedLanding => ({ attemptId: q.attempt_id, by: q.by, at: q.at, attemptSha: q.attempt_sha, state: q.state, note: q.note, batch: q.batch_id ?? null })),
@@ -572,6 +627,9 @@ export class Project extends DurableObject<BraidEnv> {
 			relations: this.relations(),
 			proposals: this.rows("SELECT * FROM proposals ORDER BY id DESC LIMIT 5").map(this.toProposal),
 			reviews: this.rows("SELECT * FROM reviews WHERE id IN (SELECT MAX(id) FROM reviews GROUP BY attempt_id) ORDER BY id").map(this.toReview),
+			likelihoods: this.rows("SELECT * FROM likelihoods").map(this.toLikelihood),
+			comparisons: this.rows("SELECT * FROM comparisons WHERE id IN (SELECT MAX(id) FROM comparisons GROUP BY intent_id) ORDER BY id").map(this.toComparison),
+			shots: this.rows<any>("SELECT attempt_id, sha, at FROM shots WHERE image IS NOT NULL").map((r) => ({ attemptId: r.attempt_id, sha: r.sha, at: r.at })),
 			outcomes: this.rows<any>("SELECT * FROM outcomes ORDER BY id DESC LIMIT 80").map((r): Outcome => ({
 				id: r.id, kind: r.kind, outcome: r.outcome, text: r.text, attemptId: r.attempt_id, intentId: r.intent_id, by: r.by, ref: r.ref, sha: r.sha ?? "", at: r.at,
 			})),
@@ -606,7 +664,10 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		// What it asks for changed, so how it stands with the others is worked out again. What a person said about it stays.
 		this.sql.exec("DELETE FROM relations WHERE source = 'planner' AND dismissed = 0 AND (a = ? OR b = ?)", id, id);
-		this.log.commit({ events: [this.noted("intent", input.by ?? "human", `Edited I${id}: ${next.title}`, id)], effects: [this.planEffect(id)] });
+		// The criteria may have changed: what the decision model made of each attempt was about the old ones.
+		const going = this.racers(id).filter((a) => a.headSha !== a.baseSha);
+		this.sql.exec("DELETE FROM likelihoods WHERE attempt_id IN (SELECT id FROM attempts WHERE intent_id = ?)", id);
+		this.log.commit({ events: [this.noted("intent", input.by ?? "human", `Edited I${id}: ${next.title}`, id)], effects: [this.planEffect(id), ...going.map((a) => this.signalEffect(a.id))] });
 		this.broadcast();
 		return this.intent(id);
 	}
@@ -765,6 +826,10 @@ export class Project extends DurableObject<BraidEnv> {
 				this.note("feedback", by, `${by} sent attempt ${a.id} back: ${body}`, a.intentId, a.id);
 			} else {
 				this.signal(a.id, "answer", { from: by, question: q.title, body });
+				// The other attempts at this intent work without seeing each other, so what a person tells one about the intent is told to all.
+				for (const o of this.racers(a.intentId)) {
+					if (o.id !== a.id) this.signal(o.id, "answer", { from: by, question: q.title, body, note: "Another attempt at your intent asked a person this, and this is the answer. It applies to your attempt too." });
+				}
 				this.note("feedback", by, `${by} answered ${a.agent}'s question "${q.title}": ${body}`, a.intentId, a.id);
 			}
 		}
@@ -786,6 +851,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (this.rows("SELECT 1 FROM overlaps WHERE a = ? OR b = ? LIMIT 1", id, id).length) this.log.commit({ events: [{ type: "overlaps.changed", attemptId: id, data: { overlaps: [] } }] });
 		this.log.cancel({ lane: `repo:${id}` }, "the attempt is over");
 		this.log.cancel({ lane: `review:${id}` }, "the attempt is over");
+		this.log.cancel({ lane: `signal:${id}` }, "the attempt is over");
 		// With this one over, another attempt at the intent may be the only one left, which is when the policy may land it.
 		const intentId = this.rows<{ intent_id: number }>("SELECT intent_id FROM attempts WHERE id = ?", id)[0]?.intent_id;
 		const others = this.rows<{ id: string }>("SELECT id FROM attempts WHERE intent_id = ? AND id != ? AND status = 'ready'", intentId ?? -1, id);
@@ -925,6 +991,10 @@ export class Project extends DurableObject<BraidEnv> {
 		if (json(flags) !== json(before.flags)) events.push({ type: "attempt.flagged", attemptId: id, intentId: a.intentId, data: { flags } });
 		// A commit pushed to an attempt that is marked ready is a new thing to review.
 		if (git && git.headSha !== before.headSha && a.status === "ready") effects.push(this.reviewEffect(id));
+		// Trunk moved under an attempt that is ready: the project's settings may have changed with it, so its landing policy is looked at again.
+		if (git && git.headSha === before.headSha && a.status === "ready") effects.push(this.considerEffect(id));
+		// The decision model is quick enough to be asked on every commit.
+		if (git && git.headSha !== before.headSha && a.headSha !== a.baseSha && this.signalOn()) effects.push(this.signalEffect(id));
 		const live = new Map(this.attempts().filter((o) => LIVE.has(o.status)).map((o) => [o.id, o]));
 		live.set(id, a);
 		const others = [...live.values()].filter((o) => o.id !== id && o.intentId !== a.intentId);
@@ -991,21 +1061,63 @@ export class Project extends DurableObject<BraidEnv> {
 	}
 
 	/** Start an attempt on an intent and run the agent for it here, instead of on someone's machine. */
-	async hostAgent(intentId: number, kind: HostedKind) {
+	async hostAgent(intentId: number, kind: HostedKind, model?: string) {
 		this.requireProject();
+		if (model !== undefined && !/^[\w.:\/-]{2,80}$/.test(model)) throw new BraidError("that is not a model name");
 		const can = hosting(this.env);
 		if (!can.available) throw new BraidError("this Braid instance cannot run agents itself");
 		if (kind !== "selftest" && !can[kind]) throw new BraidError(`no model credentials for ${kind}: set up AI Gateway (AI_GATEWAY_ID and the AI_GATEWAY_TOKEN secret) or the provider's API key`);
 		this.roomForAgent();
 		const agent = kind === "claude" ? "claude-code" : kind;
 		const joined = await this.join({ intentId, agent, kind: kind === "selftest" ? "agent" : kind, origin: "" });
-		this.sql.exec("UPDATE attempts SET hosted = 'starting' WHERE id = ?", joined.attemptId);
+		this.sql.exec("UPDATE attempts SET hosted = 'starting', ask_model = ? WHERE id = ?", model ?? null, joined.attemptId);
 		this.log.commit({
-			events: [this.noted("attempt", "braid", `Starting ${agent} for attempt ${joined.attemptId} in a Cloudflare sandbox`, intentId, joined.attemptId)],
+			events: [this.noted("attempt", "braid", `Starting ${agent}${model ? ` on ${model}` : ""} for attempt ${joined.attemptId} in a Cloudflare sandbox`, intentId, joined.attemptId)],
 			effects: [{ id: `agent.start:${joined.attemptId}`, type: "agent.start", lane: `agent:${joined.attemptId}`, data: { attemptId: joined.attemptId, kind, task: "work" } }],
 		});
 		this.broadcast();
 		return { attemptId: joined.attemptId };
+	}
+
+	/** The agents a race starts with when none are named: trunk's braid.json (race.agents), or one of each kind this instance can run. */
+	private lineUp(): { kind: "claude" | "codex"; model: string | null }[] {
+		const can = hosting(this.env), asked = this.policyAt?.policy.config?.race?.agents;
+		const one = (x: any) => {
+			const kind = (typeof x === "string" ? x : x?.kind) === "codex" ? "codex" as const : (typeof x === "string" ? x : x?.kind) === "claude" ? "claude" as const : null;
+			const model = typeof x?.model === "string" && /^[\w.:\/-]{2,80}$/.test(x.model) ? x.model : null;
+			return kind && can[kind] ? [{ kind, model }] : [];
+		};
+		const named = Array.isArray(asked) ? asked.slice(0, 6).flatMap(one) : [];
+		return named.length > 1 ? named : [...(can.claude ? [{ kind: "claude" as const, model: null }] : []), ...(can.codex ? [{ kind: "codex" as const, model: null }] : [])];
+	}
+
+	/**
+	 * Start several agents on one intent at once, each in its own sandbox. They work without seeing each other; when
+	 * they are ready the attempts are compared and one lands. `agents` names them (kind, and a model if not the usual
+	 * one); without it the project's line-up is used. An intent that already has attempts going gets these as well.
+	 */
+	async race(intentId: number, agents?: unknown[], by = "human") {
+		this.requireProject();
+		await this.policy();
+		const intent = this.intent(intentId);
+		if (intent.status !== "open") throw new BraidError(`I${intent.id} is ${intent.status}`);
+		const can = hosting(this.env);
+		if (!can.available) throw new BraidError("this Braid instance cannot run agents itself");
+		const wanted = agents?.length
+			? agents.slice(0, 6).map((x: any) => ({ kind: (typeof x === "string" ? x : x?.kind) === "codex" ? "codex" as const : "claude" as const, model: typeof x?.model === "string" && x.model ? String(x.model) : null }))
+			: this.lineUp();
+		for (const w of wanted) {
+			if (!can[w.kind]) throw new BraidError(`no model credentials for ${w.kind}: set up AI Gateway (AI_GATEWAY_ID and the AI_GATEWAY_TOKEN secret) or the provider's API key`);
+			if (w.model && !/^[\w.:\/-]{2,80}$/.test(w.model)) throw new BraidError(`"${w.model}" is not a model name`);
+		}
+		if (wanted.length + this.racers(intentId).length < 2) throw new BraidError("a race needs at least two attempts: name two agents, or set up a second kind of agent on this instance");
+		const max = Number(this.env.HOSTED_MAX) || HOSTED_MAX;
+		const running = this.rows<{ n: number }>("SELECT COUNT(*) AS n FROM attempts WHERE hosted IN ('starting', 'running')")[0].n;
+		if (running + wanted.length > max) throw new BraidError(`${running} agents are running and this would start ${wanted.length} more, past the limit of ${max} for a project (HOSTED_MAX). Wait for one to finish, stop one, or race fewer.`, 409);
+		this.note("attempt", by, `${by} started a race on I${intent.id}: ${wanted.map((w) => `${w.kind === "claude" ? "claude-code" : "codex"}${w.model ? ` on ${w.model}` : ""}`).join(" against ")}`, intent.id);
+		const started: string[] = [];
+		for (const w of wanted) started.push((await this.hostAgent(intentId, w.kind, w.model ?? undefined)).attemptId);
+		return { attempts: started };
 	}
 
 	/** Hand the job to the attempt's agent host. If that cannot be done, the attempt says so instead of showing "starting" for ever. */
@@ -1015,7 +1127,7 @@ export class Project extends DurableObject<BraidEnv> {
 		const a = this.toAttempt(row);
 		const job: HostJob = {
 			slug: this.meta("slug"), attemptId: a.id, kind, agent: a.agent, repo: a.repo, remote: a.remote, trunkRepo: this.trunk,
-			trunkRemote: this.meta("remote"), branch: this.branch, agentToken: row.token, brief: this.briefText(a), task,
+			trunkRemote: this.meta("remote"), branch: this.branch, agentToken: row.token, brief: this.briefText(a), task, ...(row.ask_model ? { model: row.ask_model } : {}),
 		};
 		try {
 			await this.agentHost(a.id)!.start(job);
@@ -1079,6 +1191,8 @@ export class Project extends DurableObject<BraidEnv> {
 		// An agent that was sent a conflict and left it open has had its turn. A person stopping it is a person taking over.
 		const left = this.rows<{ id: number }>("SELECT id FROM reconciliations WHERE attempt_id = ? AND status = 'open' AND auto = 'agent'", attemptId)[0];
 		if (left && state !== "stopped" && LIVE.has(a.status)) { await this.policy(); this.sendOn(left.id, a, "model"); }
+		// An agent that has gone is no longer waited for by the comparison of its intent's attempts.
+		if (LIVE.has(a.status)) this.log.commit({ effects: [this.considerEffect(a.id)] });
 	}
 
 	// ── verification: each commit of an attempt is run in a sandbox ──────────
@@ -1188,7 +1302,7 @@ export class Project extends DurableObject<BraidEnv> {
 			});
 		}
 		// A result can be what a landing was waiting for, or what the landing policy was waiting for.
-		this.log.commit({ effects: [...this.advanceEffect(), ...(a && !merged && LIVE.has(a.status) ? [this.considerEffect(a.id), ...(a.status === "ready" && a.headSha === run.sha ? [this.reviewEffect(a.id)] : [])] : [])] });
+		this.log.commit({ effects: [...this.advanceEffect(), ...(a && !merged && LIVE.has(a.status) ? [this.considerEffect(a.id), ...(a.status === "ready" && a.headSha === run.sha ? [this.reviewEffect(a.id)] : []), ...(this.wantsShot(a) ? [this.shotEffect(a.id)] : [])] : [])] });
 	}
 
 	/** Lockfiles a sandbox regenerated for a merge: kept as a resolution, for exactly the two commits it was made from. */
@@ -1485,6 +1599,7 @@ export class Project extends DurableObject<BraidEnv> {
 			};
 			const answer = await this.reviewer(this.env, input, pick);
 			const kept = settle(answer, intent.criteria, files, input.run?.status === "pass");
+			await this.cite(kept.criteria, files);
 			this.sql.exec("UPDATE reviews SET status = 'done', verdict = ?, criteria = ?, summary = ?, concerns = ?, changes = ?, by = ?, finished_at = ? WHERE id = ?",
 				kept.verdict, json(kept.criteria), redact(kept.summary), json(kept.concerns.map((c) => redact(c))), redact(kept.changes), answer.model, now(), id);
 			const met = kept.criteria.filter((c) => c.verdict === "met").length;
@@ -1529,7 +1644,24 @@ export class Project extends DurableObject<BraidEnv> {
 		if (a.flags.length) return hold(`Flagged for a person: ${a.flags.map((f) => f.text.toLowerCase()).join("; ")}.`, "flags");
 		const asked = this.decisionsFor(a.id);
 		if (asked.some((q) => q.kind === "question" && !asked.some((d) => d.kind === "answer" && d.title === `Answer: ${q.title}`))) return hold("It asked a question that has no answer yet.", "question");
-		if (this.rows("SELECT 1 FROM attempts WHERE intent_id = ? AND id != ? AND status IN ('working', 'ready', 'conflicted')", a.intentId, a.id).length) return hold("Another attempt at this intent is still going: a person chooses between them.", "choice");
+		if (this.racers(a.intentId).length > 1) {
+			// Several attempts at one intent: they are compared, and this one lands only if it is the one picked.
+			const c = this.comparisonOf(a.intentId);
+			const current = c && c.status !== "running" && c.attempts.some((x) => x.id === a.id) && c.attempts.every((x) => this.racers(a.intentId).some((r) => r.id === x.id && r.headSha === x.sha));
+			if (!current) return hold("Waiting for the other attempts at this intent, and then for them to be compared.", "race");
+			if (c.status === "failed") return hold(`The attempts at this intent could not be compared: ${c.error} A person chooses between them.`, "choice");
+			const said = c.judges.filter((j) => !j.error);
+			if (c.pick !== a.id) return hold(c.pick ? `The judges preferred attempt ${c.pick}.` : said.length > 1 ? `The judges did not agree (${said.map((j) => `${j.by}: ${j.pick ?? "none"}`).join(", ")}): a person chooses.` : "No judge picked an attempt: a person chooses.", "choice");
+			if (!c.agreed) return hold(`${said[0]?.by ?? "One judge"} recommends this attempt, and one judge alone does not land it: a person chooses.`, "choice");
+			if (this.signalOn()) {
+				const read = this.likelihoodOf(a.id), bar = this.likelihoodBar();
+				if (!read || read.sha !== a.headSha) return hold("Waiting for the decision model's reading of it.", "race");
+				if (!read.criteria.length) return hold("Picked by the judges, but the decision model could not read it: a person chooses.", "signal");
+				// A criterion that is about the checks having passed is not something a diff can show.
+				const weak = read.criteria.find((x, i) => review.criteria[i]?.basis !== "checks" && x.p < bar);
+				if (weak) return hold(`Picked by the judges, but ${read.by} gives "${weak.text}" ${Math.round(weak.p * 100)}%, under this project's bar of ${Math.round(bar * 100)}%: a person chooses.`, "signal");
+			}
+		}
 		const tried = this.rows<any>("SELECT * FROM outcomes WHERE kind = 'landing' AND attempt_id = ? AND sha = ? ORDER BY id DESC LIMIT 1", a.id, a.headSha)[0];
 		if (tried && tried.outcome !== "landed") return hold(`Its landing was ${tried.outcome === "conflict" ? "stopped by a conflict" : tried.outcome}: ${tried.text}`, "landing");
 		if (review.verdict === "approve") {
@@ -1547,6 +1679,195 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		const open = review.criteria.find((c) => c.verdict !== "met");
 		hold(`The reviewer left it to a person: ${open ? `"${open.text}" is ${open.verdict === "unclear" ? "not shown to be met" : "not met"}. ${open.why}` : review.summary}`, "reviewer");
+	}
+
+	// ── racing: several attempts at one intent, compared ─────────────────────
+
+	/** The attempts at an intent that are still in play. */
+	private racers(intentId: number): Attempt[] { return this.rows("SELECT * FROM attempts WHERE intent_id = ? AND status IN ('working', 'ready', 'conflicted') ORDER BY created_at", intentId).map(this.toAttempt); }
+	private raceWait(): number {
+		const asked = Number(this.policyAt?.policy.config?.race?.wait);
+		return (Number.isFinite(asked) && asked >= 0 && asked <= 24 * 60 ? asked : RACE_WAIT_MIN) * 60_000;
+	}
+	private likelihoodBar(): number {
+		const asked = Number(this.policyAt?.policy.config?.landing?.likelihood);
+		return Number.isFinite(asked) && asked >= 0 && asked <= 1 ? asked : LIKELIHOOD_BAR;
+	}
+	/** The decision model. Fields, so a test can put stand-ins here; null when this instance has none. */
+	signaller: ((env: BraidEnv, input: SignalInput) => Promise<number[]>) | null = this.env.AI ? likelihoods : null;
+	supporter: ((env: BraidEnv, cited: { claim: string; passage: string }[]) => Promise<number[]>) | null = this.env.AI ? supports : null;
+	signalName = signalName(this.env) ?? "stand-in";
+	private signalOn(): boolean { return !!this.signaller && this.policyAt?.policy.config?.signal !== false; }
+	/** The models that compare, and the call that asks one. Fields for the same reason. */
+	judgesFor: (env: BraidEnv) => ModelPick[] = judges;
+	judge: typeof judgeRace = judgeRace;
+	/** Takes a picture of a page. Null when this instance has no browser. */
+	shooter: ((url: string) => Promise<Uint8Array>) | null = (this.env as any).BROWSER ? (url) => takeShot((this.env as any).BROWSER, url) : null;
+
+	private async doSignal(attemptId: string) {
+		await this.policy();
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", attemptId)[0];
+		if (!row || !LIVE.has(row.status) || row.head_sha === row.base_sha || !this.signalOn()) return;
+		const a = this.toAttempt(row), intent = this.intent(a.intentId);
+		if (this.likelihoodOf(a.id)?.sha === a.headSha) return;
+		let read: { text: string; p: number }[] = [];
+		try {
+			const ps = await this.signaller!(this.env, { intent, criteria: intent.criteria, patch: diffText(await this.diff(a.id)) });
+			read = intent.criteria.map((text, i) => ({ text, p: ps[i] })).filter((c) => typeof c.p === "number");
+		} catch (e) {
+			// Kept as a reading with nothing in it: what waits for the reading is told there is none, and the next commit asks again.
+			console.warn("signal", a.id, splitError(e).message);
+		}
+		if (this.attempt(a.id).headSha !== a.headSha) return; // it moved while it was being read; that push asked again
+		this.sql.exec("INSERT OR REPLACE INTO likelihoods (attempt_id, sha, by, criteria, at) VALUES (?, ?, ?, ?, ?)", a.id, a.headSha, this.signalName, json(read), now());
+		this.log.commit({ effects: [this.considerEffect(a.id)] });
+		this.broadcast();
+	}
+
+	/** Have the decision model look at the lines a reviewer cited for each criterion it found met. What it says is kept beside the citation. */
+	private async cite(criteria: CriterionVerdict[], files: DiffFile[]) {
+		if (!this.supporter || !this.signalOn()) return;
+		const head = new Map(files.map((f) => [f.path, f.head]));
+		const cited = criteria.flatMap((c) => (c.verdict === "met" && c.basis === "diff" ? c.evidence.map((e) => ({ e, claim: c.text, passage: passage(head.get(e.path) ?? null, e.line) })) : [])).filter((x) => x.passage);
+		if (!cited.length) return;
+		try {
+			const ps = await this.supporter(this.env, cited.map(({ claim, passage }) => ({ claim, passage })));
+			cited.forEach((x, i) => { if (typeof ps[i] === "number") x.e.support = ps[i]; });
+		} catch (e) { console.warn("cite", splitError(e).message); }
+	}
+
+	/** Whether an attempt that is ready has everything the comparison reads: its checks have finished and so has its review. */
+	private judgeable(a: Attempt): boolean {
+		const run = this.env.RUNNER ? this.latestRun(a.id) : null;
+		if (this.env.RUNNER && (!run || run.sha !== a.headSha || run.status === "queued" || run.status === "running")) return false;
+		const config = this.policyAt?.policy.config as { review?: unknown } | null | undefined;
+		if (config?.review === false || this.meta("review") === "off" || !reviewerName(this.env)) return true;
+		const review = this.reviewOf(a.id);
+		return !!review && review.sha === a.headSha && review.status !== "running";
+	}
+
+	/** Decide, from what is recorded, whether the attempts at an intent should be compared now or when the wait runs out. Nothing is awaited. */
+	private raceCheck(intentId: number) {
+		const row = this.rows<any>("SELECT * FROM intents WHERE id = ?", intentId)[0];
+		if (!row || row.status !== "open") return;
+		const live = this.racers(intentId), ready = live.filter((a) => a.status !== "working");
+		if (live.length < 2 || !ready.length) return;
+		let at: number = row.race_at;
+		if (!at) { at = now(); this.sql.exec("UPDATE intents SET race_at = ? WHERE id = ?", at, intentId); this.broadcast(); }
+		const until = at + this.raceWait();
+		const waited = live.filter((a) => a.status === "working" && !this.gone(a));
+		this.log.commit({ effects: [!waited.length || now() >= until ? this.judgeEffect(intentId) : this.judgeEffect(intentId, until)] });
+	}
+	/** A hosted agent that has finished, failed or been stopped without marking its attempt ready will not be heard from again. */
+	private gone(a: Attempt) { return a.hosted === "finished" || a.hosted === "failed" || a.hosted === "stopped"; }
+
+	/** Ask for the attempts at an intent to be compared again, as they stand now. */
+	async compare(intentId: number) {
+		this.requireProject();
+		const ready = this.racers(intentId).filter((a) => a.status !== "working");
+		if (ready.length < 2) throw new BraidError("comparing needs at least two attempts at the intent that are ready");
+		this.log.commit({ effects: [{ ...this.judgeEffect(intentId), data: { intentId, again: true } }] });
+		return { queued: true };
+	}
+
+	/**
+	 * Compare the attempts at an intent that are ready. It happens when every attempt is ready or gone, or when the
+	 * wait for the others has run out; the ones still being worked on are then left out and named in `left`. Code
+	 * measures what it can; every model this instance has is asked to judge, each shown the attempts in a different
+	 * order and by letter. One attempt ready alone after the wait is picked without a judge: the review is its gate.
+	 */
+	private async doJudge(intentId: number, again = false) {
+		await this.policy();
+		const row = this.rows<any>("SELECT * FROM intents WHERE id = ?", intentId)[0];
+		if (!row || row.status !== "open") return;
+		const intent = this.toIntent(row), live = this.racers(intentId), ready = live.filter((a) => a.status !== "working");
+		if (live.length < 2 || !ready.length) return;
+		// A ready attempt whose checks or review are still running: their result asks for this again.
+		if (ready.some((a) => !this.judgeable(a))) return;
+		const waited = live.filter((a) => a.status === "working" && !this.gone(a));
+		if (waited.length && !again && now() < (row.race_at ?? now()) + this.raceWait()) return;
+		const key = raceKey(ready.map((a) => ({ id: a.id, sha: a.headSha }))), last = this.comparisonOf(intentId);
+		const left = live.filter((a) => a.status === "working").map((a) => a.id);
+		// The same commits were compared already. One that failed is not tried again by itself: a person can ask (see `compare`).
+		// One left "running" by a process that died is.
+		if (!again && last?.key === key && json(last.left) === json(left) && !(last.status === "running" && now() - last.at > 10 * 60_000)) return;
+		const id = this.rows<{ id: number }>("INSERT INTO comparisons (intent_id, key, status, attempts, left, at) VALUES (?, ?, 'running', ?, ?, ?) RETURNING id",
+			intentId, key, json(ready.map((a) => ({ id: a.id, sha: a.headSha }))), json(left), now())[0].id;
+		this.broadcast();
+		try {
+			const entrants: Entrant[] = [];
+			for (const a of ready) {
+				await this.doShot(a.id).catch(() => {});
+				const shot = this.rows<any>("SELECT image FROM shots WHERE attempt_id = ? AND sha = ? AND image IS NOT NULL", a.id, a.headSha)[0];
+				entrants.push({
+					attempt: a, files: await this.diff(a.id), review: this.reviewOf(a.id), run: this.latestRun(a.id), likelihood: this.likelihoodOf(a.id), readyAt: a.readyAt,
+					decisions: this.decisionsFor(a.id).filter((d) => d.agent !== "braid" && d.kind !== "feedback" && d.kind !== "answer"),
+					shot: shot ? { mime: SHOT_MIME, base64: base64(new Uint8Array(shot.image)) } : null,
+				});
+			}
+			const measured = facts(entrants), input: JudgeInput = { intent, criteria: intent.criteria, entrants, facts: measured };
+			const who = entrants.length > 1 ? this.judgesFor(this.env) : [];
+			const said: Judgement[] = await Promise.all(who.map((w, turn) => this.judge(this.env, input, w, turn)
+				.then((answer) => settleJudgement(answer, ready.map((a) => a.id), answer.model))
+				.catch((e): Judgement => ({ by: w.model, pick: null, ranking: [], why: "", differences: "", attempts: [], error: redact(splitError(e).message).slice(0, 400) }))));
+			for (const j of said) { j.why = redact(j.why); j.differences = redact(j.differences); }
+			const failed = said.length > 0 && said.every((j) => j.error);
+			const { pick, agreed } = entrants.length === 1 ? { pick: entrants[0].attempt.id, agreed: true } : together(said);
+			this.sql.exec("UPDATE comparisons SET status = ?, facts = ?, judges = ?, pick = ?, agreed = ?, error = ?, finished_at = ? WHERE id = ?",
+				failed ? "failed" : "done", json(measured), json(said), pick, agreed ? 1 : 0, failed ? said[0].error : null, now(), id);
+			const names = ready.map((a) => a.id).join(", "), answered = said.filter((j) => !j.error);
+			const text = entrants.length === 1 ? `Attempt ${names} was the only one at I${intentId} ready when the wait for the others ran out`
+				: failed ? `Attempts ${names} at I${intentId} could not be compared: ${said[0].error}`
+				: !answered.length ? `Compared attempts ${names} at I${intentId} by what could be measured; this instance has no model to judge them`
+				: agreed ? `Compared attempts ${names} at I${intentId}: ${answered.map((j) => j.by).join(" and ")} both picked ${pick}`
+				: answered.length === 1 ? `Compared attempts ${names} at I${intentId}: ${answered[0].by} recommends ${pick ?? "none of them"}`
+				: `Compared attempts ${names} at I${intentId}: the judges did not agree (${answered.map((j) => `${j.by}: ${j.pick ?? "none"}`).join(", ")})`;
+			this.log.commit({ events: [this.noted("compare", "braid", text, intentId)], effects: ready.map((a) => this.considerEffect(a.id)) });
+		} catch (e) {
+			const said = splitError(e).message;
+			this.sql.exec("UPDATE comparisons SET status = 'failed', error = ?, finished_at = ? WHERE id = ?", said.slice(0, 500), now(), id);
+			this.log.commit({ events: [this.noted("compare", "braid", `The attempts at I${intentId} could not be compared: ${said}`, intentId)], effects: ready.map((a) => this.considerEffect(a.id)) });
+		}
+		this.broadcast();
+	}
+
+	/** If the attempts at this intent were compared and this is one of them: the others, and why this one. For the record of what landed. */
+	private chosenOver(intentId: number, attemptId: string): { over: string[]; why: string } | null {
+		const c = this.comparisonOf(intentId);
+		if (!c || c.status !== "done" || c.attempts.length < 2 || !c.attempts.some((x) => x.id === attemptId)) return null;
+		const said = c.judges.filter((j) => !j.error), mine = said.filter((j) => j.pick === attemptId);
+		const why = !said.length ? "No model judged them; they were compared by what could be measured."
+			: mine.length === said.length ? `${said.map((j) => j.by).join(" and ")} picked it. ${mine[0].why}`
+			: mine.length ? `${mine[0].by} picked it (${said.filter((j) => j.pick !== attemptId).map((j) => `${j.by} picked ${j.pick ?? "none"}`).join(", ")}). ${mine[0].why}`
+			: `The judges preferred ${[...new Set(said.map((j) => j.pick ?? "none"))].join(" and ")}; a person chose this one. What they said of it: ${said[0].attempts.find((x) => x.id === attemptId)?.strengths ?? ""}`;
+		return { over: c.attempts.filter((x) => x.id !== attemptId).map((x) => x.id), why: why.trim() };
+	}
+
+	/** A picture is taken of an attempt that is ready, or that is one of several at its intent. */
+	private wantsShot(a: Attempt) { return !!this.shooter && a.headSha !== a.baseSha && (a.status !== "working" || this.racers(a.intentId).length > 1); }
+
+	/** Take a picture of an attempt's preview as its current commit serves it. A page that cannot be loaded is written down too, so it is not tried for ever. */
+	private async doShot(attemptId: string) {
+		const row = this.rows<any>("SELECT * FROM attempts WHERE id = ?", attemptId)[0];
+		if (!row || !this.shooter) return;
+		const a = this.toAttempt(row), origin = this.meta("origin");
+		if (!origin || a.headSha === a.baseSha || this.rows("SELECT 1 FROM shots WHERE attempt_id = ? AND sha = ?", a.id, a.headSha).length) return;
+		// A project with something to build is pictured once the build of this commit is there.
+		const run = this.env.RUNNER ? this.latestRun(a.id) : null;
+		if (this.env.RUNNER && (!run || run.sha !== a.headSha || !run.finishedAt)) return;
+		if (run && run.status !== "pass") return;
+		const token = this.env.BRAID_ADMIN_TOKEN;
+		const url = `${origin}/preview/${this.meta("slug")}/${a.id}${token ? `~${await previewKey(token, this.meta("slug"), a.id)}` : ""}/`;
+		let image: Uint8Array | null = null, error: string | null = null;
+		try { image = await this.shooter(url); } catch (e) { error = splitError(e).message.slice(0, 300); }
+		if (!this.trunk) return;
+		this.sql.exec("INSERT OR REPLACE INTO shots (attempt_id, sha, image, error, at) VALUES (?, ?, ?, ?, ?)", a.id, a.headSha, image, error, now());
+		if (image) this.broadcast();
+	}
+
+	async shot(attemptId: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
+		const r = this.rows<any>("SELECT sha, image FROM shots WHERE attempt_id = ? AND image IS NOT NULL", attemptId)[0];
+		return r ? { bytes: new Uint8Array(r.image), sha: r.sha } : null;
 	}
 
 	// ── sessions: the record of what each agent actually did ─────────────────
@@ -1686,6 +2007,7 @@ export class Project extends DurableObject<BraidEnv> {
 			case "peek": {
 				if (!args.attempt) throw new BraidError('peek needs the id of another attempt, e.g. {"attempt":"1.2"}; `brief` lists them');
 				const other = this.attempt(String(args.attempt));
+				if (other.id !== me.id && other.intentId === me.intentId && LIVE.has(other.status)) throw new BraidError(`attempt ${other.id} is another attempt at your own intent. The attempts at one intent are made without seeing each other, so that they can be compared; work on yours.`, 403);
 				const out: any = { ...this.describe(other), claims: other.claims, changed: other.files.map((f) => `${f.status} ${f.path}`), decisions: this.decisionsFor(other.id) };
 				if (args.path) {
 					const f = other.files.find((x) => x.path === args.path);
@@ -1695,7 +2017,9 @@ export class Project extends DurableObject<BraidEnv> {
 			}
 			case "message": {
 				const body = redact(String(args.body ?? ""));
-				const targets = args.to && args.to !== "all" ? [this.attempt(String(args.to))] : this.attempts().filter((a) => LIVE.has(a.status) && a.id !== me.id);
+				// Attempts at the same intent do not talk to each other: they are alternatives, compared when they are done.
+				const targets = (args.to && args.to !== "all" ? [this.attempt(String(args.to))] : this.attempts().filter((a) => LIVE.has(a.status) && a.id !== me.id)).filter((a) => a.intentId !== me.intentId || a.id === me.id);
+				if (args.to && args.to !== "all" && !targets.length) throw new BraidError("that is another attempt at your own intent. The attempts at one intent are made without talking to each other; a question for a person goes in `record` with kind `question`.", 403);
 				for (const t of targets) this.signal(t.id, "message", { from: { attempt: me.id, agent: me.agent, intent: me.intentId }, body });
 				this.note("message", me.agent, `${me.agent} → ${targets.map((t) => t.agent).join(", ") || "nobody"}: ${body}`, me.intentId, me.id);
 				return { delivered_to: targets.map((t) => t.id) };
@@ -1719,7 +2043,8 @@ export class Project extends DurableObject<BraidEnv> {
 				if (a.status === "working") a.status = "ready";
 				if (args.summary) a.summary = redact(String(args.summary));
 				this.saveAttempt(a);
-				this.log.commit({ events: [this.noted("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id)], effects: [this.reviewEffect(a.id), this.considerEffect(a.id)] });
+				this.sql.exec("UPDATE attempts SET ready_at = ? WHERE id = ?", now(), a.id);
+				this.log.commit({ events: [this.noted("ready", a.agent, `${a.agent} marked attempt ${a.id} ready: ${a.summary}`, a.intentId, a.id)], effects: [this.reviewEffect(a.id), this.considerEffect(a.id), ...(this.wantsShot(a) ? [this.shotEffect(a.id)] : [])] });
 				this.broadcast();
 				return { status: a.status, would_conflict_with_trunk: a.trunkConflicts, overlaps: this.overlapsFor(a.id), verification: this.verification(a), review: this.reviewFor(a), ...(fresh ? {} : { note: STALE_NOTE }) };
 			}
@@ -1766,16 +2091,19 @@ export class Project extends DurableObject<BraidEnv> {
 		}));
 	}
 	private others(me: Attempt) {
-		return this.attempts().filter((a) => a.id !== me.id && LIVE.has(a.status)).map((a) => ({
-			...this.describe(a), same_intent_as_you: a.intentId === me.intentId, claims: a.claims, changed: a.files.map((f) => f.path),
-		}));
+		return this.attempts().filter((a) => a.id !== me.id && LIVE.has(a.status)).map((a) => a.intentId === me.intentId
+			// Another attempt at the same intent: that it exists, and nothing of what it is doing.
+			? { attempt: a.id, status: a.status, same_intent_as_you: true, note: "Another agent is attempting your intent too. You work without seeing each other; the attempts are compared when they are ready and one lands." }
+			: { ...this.describe(a), same_intent_as_you: false, claims: a.claims, changed: a.files.map((f) => f.path) });
 	}
 	private trunkSummary() {
 		return { head: this.meta("head"), recent_landings: this.landings().slice(-5).reverse().map((l) => ({ sha: short(l.sha), intent: `I${l.intentId}: ${l.title}`, agent: l.agent, files: l.files })) };
 	}
 	private briefText(a: Attempt) {
 		const intent = this.intent(a.intentId);
-		const said = this.decisionsFor(a.id).filter((d) => d.kind === "feedback" || d.kind === "answer");
+		// Notes sent to this attempt, and every answer a person gave to any attempt at this intent.
+		const said = this.rows("SELECT * FROM decisions WHERE (attempt_id = ? AND kind = 'feedback') OR (intent_id = ? AND kind = 'answer') ORDER BY id", a.id, a.intentId).map(this.toDecision);
+		const rivals = this.racers(a.intentId).filter((o) => o.id !== a.id).length;
 		return [
 			`# Braid brief: attempt ${a.id} on intent I${intent.id}`,
 			`**${intent.title}**`,
@@ -1783,6 +2111,7 @@ export class Project extends DurableObject<BraidEnv> {
 			intent.acceptance ? `Done when (your attempt is reviewed against each of these):\n${intent.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : "",
 			"",
 			...this.standingText(intent.id),
+			...(rivals ? [`**${rivals === 1 ? "Another agent is" : `${rivals} other agents are`} attempting this same intent, independently of you.** When the attempts are ready they are compared against the criteria above and one lands. You are not shown their work and they are not shown yours: make your own best version. Anything a person says about the intent is told to all of you.`, ""] : []),
 			"You are one of several agents working in this project at the same time. Your working copy is a private fork of trunk.",
 			"Other agents cannot see your files, only what you tell Braid and what you push. Protocol:",
 			"1. `brief` first: see who else is working and why.",
@@ -1796,7 +2125,7 @@ export class Project extends DurableObject<BraidEnv> {
 			"8. If landing conflicts, `reconciliation` gives you both sides and why each exists; answer with `resolve`.",
 			"9. If you need a person to decide something, `record` it with kind `question`. The answer arrives in `heads_up`.",
 			...(said.length ? ["", "## What people have said about this attempt (newest last)", "Do what each note asks and `record` how you addressed it.",
-				...said.map((d) => `- ${d.agent}${d.kind === "answer" ? `, ${d.title.replace(/^Answer: /, "answering \"")}"` : ", sending it back"}: ${d.body}`)] : []),
+				...said.map((d) => `- ${d.agent}${d.kind === "answer" ? `, ${d.title.replace(/^Answer: /, "answering \"")}"${d.attemptId === a.id ? "" : " (asked by another attempt at this intent)"}` : ", sending it back"}: ${d.body}`)] : []),
 		].filter((l, i, all) => l !== "" || all[i + 1]?.startsWith("##")).join("\n");
 	}
 
@@ -1822,6 +2151,8 @@ export class Project extends DurableObject<BraidEnv> {
 		}
 		const review = this.reviewOf(a.id), reviewed = review?.status === "done" && review.sha === a.headSha ? review : null;
 		if (reviewed) lines.push("", `Reviewed by ${reviewed.by}: ${reviewed.verdict === "approve" ? "every criterion met" : reviewed.verdict === "changes" ? "changes asked for" : "left to a person"}. ${reviewed.summary.replace(/\s+/g, " ")}`);
+		const chosen = this.chosenOver(intent.id, a.id);
+		if (chosen) lines.push("", `Chosen over attempt${chosen.over.length === 1 ? "" : "s"} ${chosen.over.join(", ")}: ${chosen.why.replace(/\s+/g, " ")}`);
 		lines.push("", `Braid-Intent: ${intent.id}`, `Braid-Attempt: ${a.id}`, `Braid-Agent: ${a.agent}`, ...(reviewed ? [`Braid-Reviewed-By: ${reviewed.by}`] : []));
 		return lines.join("\n");
 	}
@@ -2288,6 +2619,10 @@ export class Project extends DurableObject<BraidEnv> {
 		this.sql.exec("INSERT OR REPLACE INTO landings (sha, parent_sha, intent_id, attempt_id, agent, title, files, reconciled, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			sha, parentSha, intent.id, a.id, a.agent, intent.title, json(files), reconciled.length ? 1 : 0, now());
 		this.sql.exec("UPDATE intents SET status = 'landed', landed_sha = ?, landed_attempt = ? WHERE id = ?", sha, a.id, intent.id);
+		// Why this attempt and not the others is part of the why of what landed.
+		const chosen = this.chosenOver(intent.id, a.id);
+		if (chosen) this.sql.exec("INSERT INTO decisions (attempt_id, intent_id, agent, kind, title, body, files, sha, at) VALUES (?, ?, 'braid', 'decision', ?, ?, '[]', ?, ?)", a.id, intent.id,
+			`Chosen over attempt${chosen.over.length === 1 ? "" : "s"} ${chosen.over.join(", ")}`, `${by === "policy" ? "Landed by this project's policy." : `${by} landed it.`} ${chosen.why}`, sha, now());
 		this.setStatus(a.id, "landed");
 		this.setMeta("head", sha);
 		this.log.commit({ events: [
@@ -2502,6 +2837,28 @@ export class Project extends DurableObject<BraidEnv> {
 			const binary = (f.base !== null && base === null) || (f.head !== null && head === null);
 			const big = (base?.length ?? 0) > MAX_TEXT || (head?.length ?? 0) > MAX_TEXT;
 			out.push({ path: f.path, status: f.status, base: binary || big ? null : base, head: binary || big ? null : head, binary: binary || big });
+		}
+		return out;
+	}
+
+	/**
+	 * One attempt against another at the same intent: for every file either changed, the other's version as the
+	 * base and this one's as the head. A file only one of them changed is compared with what it started from.
+	 */
+	async against(attemptId: string, otherId: string): Promise<DiffFile[]> {
+		const a = this.attempt(attemptId), b = this.attempt(otherId);
+		if (a.intentId !== b.intentId) throw new BraidError("those attempts are at different intents");
+		const mine = new Map(a.files.map((f) => [f.path, f])), theirs = new Map(b.files.map((f) => [f.path, f]));
+		const out: DiffFile[] = [];
+		for (const path of [...new Set([...mine.keys(), ...theirs.keys()])].sort()) {
+			const m = mine.get(path), t = theirs.get(path);
+			// Where an attempt did not touch the file, its version is the one the other started from.
+			const [mineHash, mineRepo] = m ? [m.head, a.repo] : [t!.base, b.repo], [theirHash, theirRepo] = t ? [t.head, b.repo] : [m!.base, a.repo];
+			if (mineHash === theirHash) continue;
+			const [base, head] = [await this.text(theirRepo, theirHash), await this.text(mineRepo, mineHash)];
+			const binary = (theirHash !== null && base === null) || (mineHash !== null && head === null);
+			const big = (base?.length ?? 0) > MAX_TEXT || (head?.length ?? 0) > MAX_TEXT;
+			out.push({ path, status: theirHash === null ? "added" : mineHash === null ? "deleted" : "modified", base: binary || big ? null : base, head: binary || big ? null : head, binary: binary || big });
 		}
 		return out;
 	}

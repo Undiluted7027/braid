@@ -925,6 +925,95 @@ button.cite:hover { border-color: var(--ink); }
 .proposal-done { display: flex; gap: 8px; align-items: flex-start; color: var(--faint); font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
 .proposal-done .icon { margin-top: 2px; color: var(--good); }
 
+/* A race: several attempts at one intent, compared in one place. Facts are plain, models' readings are labelled, the decision model is the quietest. */
+.race { display: grid; gap: 10px; margin-bottom: 32px; min-width: 0; scroll-margin-top: 72px; }
+.race-head { display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; }
+.race-panel { display: grid; gap: 16px; padding: 16px 20px 20px; margin-bottom: 4px; min-width: 0; }
+.race-panel > * { min-width: 0; }
+.race-top { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px 16px; align-items: start; }
+.race-top > .chip { margin-top: 5px; vertical-align: 0; }
+.race-top > div:not(.race-acts) { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.race-top h3 { font-size: 20px; line-height: 26px; letter-spacing: -0.02em; font-weight: 600; }
+.race-top p { color: var(--muted); max-width: 90ch; }
+.race-acts { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.race-when { font-size: 12.5px; line-height: 18px; color: var(--faint) !important; }
+.race-veto { display: flex; gap: 8px; align-items: flex-start; padding: 8px 12px; border: 1px solid var(--warn); border-radius: var(--r-sm); background: var(--warn-bg); color: var(--ink) !important; }
+.race-veto .icon { margin-top: 3px; color: var(--warn); }
+.race-judges { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 0; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.race-judges > div { padding: 12px 14px; display: grid; gap: 6px; align-content: start; min-width: 0; overflow-wrap: anywhere; }
+.race-judges > div + div { border-left: 1px solid var(--line); }
+.race-by { display: block; font: 500 10.5px/16px var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--faint); }
+.race-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.race-table { border-collapse: collapse; width: 100%; table-layout: fixed; min-width: 620px; }
+.race-table.n3 { min-width: 860px; }
+.race-table.n4 { min-width: 1080px; }
+.race-table th, .race-table td { padding: 10px 14px; text-align: left; vertical-align: top; border-top: 1px solid var(--line); overflow-wrap: anywhere; font-weight: 400; }
+.race-table thead th { border-top: 0; background: var(--bg); }
+.race-table th:first-child { width: 220px; font-weight: 500; background: var(--bg); }
+.race-table td, .race-table thead th + th { border-left: 1px solid var(--line); }
+.race-table thead th.picked { box-shadow: inset 0 3px 0 var(--good); }
+.race-table tbody th.clashing { box-shadow: inset 3px 0 0 var(--bad); }
+.race-table tbody th .crit-n { margin-right: 8px; }
+.race-col { display: grid; gap: 8px; min-width: 0; }
+.race-who { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+.race-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.race-tags .chip { vertical-align: 0; }
+.race-shot { position: relative; display: block; min-height: 0; padding: 0; border: 1px solid var(--line-strong); border-radius: var(--r-sm); overflow: hidden; background: #fff; cursor: zoom-in; width: 100%; }
+.race-shot:hover { border-color: var(--ink); background: #fff; }
+.race-shot img { display: block; width: 100%; height: auto; aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; }
+.race-shot-old { position: absolute; left: 6px; bottom: 6px; font: 500 10.5px/14px var(--mono); letter-spacing: 0.05em; text-transform: uppercase; background: var(--ink); color: var(--on-ink); padding: 2px 6px; border-radius: 3px; }
+.race-noshot { display: grid; place-items: center; aspect-ratio: 16 / 10; padding: 12px; border: 1px dashed var(--line-strong); border-radius: var(--r-sm); color: var(--faint); font-size: 12.5px; line-height: 18px; text-align: center; }
+.race-col-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.race-col-acts button { min-height: 28px; padding: 3px 10px; font-size: 13px; }
+.race-why { color: var(--muted); font-size: 13px; line-height: 18px; margin-top: 4px; }
+.race-note { display: block; color: var(--faint); font-size: 12.5px; line-height: 18px; font-weight: 400; margin-top: 2px; }
+.race-signal { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--line); color: var(--faint); font-size: 12px; line-height: 16px; }
+.crit-cell.old { opacity: 0.6; }
+.good-t { color: var(--good); }
+.bad-t { color: var(--bad); }
+.race-lines { font-size: 12px; }
+.race-files { font-size: 12px; color: var(--muted); }
+.race-judged th { vertical-align: top; }
+.race-judged td { font-size: 13px; line-height: 19px; color: var(--muted); }
+.race-judged td p { color: var(--ink); }
+.race-sendback { display: inline-block; margin-top: 6px; font-size: 13px; }
+.race-send { max-width: 720px; }
+.race-pair { display: grid; gap: 10px; padding-top: 16px; border-top: 1px solid var(--line); min-width: 0; }
+.race-pair > * { min-width: 0; }
+.race-pair-head { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+.race-pair-head h3 { margin-right: auto; }
+.race-pair-views button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
+.race-previews { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.race-previews figure { display: grid; gap: 6px; min-width: 0; }
+.race-previews figcaption { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.race-previews .preview { height: 480px; }
+.race-foot { color: var(--faint); font-size: 12.5px; line-height: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+.dialog.race-big { width: min(1320px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 12px; }
+.race-big-head { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.race-big img { display: block; width: 100%; height: auto; max-height: calc(100vh - 120px); object-fit: contain; object-position: top; border: 1px solid var(--line); background: #fff; }
+/* The decision model's reading: a thin grey bar and a number. It must never look like a verdict. */
+.likely { display: inline-flex; align-items: center; gap: 6px; font: 500 11.5px/16px var(--mono); color: var(--muted); cursor: help; }
+.likely-bar { display: inline-block; width: 44px; height: 4px; border-radius: 2px; background: var(--sunk-2); overflow: hidden; }
+.likely-bar i { display: block; height: 100%; background: var(--ghost); }
+.likely.low .likely-bar i { background: var(--warn); }
+.likely.low .likely-n { color: var(--warn); }
+.likely.stale { opacity: 0.55; }
+.crit-signal { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; color: var(--faint); font-size: 12.5px; line-height: 18px; }
+.cite.doubt { border-style: dashed; border-color: var(--warn); }
+.cite-doubt { display: inline-grid; place-items: center; width: 14px; height: 14px; margin-left: 5px; border-radius: 50%; background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); font: 600 10px/1 var(--mono); text-decoration: none; flex: none; }
+.crit-doubt { display: flex; gap: 6px; align-items: flex-start; color: var(--muted); font-size: 12.5px; line-height: 18px; }
+.crit-doubt .cite-doubt { margin: 2px 2px 0 0; }
+.one-of { display: flex; gap: 8px; align-items: flex-start; color: var(--muted); font-size: 13px; line-height: 18px; }
+.one-of .icon { margin-top: 2px; }
+.race-line { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 6px 10px; flex-wrap: wrap; margin-top: 6px; font-size: 13px; line-height: 20px; color: var(--muted); }
+.race-line .chip { align-self: center; vertical-align: 0; }
+.race-line a { font-weight: 500; color: var(--ink); }
+.lineup { display: grid; gap: 6px; }
+.lineup li { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.lineup-model { flex: 1; min-width: 0; }
+.lineup-model input { font-family: var(--mono); font-size: 12.5px; }
+.join-way + .join-way.race-start { border-left: 1px solid var(--line); }
+
 /* Dialogs */
 .dialog { border: 1px solid var(--ink); border-radius: var(--r); padding: 24px; width: min(460px, calc(100vw - 32px)); background: var(--surface); color: var(--ink); box-shadow: var(--offset); }
 .dialog::backdrop { background: rgb(10 10 10 / 0.55); }
@@ -982,6 +1071,19 @@ p .mono, .ihead .mono { overflow-wrap: anywhere; }
 	.needs a { grid-template-columns: minmax(0, 1fr) auto; }
 	.needs .chip { grid-column: 1 / -1; }
 	.needs-row { grid-template-columns: minmax(0, 1fr); }
+	.race-panel { padding: 14px; }
+	.race-top { grid-template-columns: minmax(0, 1fr); }
+	.race-top > .chip { justify-self: start; margin-top: 0; }
+	.race-acts { justify-content: flex-start; }
+	.race-top h3 { font-size: 18px; line-height: 24px; }
+	.race-judges > div + div { border-left: 0; border-top: 1px solid var(--line); }
+	.race-table { min-width: 0; width: max-content; table-layout: auto; }
+	.race-table.n3, .race-table.n4 { min-width: 0; }
+	.race-table th:first-child { width: 128px; min-width: 128px; max-width: 128px; position: sticky; left: 0; z-index: 1; box-shadow: 1px 0 0 var(--line); }
+	.race-table td, .race-table thead th + th { width: 232px; min-width: 232px; max-width: 232px; }
+	.race-table th, .race-table td { padding: 8px 10px; }
+	.race-previews { grid-template-columns: minmax(0, 1fr); }
+	.race-pair-head h3 { flex-basis: 100%; }
 	.stand-list > li { grid-template-columns: minmax(0, 1fr); gap: 6px; }
 	.stand-list > li > button { justify-self: start; }
 	.clash-pairs li { grid-template-columns: minmax(0, 1fr); gap: 2px; }

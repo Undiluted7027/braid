@@ -12,6 +12,8 @@
   // Every project trunk and every agent attempt is a repo in this Artifacts namespace.
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "braid" }],
   "ai": { "binding": "AI" },
+  // A browser for pictures of the previews of attempts that are compared with each other.
+  "browser": { "binding": "BROWSER" },
   "durable_objects": {
     "bindings": [
       { "name": "PROJECT", "class_name": "Project" },

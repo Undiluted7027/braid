@@ -7,6 +7,7 @@ import { Agent, useAction } from "./App";
 import { ask, Icon, Notice, type IconName } from "./Kit";
 import { sentence, useAsked } from "./Later";
 import { clashingCriteria } from "./Plan";
+import { likelihoodOf, LikelyBar, LOW_SUPPORT } from "./Race";
 import { runFor } from "./Verify";
 
 const LIVE = new Set(["working", "ready", "conflicted"]);
@@ -73,7 +74,7 @@ export function FlagBox({ a }: { a: Attempt }) {
 /** Under a project that lands by itself: why this attempt has not been landed. */
 export function Held({ state, a }: { state: State; a: Attempt }) {
 	if (policyOf(state).landing !== "auto" || !a.held || !LIVE.has(a.status)) return null;
-	const waiting = a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency";
+	const waiting = a.heldFor === "checks" || a.heldFor === "review" || a.heldFor === "dependency" || a.heldFor === "race";
 	return (
 		<p className={`held ${waiting ? "waiting" : "person"}`} role="status">
 			<Icon name={waiting ? "clock" : "agent"} />
@@ -85,12 +86,22 @@ export function Held({ state, a }: { state: State; a: Attempt }) {
 function Evidence({ c, onCite, toChecks }: { c: CriterionVerdict; onCite?: (path: string, line: number | null) => void; toChecks?: () => void }) {
 	if (c.basis === "checks") return <p className="crit-basis"><Icon name="check" size={12} />Judged from the project's checks having passed, not from particular lines.{toChecks && <> <button className="link" onClick={toChecks}>See the checks</button></>}</p>;
 	if (!c.evidence.length) return <p className="crit-basis"><Icon name="changes" size={12} />Judged from the diff; the reviewer pointed at no particular lines.</p>;
+	// The decision model also reads each citation. A low number is a reason to look, not a finding: it is noisy line by line.
+	const doubted = c.evidence.filter((e) => typeof e.support === "number" && e.support < LOW_SUPPORT);
+	const at = (e: CriterionVerdict["evidence"][number]) => `${e.path}${e.line ? `:${e.line}` : ""}`;
 	return (
-		<p className="crit-basis"><Icon name="changes" size={12} />Judged from the diff:
-			{c.evidence.map((e, i) => onCite
-				? <button key={i} className="cite mono" onClick={() => onCite(e.path, e.line)} title="Show these lines in the changes">{e.path}{e.line ? `:${e.line}` : ""}</button>
-				: <span key={i} className="cite mono">{e.path}{e.line ? `:${e.line}` : ""}</span>)}
-		</p>
+		<>
+			<p className="crit-basis"><Icon name="changes" size={12} />Judged from the diff:
+				{c.evidence.map((e, i) => {
+					const low = typeof e.support === "number" && e.support < LOW_SUPPORT;
+					const inner = <>{at(e)}{low && <span className="cite-doubt" aria-label="worth a look">?</span>}</>;
+					return onCite
+						? <button key={i} className={`cite mono ${low ? "doubt" : ""}`} onClick={() => onCite(e.path, e.line)} title={low ? "Worth a look: the decision model did not read this line as showing the criterion. Show it in the changes" : "Show these lines in the changes"}>{inner}</button>
+						: <span key={i} className={`cite mono ${low ? "doubt" : ""}`}>{inner}</span>;
+				})}
+			</p>
+			{doubted.length > 0 && <p className="crit-doubt"><span className="cite-doubt" aria-hidden="true">?</span>Worth a look: the decision model did not read {doubted.map(at).join(", ")} as showing this criterion ({doubted.map((e) => `${Math.round(e.support! * 100)}%`).join(", ")}). It judges one line at a time and is often wrong that way, so this marks the citation for you; it does not change the reviewer's verdict.</p>}
+		</>
 	);
 }
 
@@ -108,6 +119,7 @@ export function ReviewPanel({ state, a, intent, onCite, toChecks }: { state: Sta
 		</button>
 	);
 	const criteria = intent.criteria ?? [];
+	const signal = likelihoodOf(state, a);
 	const list = (verdicts: CriterionVerdict[] | null) => (
 		<ol className="criteria">
 			{(verdicts ?? criteria.map((text) => ({ text, verdict: null, basis: "diff" as const, why: "", evidence: [] }))).map((c, i) => {
@@ -118,6 +130,7 @@ export function ReviewPanel({ state, a, intent, onCite, toChecks }: { state: Sta
 						<div className="crit-body">
 							<p className="crit-text"><span className="crit-n">{i + 1}</span>{c.text}</p>
 							{c.why && <p className="crit-why">{c.why}</p>}
+							{signal?.criteria[i] && <p className="crit-signal"><span>Decision model, a second reading:</span><LikelyBar p={signal.criteria[i].p} stale={signal.sha !== a.headSha} /><span>likely met</span></p>}
 							{c.verdict && <Evidence c={c as CriterionVerdict} onCite={onCite} toChecks={toChecks} />}
 						</div>
 					</li>
@@ -283,6 +296,18 @@ export function PolicyPanel({ state }: { state: State }) {
 						{policy.landing === "auto" && policy.review && <> When the reviewer asks for changes, the attempt goes back to its agent, at most twice.</>}</dd>
 				</div>
 				<div>
+					<dt><Icon name="fork" size={14} />Races</dt>
+					<dd><strong>{(policy.race?.agents ?? []).length ? (policy.race.agents.map((x) => `${x.kind === "codex" ? "Codex" : "Claude Code"}${x.model ? ` on ${x.model}` : ""}`).join(" against ")) : "No line-up set"}.</strong> A race starts these on one intent, each blind to the others. Once one is ready the rest are waited for {policy.race?.wait ?? 30} minutes, then the ready ones are compared{(policy.reviewers ?? []).length ? ` by ${(policy.reviewers ?? []).join(" and ")}` : ""}.{policy.landing === "auto" ? " Braid lands the pick by itself only when at least two judges agree." : ""}</dd>
+				</div>
+				<div>
+					<dt><Icon name="question" size={14} />Decision model</dt>
+					<dd>{policy.signal ? <><strong><span className="mono">{policy.signal}</span>, as a second reading.</strong> On every push it says how likely each criterion is met, in well under a second. It can only hold a landing back, never cause one{policy.landing === "auto" ? <>: the pick of a race is not landed by Braid unless it gives every criterion at least {Math.round((policy.likelihood ?? 0.9) * 100)}%</> : null}. It cannot say why, and it is unsure about things a change leaves out.</> : <><strong>None.</strong> Only the reviewer and the judges read attempts.</>}</dd>
+				</div>
+				<div>
+					<dt><Icon name="eye" size={14} />Pictures</dt>
+					<dd>{policy.shots ? <><strong>On.</strong> Braid takes a picture of each attempt's preview at each commit, for comparing attempts by eye.</> : <><strong>Off.</strong> This instance cannot take pictures of previews.</>}</dd>
+				</div>
+				<div>
 					<dt><Icon name="conflict" size={14} />Conflicts</dt>
 					<dd>{policy.conflicts === "auto" ? <><strong>The agent first, then the model,</strong> and a person only after both.</> : <><strong>A person</strong> resolves them, or asks the agent or the model to.</>}</dd>
 				</div>
@@ -291,7 +316,7 @@ export function PolicyPanel({ state }: { state: State }) {
 			{!state.viewer && planner && <button disabled={planning.busy} onClick={togglePlan}>{planning.busy ? "Saving…" : policy.plan ? "Turn planning off" : "Turn planning on"}</button>}
 			{act.error && <Notice small>{act.error}</Notice>}
 			{planning.error && <Notice small>{planning.error}</Notice>}
-			<p className="hint">Who lands and who resolves conflicts are set in trunk's <code>braid.json</code>, under <code>landing</code>.</p>
+			<p className="hint">Set in trunk's <code>braid.json</code>: who lands and who resolves conflicts under <code>landing</code> (<code>policy</code>, <code>conflicts</code>, and <code>likelihood</code> for the decision model's bar); the line-up and the wait under <code>race</code> (<code>agents</code>, <code>wait</code>); <code>"signal": false</code> turns the decision model off.</p>
 		</section>
 	);
 }

@@ -16,6 +16,8 @@ export interface Intent {
 	landedAttempt: string | null;
 	/** "Done when" as separate things to check. Every attempt at the intent is reviewed against these. */
 	criteria: string[];
+	/** Set while more than one attempt is going and one is ready: when the others stop being waited for. */
+	raceUntil: number | null;
 }
 /**
  * How two intents stand to each other, found before work starts. "contradicts": both cannot be true of one codebase
@@ -38,7 +40,57 @@ export interface Flag {
 	text: string; paths: string[];
 }
 /** One criterion as the reviewer found it. `basis`: judged from the diff (with lines as evidence), or from the project's checks having passed. */
-export interface CriterionVerdict { text: string; verdict: "met" | "not_met" | "unclear"; basis: "diff" | "checks"; why: string; evidence: { path: string; line: number | null }[] }
+export interface CriterionVerdict {
+	text: string; verdict: "met" | "not_met" | "unclear"; basis: "diff" | "checks"; why: string;
+	/**
+	 * The lines the reviewer pointed at. `support`, when present, is how likely a decision model finds it that those lines
+	 * show the criterion (0 to 1). A low number marks the citation for a person to look at; it never changes the verdict.
+	 */
+	evidence: { path: string; line: number | null; support?: number | null }[];
+}
+/**
+ * How likely a decision model (Cloudflare's Clef, on Workers AI) finds it that each criterion is met by one commit of an attempt.
+ * It answers in well under a second, so it is asked on every push. It is a signal next to the review, never a verdict:
+ * it cannot explain itself, and it is unsure about things a change leaves out.
+ */
+export interface Likelihood { attemptId: string; sha: string; by: string; criteria: { text: string; p: number }[]; at: number }
+/** A picture of an attempt's preview, taken in a browser Braid runs. The image is at `attempts/<id>/shot`. */
+export interface Shot { attemptId: string; sha: string; at: number }
+/** One attempt in a comparison, as code sees it: nothing here comes from a model. */
+export interface RaceFacts {
+	attemptId: string; sha: string; agent: string; model: string | null;
+	checks: "pass" | "fail" | "error" | "none"; checkMs: number | null;
+	files: number; added: number; removed: number;
+	/** Files this attempt changed and no other attempt in the comparison did. */
+	only: string[];
+	flags: number; review: Review["verdict"]; met: number; criteria: number;
+	/** From the attempt being started to its being marked ready. */
+	minutes: number | null; behind: number; conflicts: number;
+}
+/** What one model made of the attempts at an intent, read side by side. */
+export interface Judgement {
+	by: string;
+	/** The attempt it would land, or null when it would land none of them. */
+	pick: string | null;
+	/** Every attempt compared, best first. */
+	ranking: string[];
+	why: string;
+	/** How the approaches differ, in a few sentences. */
+	differences: string;
+	attempts: { id: string; strengths: string; weaknesses: string; /** Something in it worth keeping even if it is not picked. Empty when there is nothing. */ keep: string }[];
+	error: string | null;
+}
+/**
+ * The attempts at one intent compared, once they are all ready or the wait for the others ran out. `left` are attempts that
+ * were still being worked on. `agreed`: at least two judges, from different makers, and all named the same attempt.
+ * A comparison is about the commits in `attempts`; when one of them moves, the intent is compared again.
+ */
+export interface Comparison {
+	id: number; intentId: number; status: "running" | "done" | "failed";
+	attempts: { id: string; sha: string }[]; left: string[];
+	facts: RaceFacts[]; judges: Judgement[];
+	pick: string | null; agreed: boolean; error: string | null; at: number; finishedAt: number | null;
+}
 /**
  * A reviewer's reading of one commit of an attempt against its intent's criteria. `verdict`: "approve" (every
  * criterion met, nothing for a person to weigh), "changes" (something specific the agent could change, in `changes`),
@@ -73,10 +125,10 @@ export interface Attempt {
 	/** Under a project that lands by itself: why this attempt has not been landed, in words. Empty when that does not apply. */
 	held: string;
 	/**
-	 * What kind of thing is holding it. "checks", "review" and "dependency" are things Braid is waiting for and will act on by itself;
+	 * What kind of thing is holding it. "checks", "review", "dependency" and "race" (the other attempts at its intent, or their comparison) are things Braid is waiting for and will act on by itself;
 	 * every other kind needs a person. Empty when `held` is.
 	 */
-	heldFor: "" | "checks" | "review" | "checks-failed" | "review-failed" | "no-reviewer" | "flags" | "question" | "choice" | "landing" | "reviewer" | "contradiction" | "dependency" | "person";
+	heldFor: "" | "checks" | "review" | "checks-failed" | "review-failed" | "no-reviewer" | "flags" | "question" | "choice" | "landing" | "reviewer" | "contradiction" | "dependency" | "person" | "race" | "signal";
 	/** Landings on trunk since this attempt's base. */
 	behind: number;
 	/** Paths that would conflict with trunk if this landed now. */
@@ -84,6 +136,8 @@ export interface Attempt {
 	checks: Check[];
 	createdAt: number;
 	updatedAt: number;
+	/** When its agent last marked it ready. */
+	readyAt: number | null;
 	/** The latest session event, for a one-line "what is it doing now". */
 	/** Set when Braid itself runs the agent. */
 	hosted?: Hosted | null;
@@ -170,8 +224,15 @@ export interface ProjectInfo { slug: string; name: string; description: string; 
 	 * `conflicts`: "auto" sends a conflict to the agent and then the model before a person.
 	 * `reviewers`: the models this instance can review with. With two, an attempt is read by one from a different maker than its agent.
 	 * `plan`: each intent is looked at next to the others when it is opened or edited, by `planner`.
+	 * `signal`: the decision model asked on every push how likely each criterion is met, or null when there is none.
+	 * `likelihood`: under "auto", the least that model must give every criterion of the attempt picked in a race (landing.likelihood).
+	 * `race`: the agents a race is started with when none are named (race.agents), and how many minutes the others are
+	 * waited for once one attempt is ready (race.wait). `shots`: this instance can take pictures of previews.
 	 */
-	policy: { landing: "person" | "auto"; review: boolean; conflicts: "person" | "auto"; reviewers: string[]; plan: boolean; planner: string | null };
+	policy: {
+		landing: "person" | "auto"; review: boolean; conflicts: "person" | "auto"; reviewers: string[]; plan: boolean; planner: string | null;
+		signal: string | null; likelihood: number; race: { agents: { kind: "claude" | "codex"; model: string | null }[]; wait: number }; shots: boolean;
+	};
 }
 /** One command run in the sandbox for a commit. `tail` is the end of its output. */
 export interface RunStep { name: string; command: string; status: "running" | "pass" | "fail"; exitCode: number | null; ms: number; tail: string }
@@ -210,6 +271,12 @@ export interface State {
 	proposals: Proposal[];
 	/** The latest review of each attempt. */
 	reviews: Review[];
+	/** The decision model's latest reading of each attempt. */
+	likelihoods: Likelihood[];
+	/** The latest comparison of each intent that has had more than one attempt ready. */
+	comparisons: Comparison[];
+	/** The latest picture of each attempt's preview. */
+	shots: Shot[];
 	/** How things asked for turned out, newest first. A request only answers "queued"; this is where its result shows. */
 	outcomes: Outcome[];
 	/** Work Braid gave up on after several tries. Each can be tried again. */

@@ -115,6 +115,10 @@ export async function world(env = {}) {
 		p.planner = async () => ({ relations: [], model: "stand-in" });
 		p.splitter = async () => { throw new Error("[501] no stand-in for splitting a goal in this test"); };
 		p.reviewer = async () => { throw new Error("[501] no stand-in for reviewing in this test"); };
+		// No judges, no decision model and no browser unless a test puts them here.
+		p.judgesFor = () => [];
+		p.judge = async () => { throw new Error("[501] no stand-in for judging in this test"); };
+		p.signaller = null; p.supporter = null; p.shooter = null;
 		return p;
 	};
 	let project = standIns(new Project(ctx, fullEnv));
@@ -123,7 +127,7 @@ export async function world(env = {}) {
 		root, origin, remote, runs, agents, db,
 		get project() { return project; },
 		/** The same storage, a new process: what a restart of the object looks like. */
-		restart() { const before = project; project = standIns(new Project(ctx, fullEnv)); Object.assign(project, { planner: before.planner, splitter: before.splitter, reviewer: before.reviewer }); return project; },
+		restart() { const before = project; project = standIns(new Project(ctx, fullEnv)); Object.assign(project, { planner: before.planner, splitter: before.splitter, reviewer: before.reviewer, judgesFor: before.judgesFor, judge: before.judge, signaller: before.signaller, supporter: before.supporter, shooter: before.shooter }); return project; },
 		/** Make the next `times` calls of an Artifacts operation fail. */
 		fail(op, times = 1) { failing.set(op, times); },
 		/** Fire the alarm until no work is left that is due now. Work scheduled for later stays, unless `later` is given. */
