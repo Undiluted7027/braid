@@ -7,6 +7,11 @@ Two places. How a project is run is set in `braid.json` at the root of its trunk
 | Key | Default | What it does |
 |---|---|---|
 | `environment.image` | detected from the files | `"node"`, `"python"`, `"go"`, `"rust"` or `"java"`: the sandbox image a commit is run in. Read from the commit itself, not from trunk. |
+| `environment.dockerfile` | none | A Dockerfile in the repository to build and run the commit in, with `environment.context` as its build directory (the Dockerfile's own directory unless said). Read from the commit itself. The commit is mounted into the image at `/workspace` and install and checks run there, so the image only has to provide the tools. |
+| `environment.image` (an image name) | none | An image to pull and run the commit in, such as `"python:3.13-slim"`. |
+| `environment.devcontainer` | followed where images are allowed | `false` says the repository's devcontainer is not for running checks. |
+| `environment.internet` | none | `"build"`, **on trunk**, allows the Internet while a project's own image is built or pulled, and never while checks run. Without it a devcontainer is not followed, and a commit that names a Dockerfile or an image is told why it was not run. An attempt cannot set this for itself. |
+| `environment.maven` | the project's own, or Google's mirror | **On trunk.** The address of a mirror of Maven Central for a Java project, such as `"https://repo.example.com/maven2/"`. Maven Central itself refuses requests from Cloudflare's network, so a deployed instance needs one. Without this setting Braid uses the mirrors named in the repository's `.mvn/settings.xml` if it has that file, and otherwise Google's mirror (`maven-central.storage-download.googleapis.com`). Braid lets the sandbox reach the mirror and points Maven and Gradle at it. |
 | `install` | the language's usual install | The command that installs dependencies in the sandbox. |
 | `checks` | what the language's conventions give | `{ "name": "command" }`: what is run for every commit and every merge. Without it: Node's `typecheck`, `lint`, `test` and `build` scripts; Python's `mypy`, `ruff` and `pytest` where set up; `go vet`, `go build`, `go test`; `cargo check`, `cargo test`; `mvn test`. |
 | `preview.dir` | none | The directory a build writes, served as the attempt's preview. |

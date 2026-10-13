@@ -8,7 +8,8 @@ import { redact } from "../shared/redact";
 import { ArtifactsHost } from "./host";
 import { handleMcp } from "./mcp";
 import type { BraidEnv, Project } from "./project";
-import { registriesFor, type Toolchain } from "./environment.ts";
+import { gradleInit, mavenSettings, registriesFor, type Maven, type Toolchain } from "./environment.ts";
+import { TOOL_ENV } from "./runner";
 
 export type HostedKind = "claude" | "codex" | "selftest";
 export interface HostJob {
@@ -21,6 +22,8 @@ export interface HostJob {
 	model?: string;
 	/** What the attempt's code needs to be run in. It decides the sandbox image and which package registries can be read. */
 	toolchain?: Toolchain;
+	/** For a Java project: the mirror its packages come from, as trunk has it. */
+	maven?: Maven;
 }
 interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string; kind: HostedKind; registries: string[] }
 
@@ -218,7 +221,7 @@ export class AgentHost extends DurableObject<BraidEnv> {
 	}
 
 	private async exec(argv: string[], cwd = "/workspace", env: Record<string, string> = {}, stdin?: string) {
-		const p = await this.ctx.container!.exec(argv, { cwd, env: { HOME: "/root", ...TRUST, ...env }, stderr: "combined", ...(stdin === undefined ? {} : { stdin: new Blob([stdin]).stream() }) });
+		const p = await this.ctx.container!.exec(argv, { cwd, env: { HOME: "/root", ...TOOL_ENV, ...TRUST, ...env }, stderr: "combined", ...(stdin === undefined ? {} : { stdin: new Blob([stdin]).stream() }) });
 		const out = await p.output();
 		return { code: out.exitCode, text: new TextDecoder().decode(out.stdout) };
 	}
@@ -237,7 +240,7 @@ export class AgentHost extends DurableObject<BraidEnv> {
 		if (!container) throw new Error("no container is configured for hosted agents");
 		if (container.running) await container.destroy().catch(() => {});
 		const git = new URL(job.remote), env = this.env;
-		const props: OutboundProps = { slug: job.slug, gitHost: git.hostname, repo: job.repo, repoPath: git.pathname, trunkRepo: job.trunkRepo, trunkPath: new URL(job.trunkRemote).pathname, agentToken: job.agentToken, kind: job.kind, registries: registriesFor(job.toolchain ?? "node") };
+		const props: OutboundProps = { slug: job.slug, gitHost: git.hostname, repo: job.repo, repoPath: git.pathname, trunkRepo: job.trunkRepo, trunkPath: new URL(job.trunkRemote).pathname, agentToken: job.agentToken, kind: job.kind, registries: [...registriesFor(job.toolchain ?? "node"), ...(job.maven?.hosts ?? [])] };
 		const images = container.images as Record<string, typeof container.images.agent>;
 		container.start({ image: (job.toolchain && job.toolchain !== "node" && images[job.toolchain]) || images.agent, enableInternet: false, instance: "standard-2" });
 		const outbound = this.ctx.exports.AgentOutbound({ props });
@@ -247,6 +250,11 @@ export class AgentHost extends DurableObject<BraidEnv> {
 
 		const mcp = `https://${BRAID_HOST}/mcp/${job.slug}`;
 		await this.must("clone", ["git", "clone", "-q", job.remote, REPO]);
+		// A Java project's agent is given the same mirror, and the same trust in the gateway, as its checks are.
+		if (job.toolchain === "java") {
+			await this.must("java trust", ["sh", "-c", `keytool -importcert -noprompt -trustcacerts -cacerts -storepass changeit -alias braid-sandbox -file ${CA} >/dev/null 2>&1 || true`]);
+			if (job.maven?.mirror) await this.must("java mirror", ["sh", "-c", `mkdir -p "$HOME/.m2" "$HOME/.gradle" && printf %s "$0" > "$HOME/.m2/settings.xml" && printf %s "$1" > "$HOME/.gradle/init.gradle"`, mavenSettings(job.maven.mirror), gradleInit(job.maven.mirror)]);
+		}
 		await this.must("git setup", ["sh", "-c", `git config user.name "$0" && git config user.email "$0@agents.braid.dev" && git remote add trunk "$1" && mkdir -p ${TASK} && printf '\\nBRAID.md\\n.mcp.json\\n' >> .git/info/exclude`, job.agent, job.trunkRemote], REPO);
 		await this.must("write brief", ["sh", "-c", "cat > BRAID.md"], REPO, `${job.brief}
 
@@ -283,7 +291,7 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 			agentEnv = { ANTHROPIC_API_KEY: "provided-by-worker", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", IS_SANDBOX: "1", ...(useGateway(env) ? { ANTHROPIC_BASE_URL: `https://${GATEWAY_HOST}${gatewayPath(env)}/anthropic` } : {}) };
 		}
 		// Not awaited to completion: the script outlives this call and the alarm follows it through its files.
-		await container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", TASK, ...argv], { cwd: REPO, env: { HOME: "/root", CI: "true", ...TRUST, ...agentEnv }, stdout: "ignore", stderr: "ignore" });
+		await container.exec(["/bin/sh", "-c", TASK_SCRIPT, "agent", TASK, ...argv], { cwd: REPO, env: { HOME: "/root", CI: "true", ...TOOL_ENV, ...TRUST, ...agentEnv }, stdout: "ignore", stderr: "ignore" });
 		await this.project(job).hostedEvents(job.attemptId, [{ kind: "system", text: `${job.kind === "selftest" ? "self-test" : job.kind === "codex" ? "codex" : "claude"} started on attempt ${job.attemptId} in a Cloudflare sandbox${job.kind === "selftest" ? "" : ` (${model})`}${job.task === "work" ? "" : job.task === "reconcile" ? ", to reconcile with trunk" : job.task === "respond" ? ", to act on the note it was sent" : ", to fix failed verification"}` }], "running", job.kind === "selftest" ? undefined : model);
 	}
 

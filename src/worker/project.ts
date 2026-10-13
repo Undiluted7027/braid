@@ -18,7 +18,7 @@ import { likelihoods, passage, signalName, supports, type SignalInput } from "./
 import { previewKey, SHOT_MIME, takeShot } from "./shot";
 import { diffText } from "./review.ts";
 import type { ModelPick } from "./model";
-import { conventionalChecks, LOCKFILE, lockOf, toolchainOf, type Files, type Toolchain } from "./environment.ts";
+import { conventionalChecks, imageInputs, LOCKFILE, lockOf, mavenFor, ownImageOf, toolchainOf, type Files, type Toolchain } from "./environment.ts";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
 import { drain, Log, type Effect, type Executor, type NewEffect, type NewEvent } from "./log.ts";
@@ -589,6 +589,8 @@ export class Project extends DurableObject<BraidEnv> {
 		for (const { ref } of this.rows<{ ref: string }>("SELECT DISTINCT ref FROM runs")) {
 			try { await this.runner(ref)?.clear(); } catch {}
 		}
+		// The images its sandboxes built.
+		try { await this.runner("~images")?.clear(); } catch {}
 		await this.ctx.storage.deleteAlarm();
 		await this.ctx.storage.deleteAll();
 		this.schema();
@@ -1131,6 +1133,8 @@ export class Project extends DurableObject<BraidEnv> {
 			trunkRemote: this.meta("remote"), branch: this.branch, agentToken: row.token, brief: this.briefText(a), task, ...(row.ask_model ? { model: row.ask_model } : {}),
 			toolchain: await this.toolchainAt(a.repo, a.headSha),
 		};
+		const maven = job.toolchain === "java" ? (await this.policy()).maven : undefined;
+		if (maven) job.maven = maven;
 		// It may have been stopped, or its attempt ended, while its files were being looked at.
 		const still = this.rows<any>("SELECT status, hosted FROM attempts WHERE id = ?", attemptId)[0];
 		if (!still || !LIVE.has(still.status) || still.hosted !== "starting") return;
@@ -1223,7 +1227,10 @@ export class Project extends DurableObject<BraidEnv> {
 		const files = this.filesAt(this.trunk, head);
 		const read = async (path: string) => { try { return JSON.parse((await files.read(path)) ?? "null"); } catch { return null; } };
 		const config = await read("braid.json");
-		const policy = { config: config && typeof config === "object" ? config : null, checks: await conventionalChecks(files, config).catch(() => []) };
+		const settled = config && typeof config === "object" ? config : null;
+		const policy: RunPolicy = { config: settled, checks: await conventionalChecks(files, config).catch(() => []) };
+		// Only looked up for a project that has Java in it: it costs a read of the repository.
+		if ((await toolchainOf(files, settled).catch(() => "node")) === "java" || settled?.environment?.maven) policy.maven = await mavenFor(files, settled).catch(() => undefined);
 		this.policyAt = { head, policy };
 		return policy;
 	}
@@ -1240,6 +1247,22 @@ export class Project extends DurableObject<BraidEnv> {
 			read: async (path) => (path.includes("/") || (await names()).has(path) ? asText(await this.host.readFile(repo, sha, path).catch(() => null)) : null),
 		};
 	}
+	/**
+	 * The image a commit brings for itself, if it does: a Dockerfile or an image named in its own braid.json, or a
+	 * devcontainer. Getting one needs the Internet, and whether that is allowed is trunk's to say
+	 * (`"environment": { "internet": "build" }`): an attempt cannot give itself the Internet. A commit that asks outright
+	 * in a project that has not allowed it is told so by its run; a devcontainer is simply not followed there.
+	 */
+	private async ownImageAt(repo: string, sha: string, trunk: any | null): Promise<RunJob["own"] | null> {
+		const files = this.filesAt(repo, sha);
+		let own: any = null;
+		try { own = JSON.parse((await files.read("braid.json")) ?? "null"); } catch {}
+		const found = await ownImageOf(files, own).catch(() => null), allowed = trunk?.environment?.internet === "build";
+		if (!found || (!allowed && !found.explicit)) return null;
+		const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(await imageInputs(files, found.image)));
+		return { image: found.image, allowed, key: [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 40) };
+	}
+
 	/** What a commit has to be run in. From its own files and its own braid.json: an attempt that moves a project to another toolchain is run in that one. */
 	private async toolchainAt(repo: string, sha: string): Promise<Toolchain> {
 		const files = this.filesAt(repo, sha);
@@ -1262,8 +1285,9 @@ export class Project extends DurableObject<BraidEnv> {
 		const runId = this.rows<{ id: number }>("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at) VALUES (?, ?, 'queued', '[]', 0, 0, NULL, ?) RETURNING id", ref, target.sha, now())[0].id;
 		// A lockfile is brought up to date in the image of the toolchain it belongs to.
 		const toolchain = (regenerate && lockOf(regenerate[0])?.toolchain) || (await this.toolchainAt(target.repo, target.sha));
-		this.sql.exec("UPDATE runs SET toolchain = ? WHERE id = ?", toolchain, runId);
-		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy: await this.policy(), toolchain, ...(regenerate ? { regenerate } : {}) };
+		const policy = await this.policy(), own = regenerate ? null : await this.ownImageAt(target.repo, target.sha, policy.config);
+		this.sql.exec("UPDATE runs SET toolchain = ? WHERE id = ?", own ? (own.image.kind === "dockerfile" ? own.image.dockerfile : own.image.image) : toolchain, runId);
+		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy, toolchain, ...(regenerate ? { regenerate } : {}), ...(own ? { own } : {}) };
 		try {
 			await this.runner(ref)!.start(job);
 		} catch (e) {

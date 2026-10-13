@@ -4,7 +4,7 @@ import { splitError, type BraidEnv, type Project } from "./project";
 import { previewKey, SHOT_MIME } from "./shot";
 
 export { Project } from "./project";
-export { GitGateway, RegistryGateway, Runner } from "./runner";
+export { GitGateway, ImageGateway, RegistryGateway, Runner } from "./runner";
 export { AgentHost, AgentOutbound } from "./agent";
 
 const REGISTRY = "~registry";

@@ -37,7 +37,9 @@
         "python": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "python" } },
         "go": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "go" } },
         "rust": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "rust" } },
-        "java": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "java" } }
+        "java": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "java" } },
+        // For a project that brings its own Dockerfile or image: Docker itself, to build it and to run the checks inside it.
+        "dind": { "dockerfile": "./Dockerfile.dind" }
       }
     },
     // Hosted agents: Claude Code or Codex working on an attempt inside a sandbox.

@@ -3,15 +3,23 @@
 What Braid does not do, or does only in part. What is planned next is in [DIRECTION.md](DIRECTION.md); what was built, checked and left open at each step is in [LATER.md](LATER.md).
 
 - A built preview is static files. An app that needs its own backend loads but its API calls fail. Braid's own UI is the exception: it reads from the instance it is previewed on. Assets a build loads by root path from inside JavaScript or CSS (lazy chunks, `url(/...)`) are not redirected.
-- Verification knows five toolchains: Node (npm or pnpm), Python (uv, poetry or pip), Go, Rust and Java (Maven, or Gradle through the project's wrapper). A project in another language, or one that needs system packages the images lack, has to wait for Braid to build a project's own `Dockerfile`, which it does not do yet. Each step has ten minutes.
+- Verification knows five toolchains: Node (npm or pnpm), Python (uv, poetry or pip), Go, Rust and Java (Maven, or Gradle through the project's wrapper). A project in another language, or one that needs system packages the images lack, brings its own `Dockerfile` or image (see [SETTINGS.md](SETTINGS.md)). Each step has ten minutes; building an image has twenty-five.
 - Monorepos across languages are supported only in part. Braid looks for a manifest at the root of the repository and runs the whole commit in one image:
   - Node beside one other language works, because every image has Node. Detection only runs the other language's conventional checks, so list the checks for both in `braid.json` (see [SETTINGS.md](SETTINGS.md#a-repository-with-more-than-one-language)). Not yet run for real.
   - Manifests only in subdirectories (`api/pyproject.toml`, `web/package.json`, nothing at the root) are not detected: name the image and the checks in `braid.json`.
   - Two languages other than Node (a Go service and a Rust one) cannot be run together: no image has both.
   - Every check runs for every commit. Braid does not work out which part of a monorepo a change touches and run only that part's checks.
-- A project's own `Dockerfile`, `docker-compose.yml` and devcontainer are not used. A project whose tests need a database or another service cannot run them in the sandbox.
+- A project's own image:
+  - It works on a deployed instance only. Under `wrangler dev` the sandbox cannot start containers of its own, and the run says so.
+  - A `Dockerfile` in the repository is not used just for being there (most are for shipping, not for running checks): the commit's `braid.json` has to name it, or the repository has a devcontainer.
+  - The sandbox that builds the image has the Internet and holds the source. A hostile `Dockerfile` in an attempt could send the code somewhere, which is why trunk has to allow image builds and why an attempt that changes a `Dockerfile` is flagged.
+  - The image has to have a shell. It is at most 3 GB compressed, a project keeps three, and one is rebuilt after a week or when its Dockerfile or the manifests beside it change. Moving an image between the two sandboxes goes at about 3 MB a second.
+  - The commit is mounted at `/workspace`; what the image's own `WORKDIR`, `ENTRYPOINT` and `CMD` say is not used.
+  - Hosted agents do not work inside a project's own image yet: they run in the image for the project's language.
+- `docker-compose.yml` is not used. A project whose tests need a database or another service cannot run them in the sandbox.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`). A rename shows up as exactly that.
+- Java on a deployed instance gets its packages from a mirror of Maven Central, by default Google's, because Maven Central blocks Cloudflare's network. A project that needs artifacts from other repositories has to name a mirror that carries them. Gradle is pointed at the mirror by a script that has not been run for real, and a Java project in its own image is not given the mirror.
 - Lockfiles are regenerated for npm, pnpm, uv, poetry, Cargo and Go (`go.sum`). Checked for real with Go and Cargo.
 - A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks. Only a conflict can bring it back by itself, and only in a project that asks for that (`landing.conflicts`).
 - Reverting a landing adds one commit that undoes it and reopens the intent. It is refused if a later landing changed the same lines, and the revert itself is verified on trunk afterwards, not before.

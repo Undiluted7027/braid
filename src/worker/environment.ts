@@ -140,3 +140,105 @@ export const lockOf = (path: string) => LOCK_COMMANDS[path.slice(path.lastIndexO
 
 /** Files that say what a project is run in. A change to one is for a person to look at: it changes what every check means. */
 export const ENVIRONMENT = /(^|\/)(Dockerfile[^/]*|[^/]*\.dockerfile|docker-compose[^/]*\.ya?ml|compose\.ya?ml|\.devcontainer\/[^/]+|\.devcontainer\.json|\.tool-versions|\.mise\.toml|mise\.toml|\.python-version|\.nvmrc|\.node-version|rust-toolchain(\.toml)?)$/;
+
+/**
+ * A project's own image: what a commit asks to be run in when the images Braid has are not enough. Either a
+ * Dockerfile in the repository, which Braid builds, or an image by name, which it pulls. Both need the Internet,
+ * so they are only followed in a project whose trunk allows that for building images (see `ownImageOf`).
+ */
+export type OwnImage = { kind: "dockerfile"; dockerfile: string; context: string } | { kind: "image"; image: string };
+
+const PATH = /^[\w.@+-][\w.@+/-]*$/;
+const IMAGE = /^[a-z0-9][a-z0-9._/-]*(:[\w.-]{1,128})?(@sha256:[0-9a-f]{64})?$/;
+const safePath = (p: unknown): string | null => (typeof p === "string" && PATH.test(p) && !p.split("/").includes("..") && p.length < 200 ? p.replace(/^\.\//, "") : null);
+const dirOf = (path: string) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".");
+/** A path written relative to a directory of the repository, as a path from its root. Null if it leaves the repository. */
+function under(dir: string, relative: unknown): string | null {
+	if (typeof relative !== "string" || relative.startsWith("/")) return null;
+	const parts: string[] = dir === "." ? [] : dir.split("/");
+	for (const part of relative.split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === "..") { if (!parts.length) return null; parts.pop(); } else parts.push(part);
+	}
+	return safePath(parts.join("/") || ".") ?? (parts.length ? null : ".");
+}
+/** devcontainer.json is JSON with comments and trailing commas. */
+export function parseJsonc(text: string): any {
+	const bare = text.replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (m, str) => str ?? "").replace(/,(\s*[}\]])/g, "$1");
+	try { return JSON.parse(bare); } catch { return null; }
+}
+
+/**
+ * The image a commit asks for, from its own files. `explicit` is true when its braid.json says so
+ * (`"environment": { "dockerfile": "Dockerfile" }` or `{ "image": "python:3.13-slim" }`), and false when it comes from a
+ * devcontainer, which is followed only where the project has already allowed images to be built.
+ */
+export async function ownImageOf(files: Files, config?: any | null): Promise<{ image: OwnImage; explicit: boolean } | null> {
+	const env = config?.environment;
+	const dockerfile = safePath(env?.dockerfile);
+	if (dockerfile) return { image: { kind: "dockerfile", dockerfile, context: safePath(env?.context) ?? dirOf(dockerfile) }, explicit: true };
+	if (typeof env?.image === "string" && !isToolchain(env.image) && IMAGE.test(env.image) && env.image.length < 250) return { image: { kind: "image", image: env.image }, explicit: true };
+	if (env?.devcontainer === false) return null;
+	for (const path of [".devcontainer/devcontainer.json", ".devcontainer.json"]) {
+		const text = await files.read(path);
+		if (!text) continue;
+		const dev = parseJsonc(text), base = dirOf(path);
+		const file = under(base, dev?.build?.dockerfile ?? dev?.dockerFile);
+		if (file && file !== ".") return { image: { kind: "dockerfile", dockerfile: file, context: under(base, dev?.build?.context ?? dev?.context ?? ".") ?? base }, explicit: false };
+		if (typeof dev?.image === "string" && IMAGE.test(dev.image)) return { image: { kind: "image", image: dev.image }, explicit: false };
+	}
+	return null;
+}
+
+/** Manifests a Dockerfile usually copies in to install dependencies: an image built before one of these changed is built again. */
+export const IMAGE_INPUTS = ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "requirements.txt", "requirements-dev.txt", "pyproject.toml", "uv.lock", "poetry.lock",
+	"go.mod", "go.sum", "Cargo.toml", "Cargo.lock", "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile", "Gemfile.lock", "composer.json", "composer.lock"];
+/** What decides whether two commits can share one built image: the Dockerfile's text (or the image's name) and the manifests beside it. */
+export async function imageInputs(files: Files, image: OwnImage): Promise<string> {
+	const parts: string[] = [image.kind, image.kind === "dockerfile" ? `${image.dockerfile}\n${image.context}\n${(await files.read(image.dockerfile)) ?? ""}` : image.image];
+	if (image.kind === "dockerfile") {
+		const dir = image.context === "." ? "" : `${image.context}/`;
+		for (const name of IMAGE_INPUTS) { const text = await files.read(dir + name); if (text !== null) parts.push(`${name}\n${text}`); }
+	}
+	return parts.join("\n\0\n");
+}
+
+/**
+ * Where Java's packages come from. Maven Central answers 403 to requests from Cloudflare's network, so a Java project
+ * on a deployed instance needs a mirror. In order: what the project says in braid.json (`"environment": { "maven":
+ * "https://…/maven2/" }`), the mirrors in its own `.mvn/settings.xml`, and failing both, Google's mirror of Maven Central.
+ * Read from trunk: it decides which hosts a sandbox may reach, and an attempt does not get to add one.
+ */
+export const MAVEN_MIRROR = "https://maven-central.storage-download.googleapis.com/maven2/";
+export interface Maven {
+	/** The mirror Braid points Maven and Gradle at. Null when the project's own settings file names its mirrors: Braid then only lets the sandbox reach them. */
+	mirror: string | null;
+	hosts: string[];
+}
+function mirrorUrl(value: unknown): URL | null {
+	if (typeof value !== "string" || value.length > 300) return null;
+	try { const u = new URL(value.trim()); return u.protocol === "https:" && !u.username && !u.password && !u.search && /^[a-z0-9.-]+$/.test(u.hostname) && u.hostname.includes(".") && (!u.port || u.port === "443") ? u : null; } catch { return null; }
+}
+export async function mavenFor(files: Files, config?: any | null): Promise<Maven> {
+	const said = mirrorUrl(config?.environment?.maven);
+	if (said) return { mirror: said.href.replace(/\/?$/, "/"), hosts: [said.hostname] };
+	const settings = await files.read(".mvn/settings.xml");
+	if (settings) {
+		const hosts = [...settings.replace(/<!--[\s\S]*?-->/g, "").matchAll(/<mirror>[\s\S]*?<url>\s*([^<\s]+)\s*<\/url>[\s\S]*?<\/mirror>/g)].map((m) => mirrorUrl(m[1])?.hostname).filter((h): h is string => !!h);
+		if (hosts.length) return { mirror: null, hosts: [...new Set(hosts)].slice(0, 6) };
+	}
+	return { mirror: MAVEN_MIRROR, hosts: [new URL(MAVEN_MIRROR).hostname] };
+}
+const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+/** A Maven settings file for the sandbox's user: everything asked of Maven Central goes to the mirror. */
+export const mavenSettings = (mirror: string) => `<settings>\n  <mirrors>\n    <mirror>\n      <id>braid-mirror</id>\n      <mirrorOf>central</mirrorOf>\n      <url>${xml(mirror)}</url>\n    </mirror>\n  </mirrors>\n</settings>\n`;
+/** The same for Gradle, as an init script: repositories that point at Maven Central are pointed at the mirror. */
+export const gradleInit = (mirror: string) => `def braidMirror = ${JSON.stringify(mirror)}
+def braidCentral = ["repo.maven.apache.org", "repo1.maven.org"]
+def braidPoint = { repos -> repos.all { repo -> if (repo instanceof MavenArtifactRepository && braidCentral.contains(repo.url.host)) repo.url = uri(braidMirror) } }
+settingsEvaluated { settings ->
+	braidPoint(settings.pluginManagement.repositories)
+	braidPoint(settings.dependencyResolutionManagement.repositories)
+}
+allprojects { braidPoint(buildscript.repositories); braidPoint(repositories) }
+`;

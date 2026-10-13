@@ -282,6 +282,47 @@ test("a Go project: both sides add a dependency at the same place, go.mod keeps 
 	assert.match((await w.state()).reconciliations.at(-1).rationale, /go\.sum was regenerated from the merged go\.mod/);
 });
 
+test("a Java project's runs carry the mirror trunk names, and an attempt cannot name another", async (t) => {
+	const { w, intents } = await started(t, ["One"]);
+	const trunk = w.clone("p--trunk", "owner");
+	w.push(trunk, { "pom.xml": "<project/>\n", "package.json": null, "test/app.test.js": null });
+	await w.project.onPush("p--trunk"); await w.settle();
+	assert.deepEqual([w.runs.at(-1).toolchain, w.runs.at(-1).policy.maven], ["java", { mirror: "https://maven-central.storage-download.googleapis.com/maven2/", hosts: ["maven-central.storage-download.googleapis.com"] }]);
+	w.push(trunk, { "braid.json": JSON.stringify({ environment: { maven: "https://repo.acme.example/maven2/" } }) });
+	await w.project.onPush("p--trunk"); await w.settle();
+	assert.deepEqual(w.runs.at(-1).policy.maven, { mirror: "https://repo.acme.example/maven2/", hosts: ["repo.acme.example"] });
+	const a = await agent(w, intents[0], "ana");
+	work(w, a, { "braid.json": JSON.stringify({ environment: { maven: "https://elsewhere.example/m2/" } }) }); await w.project.onPush(a.repo); await w.settle();
+	assert.deepEqual([w.runs.at(-1).ref, w.runs.at(-1).policy.maven.hosts], [a.attemptId, ["repo.acme.example"]]);
+});
+
+test("a commit that brings its own image is run in it only where trunk has allowed images to be built", async (t) => {
+	const { w, intents } = await started(t, ["One", "Two", "Three"]);
+	const job = (ref) => w.runs.filter((r) => r.ref === ref).at(-1);
+	// Trunk has not allowed it. An attempt that asks outright is told so by its run; one with only a devcontainer is run as before.
+	const a = await agent(w, intents[0], "ana"), b = await agent(w, intents[1], "ben");
+	work(w, a, { "braid.json": JSON.stringify({ environment: { dockerfile: "Dockerfile", internet: "build" } }), Dockerfile: "FROM node:24\n" }); await w.project.onPush(a.repo);
+	work(w, b, { ".devcontainer/devcontainer.json": '{ "image": "node:24" }' }); await w.project.onPush(b.repo); await w.settle();
+	assert.deepEqual([job(a.attemptId).own.allowed, job(a.attemptId).own.image, job(b.attemptId).own ?? null], [false, { kind: "dockerfile", dockerfile: "Dockerfile", context: "." }, null], "an attempt cannot give itself the Internet");
+	assert.deepEqual((await w.state()).attempts.map((x) => x.flags.map((f) => f.kind).filter((k) => k === "environment" || k === "checks")), [["checks", "environment"], ["environment"]]);
+	// Trunk allows it. The same attempts are now run in their own images, and so is trunk if it names one.
+	const trunk = w.clone("p--trunk", "owner");
+	w.push(trunk, { "braid.json": JSON.stringify({ environment: { internet: "build", image: "node:24-slim" } }) });
+	await w.project.onPush("p--trunk"); await w.settle();
+	assert.deepEqual([job("trunk").own.allowed, job("trunk").own.image, (await w.state()).runs.find((r) => r.ref === "trunk").toolchain], [true, { kind: "image", image: "node:24-slim" }, "node:24-slim"]);
+	await w.project.verify(a.attemptId, true); await w.project.verify(b.attemptId, true);
+	assert.deepEqual([job(a.attemptId).own.allowed, job(b.attemptId).own.allowed, job(b.attemptId).own.image], [true, true, { kind: "image", image: "node:24" }]);
+	// Commits with the same Dockerfile and manifests share one built image; a change to either makes another.
+	const c = await agent(w, intents[2], "cy");
+	work(w, c, { "braid.json": JSON.stringify({ environment: { dockerfile: "Dockerfile" } }), Dockerfile: "FROM node:24\n", "src.js": "1\n" }); await w.project.onPush(c.repo); await w.settle();
+	const first = job(c.attemptId).own.key;
+	work(w, c, { "src.js": "2\n" }); await w.project.onPush(c.repo); await w.settle();
+	assert.equal(job(c.attemptId).own.key, first);
+	work(w, c, { Dockerfile: "FROM node:24\nRUN true\n" }); await w.project.onPush(c.repo); await w.settle();
+	assert.notEqual(job(c.attemptId).own.key, first);
+	assert.match(first, /^[0-9a-f]{40}$/);
+});
+
 test("while trunk is failing, an attempt whose merge does not pass is refused and one that fixes it lands", async (t) => {
 	const { w, intents } = await started(t, ["One", "Two", "Fix"]);
 	const a = await ready(w, intents[0], "ana", { "a.md": "a\n" }), b = await ready(w, intents[1], "ben", { "b.md": "b\n" }), c = await ready(w, intents[2], "cy", { "fix.md": "fix\n" });

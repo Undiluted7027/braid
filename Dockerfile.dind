@@ -1,0 +1,7 @@
+# The sandbox Braid uses for a project that brings its own image: a Docker daemon, and just enough to fetch the
+# commit and move a built image in and out. The project's Dockerfile is built in one of these that has Internet
+# access; the checks are run inside the result in another that has none.
+FROM docker:dind
+RUN apk add --no-cache bash coreutils curl git zstd
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
