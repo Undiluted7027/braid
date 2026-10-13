@@ -77,7 +77,7 @@ To put real agents on a project, start them in sandboxes on Cloudflare, or deplo
 | **Workers** | The API, the MCP endpoint for agents, the interface, and previews of every attempt. |
 | **Artifacts** | Trunk is a repository and every attempt is a fork of it. Push events tell Braid when an agent has pushed. |
 | **Durable Objects** | One per project, with SQLite: all coordination state, an event log, and the only writer to trunk. |
-| **Containers** | A fresh sandbox for every commit that is verified, and for every hosted agent. No Internet access and no credentials inside. |
+| **Containers** | A fresh sandbox for every commit that is verified, and for every hosted agent, in an image for the project's language (Node, Python, Go, Rust or Java). No Internet access and no credentials inside. |
 | **Workflows** | Carry each push event to the project that owns the repository. |
 | **AI Gateway** | Every model call (reviews, planning, judging, reconciliation, hosted agents), with the provider keys held in the gateway. |
 | **Workers AI** | Clef, a decision model, reads every push and says how likely each criterion is met. |

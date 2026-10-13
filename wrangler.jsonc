@@ -27,17 +27,30 @@
     { "tag": "v3", "new_sqlite_classes": ["AgentHost"] }
   ],
   // Each attempt is verified in its own Linux sandbox, started on demand by the Runner object.
+  // One image per toolchain, all built from the same Dockerfile: Node alone, or Node with Python, Go, Rust or Java.
   "containers": [
     {
       "class_name": "Runner",
       "scheduling_policy": "durable_object",
-      "images": { "runner": { "dockerfile": "./Dockerfile" } }
+      "images": {
+        "runner": { "dockerfile": "./Dockerfile" },
+        "python": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "python" } },
+        "go": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "go" } },
+        "rust": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "rust" } },
+        "java": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "java" } }
+      }
     },
     // Hosted agents: Claude Code or Codex working on an attempt inside a sandbox.
     {
       "class_name": "AgentHost",
       "scheduling_policy": "durable_object",
-      "images": { "agent": { "dockerfile": "./Dockerfile" } }
+      "images": {
+        "agent": { "dockerfile": "./Dockerfile" },
+        "python": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "python" } },
+        "go": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "go" } },
+        "rust": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "rust" } },
+        "java": { "dockerfile": "./Dockerfile", "build_vars": { "TOOLCHAIN": "java" } }
+      }
     }
   ],
   "workflows": [{ "name": "braid-push", "binding": "PUSH_WORKFLOW", "class_name": "PushWorkflow" }],

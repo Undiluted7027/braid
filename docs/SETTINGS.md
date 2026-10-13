@@ -6,8 +6,9 @@ Two places. How a project is run is set in `braid.json` at the root of its trunk
 
 | Key | Default | What it does |
 |---|---|---|
-| `install` | the package manager's install | The command that installs dependencies in the sandbox. |
-| `checks` | the `typecheck`, `lint`, `test` and `build` scripts that exist | `{ "name": "command" }`: what is run for every commit and every merge. |
+| `environment.image` | detected from the files | `"node"`, `"python"`, `"go"`, `"rust"` or `"java"`: the sandbox image a commit is run in. Read from the commit itself, not from trunk. |
+| `install` | the language's usual install | The command that installs dependencies in the sandbox. |
+| `checks` | what the language's conventions give | `{ "name": "command" }`: what is run for every commit and every merge. Without it: Node's `typecheck`, `lint`, `test` and `build` scripts; Python's `mypy`, `ruff` and `pytest` where set up; `go vet`, `go build`, `go test`; `cargo check`, `cargo test`; `mvn test`. |
 | `preview.dir` | none | The directory a build writes, served as the attempt's preview. |
 | `preview.api` | none | `"braid"` answers the preview's `/api/` calls from this instance, read-only. For a project whose backend is Braid itself. |
 | `landing.policy` | `"person"` | `"auto"` lands an attempt without a person once it is ready, its checks passed, its review found every criterion met and nothing is flagged. |
@@ -32,6 +33,25 @@ Example:
 	"race": { "agents": ["claude", "codex"], "wait": 20 }
 }
 ```
+
+### A repository with more than one language
+
+Braid runs a commit in one image, picked from the manifest at the repository's root. Every image has Node, so a backend in Python, Go, Rust or Java with a JavaScript front end can be run together by saying so:
+
+```json
+{
+	"environment": { "image": "python" },
+	"install": "cd api && uv sync --frozen && cd ../web && npm ci",
+	"checks": {
+		"api": "cd api && uv run pytest",
+		"web": "cd web && npm test",
+		"web build": "cd web && npm run build"
+	},
+	"preview": { "dir": "web/dist" }
+}
+```
+
+Two languages other than Node in one repository cannot be run together yet, and all checks run for every commit whichever part it touched. See [LIMITS.md](LIMITS.md).
 
 ## The instance (secrets and variables)
 

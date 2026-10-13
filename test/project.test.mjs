@@ -242,7 +242,7 @@ test("both sides changing dependencies: the lockfile is regenerated in a sandbox
 	const b = await ready(w, intents[1], "ben", { "package.json": pkg({ right: "2.0.0" }), "package-lock.json": "lock with right\n" });
 	await land(w, a.attemptId);
 	const held = await land(w, b.attemptId);
-	assert.deepEqual([held.queued, held.note], ["locking", "regenerating the lockfile from the merged package.json"]);
+	assert.deepEqual([held.queued, held.note], ["locking", "regenerating the lockfile from the merged manifest"]);
 	const job = w.runs.at(-1);
 	assert.deepEqual([job.ref, job.regenerate], [`lock:${b.attemptId}`, ["package-lock.json"]]);
 	await w.project.lockfiles(job.runId, { "package-lock.json": "lock with left and right\n" });
@@ -254,6 +254,32 @@ test("both sides changing dependencies: the lockfile is regenerated in a sandbox
 	assert.ok((await standing(w, b.attemptId)).landed);
 	assert.equal(trunkFile(w, "package-lock.json"), "lock with left and right");
 	assert.deepEqual(Object.keys(JSON.parse(trunkFile(w, "package.json")).dependencies), ["left", "right"]);
+});
+
+test("a Go project: both sides add a dependency at the same place, go.mod keeps both and go.sum is regenerated in the Go image", async (t) => {
+	const { w, intents } = await started(t, ["One", "Two"]);
+	const mod = (extra) => `module example.com/tally\n\ngo 1.24\n\nrequire (\n\tgithub.com/google/uuid v1.6.0\n${extra})\n`;
+	const trunk = w.clone("p--trunk", "owner");
+	w.push(trunk, { "go.mod": mod(""), "go.sum": "uuid h1\n", "tally.go": "package tally\n", "package.json": null, "test/app.test.js": null });
+	await w.project.onPush("p--trunk"); await w.settle();
+	// Trunk is run as Go, in the Go image, and so is everything forked from it.
+	assert.deepEqual([w.runs.at(-1).ref, w.runs.at(-1).toolchain, w.runs.at(-1).policy.checks], ["trunk", "go", ["vet", "build", "test"]]);
+	await w.finish("trunk", "pass"); await w.settle();
+	const a = await ready(w, intents[0], "ana", { "go.mod": mod("\tgithub.com/google/go-cmp v0.7.0\n"), "go.sum": "uuid h1\ncmp h1\n" });
+	const b = await ready(w, intents[1], "ben", { "go.mod": mod("\tgithub.com/dustin/go-humanize v1.0.1\n"), "go.sum": "uuid h1\nhumanize h1\n" });
+	assert.deepEqual([(await w.state()).runs.find((r) => r.ref === b.attemptId).toolchain, w.runs.at(-1).toolchain], ["go", "go"]);
+	await land(w, a.attemptId);
+	const held = await land(w, b.attemptId);
+	assert.deepEqual([held.queued, held.note], ["locking", "regenerating the lockfile from the merged manifest"]);
+	const job = w.runs.at(-1);
+	assert.deepEqual([job.ref, job.regenerate, job.toolchain], [`lock:${b.attemptId}`, ["go.sum"], "go"]);
+	await w.project.lockfiles(job.runId, { "go.sum": "uuid h1\ncmp h1\nhumanize h1\n" });
+	await w.finish(`lock:${b.attemptId}`, "pass"); await w.settle();
+	await w.finish(await mergeRef(w, b.attemptId), "pass"); await w.settle();
+	assert.ok((await standing(w, b.attemptId)).landed);
+	assert.equal(trunkFile(w, "go.sum"), "uuid h1\ncmp h1\nhumanize h1");
+	assert.match(trunkFile(w, "go.mod"), /go-cmp v0\.7\.0\n\tgithub\.com\/dustin\/go-humanize v1\.0\.1\n\)/);
+	assert.match((await w.state()).reconciliations.at(-1).rationale, /go\.sum was regenerated from the merged go\.mod/);
 });
 
 test("while trunk is failing, an attempt whose merge does not pass is refused and one that fixes it lands", async (t) => {

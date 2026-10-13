@@ -36,7 +36,7 @@ export interface Proposal {
 }
 /** Something about an attempt a person should look at whatever a reviewer says. Raised from the diff and the session, with no model. */
 export interface Flag {
-	kind: "tests-deleted" | "tests-changed" | "checks" | "lockfile" | "outside-claims" | "history" | "destructive";
+	kind: "tests-deleted" | "tests-changed" | "checks" | "lockfile" | "outside-claims" | "history" | "destructive" | "environment";
 	text: string; paths: string[];
 }
 /** One criterion as the reviewer found it. `basis`: judged from the diff (with lines as evidence), or from the project's checks having passed. */
@@ -241,6 +241,8 @@ export interface Run {
 	id: number; ref: string; sha: string;
 	status: "queued" | "running" | "pass" | "fail" | "error" | "superseded";
 	steps: RunStep[]; preview: boolean;
+	/** What the commit was run in: "node", "python", "go", "rust" or "java", worked out from its own files. Absent on runs from before Braid ran anything but Node. */
+	toolchain?: string | null;
 	/** The preview's /api/ calls are answered by this Braid instance, read-only (braid.json: preview.api = "braid"). */
 	previewApi: boolean; nothingToRun: boolean; error: string | null; startedAt: number; finishedAt: number | null;
 }

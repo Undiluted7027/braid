@@ -2,6 +2,7 @@
 // diff and the session, with no model: a model can be talked round, these cannot.
 import { claimMatches } from "./overlap.ts";
 import { GENERATED } from "./gitops.ts";
+import { ENVIRONMENT, lockOf } from "./environment.ts";
 import type { FileChange, Flag } from "../shared/types.ts";
 
 const TEST = /(^|\/)(tests?|__tests__|specs?|e2e)\/|\.(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py)$|(^|\/)test_[^/]+\.py$/;
@@ -22,8 +23,10 @@ export function diffFlags(files: FileChange[], claims: string[], scripts?: { bas
 		const names = [...new Set([...Object.keys(scripts.base), ...Object.keys(scripts.head)])].filter((n) => scripts.base[n] !== scripts.head[n] && (n in scripts.base));
 		if (names.length) out.push({ kind: "checks", text: `Changed or removed the package.json script${names.length === 1 ? "" : "s"} ${names.join(", ")}`, paths: ["package.json"] });
 	}
-	const manifests = new Set(files.filter((f) => /(^|\/)package\.json$/.test(f.path)).map((f) => f.path.replace(/package\.json$/, "")));
-	flag("lockfile", "Changed a lockfile without changing the package.json beside it", files.filter((f) => GENERATED.test(f.path) && !manifests.has(f.path.replace(/[^/]+$/, ""))).map((f) => f.path));
+	// A lockfile goes with a manifest in the same directory: package.json for Node's, pyproject.toml, Cargo.toml or go.mod for the others'.
+	const changed = new Set(files.map((f) => f.path)), manifestOf = (path: string) => path.replace(/[^/]+$/, "") + (lockOf(path)?.manifest ?? "package.json");
+	flag("lockfile", "Changed a lockfile without changing the manifest beside it", files.filter((f) => GENERATED.test(f.path) && !changed.has(manifestOf(f.path))).map((f) => f.path));
+	flag("environment", "Changed what the project is run in", files.filter((f) => ENVIRONMENT.test(f.path)).map((f) => f.path));
 	const outside = files.filter((f) => !claims.some((c) => claimMatches(c, f.path) || claimMatches(f.path, c))).map((f) => f.path);
 	flag("outside-claims", claims.length ? "Changed files it did not say it would" : "Changed files without saying beforehand which ones", outside);
 	return out;

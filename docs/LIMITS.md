@@ -3,10 +3,16 @@
 What Braid does not do, or does only in part. What is planned next is in [DIRECTION.md](DIRECTION.md); what was built, checked and left open at each step is in [LATER.md](LATER.md).
 
 - A built preview is static files. An app that needs its own backend loads but its API calls fail. Braid's own UI is the exception: it reads from the instance it is previewed on. Assets a build loads by root path from inside JavaScript or CSS (lazy chunks, `url(/...)`) are not redirected.
-- Verification supports Node projects (npm or pnpm). Each step has ten minutes.
+- Verification knows five toolchains: Node (npm or pnpm), Python (uv, poetry or pip), Go, Rust and Java (Maven, or Gradle through the project's wrapper). A project in another language, or one that needs system packages the images lack, has to wait for Braid to build a project's own `Dockerfile`, which it does not do yet. Each step has ten minutes.
+- Monorepos across languages are supported only in part. Braid looks for a manifest at the root of the repository and runs the whole commit in one image:
+  - Node beside one other language works, because every image has Node. Detection only runs the other language's conventional checks, so list the checks for both in `braid.json` (see [SETTINGS.md](SETTINGS.md#a-repository-with-more-than-one-language)). Not yet run for real.
+  - Manifests only in subdirectories (`api/pyproject.toml`, `web/package.json`, nothing at the root) are not detected: name the image and the checks in `braid.json`.
+  - Two languages other than Node (a Go service and a Rust one) cannot be run together: no image has both.
+  - Every check runs for every commit. Braid does not work out which part of a monorepo a change touches and run only that part's checks.
+- A project's own `Dockerfile`, `docker-compose.yml` and devcontainer are not used. A project whose tests need a database or another service cannot run them in the sandbox.
 - Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
 - A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`). A rename shows up as exactly that.
-- Lockfiles are regenerated for npm and pnpm only.
+- Lockfiles are regenerated for npm, pnpm, uv, poetry, Cargo and Go (`go.sum`). Checked for real with Go and Cargo.
 - A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks. Only a conflict can bring it back by itself, and only in a project that asks for that (`landing.conflicts`).
 - Reverting a landing adds one commit that undoes it and reopens the intent. It is refused if a later landing changed the same lines, and the revert itself is verified on trunk afterwards, not before.
 - Braid refuses a resolution that is identical to one side unless told that is intended.

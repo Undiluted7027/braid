@@ -1,16 +1,19 @@
 // Verifies an attempt by running it: one sandbox per ref, a fresh Linux instance per run.
 // The instance has no Internet access and holds no credentials. It can reach exactly two things,
-// both through this Worker: the one repository it is verifying (read-only) and the package registry.
+// both through this Worker: the one repository it is verifying (read-only) and the package registries of its toolchain.
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { redact } from "../shared/redact";
 import type { Run, RunStep } from "../shared/types";
 import { ArtifactsHost } from "./host";
 import type { BraidEnv, Project } from "./project";
+import { lockOf, planFor, registriesFor, type Files, type Toolchain } from "./environment.ts";
 
-/** What to run, as trunk defines it: its braid.json, and the check scripts its package.json has. An attempt cannot drop a check by editing these. */
-export interface RunPolicy { config: any | null; scripts: string[] }
+/** What to run, as trunk defines it: its braid.json, and the checks it has by convention (by name). An attempt cannot drop a check by editing these. */
+export interface RunPolicy { config: any | null; checks: string[] }
 export interface RunJob { slug: string; ref: string; repo: string; remote: string; branch: string; sha: string; runId: number; policy?: RunPolicy;
-	/** Instead of verifying: bring these lockfiles up to date with the commit's package.json and hand them back. */
+	/** The toolchain this commit needs, worked out from its own files before the sandbox is started: it decides the image. */
+	toolchain?: Toolchain;
+	/** Instead of verifying: bring these lockfiles up to date with the commit's manifest and hand them back. */
 	regenerate?: string[] }
 
 const CA = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
@@ -20,8 +23,6 @@ const TAIL = 6000;
 const MAX_RUN_MS = 60 * 60 * 1000;
 const MAX_PREVIEW_FILE = 1_900_000; // a SQLite value holds 2 MB
 const MAX_PREVIEW_TOTAL = 40_000_000;
-const REGISTRIES = ["registry.npmjs.org"];
-const SCRIPTS = ["typecheck", "lint", "test", "build"];
 const PREVIEW_DIRS = ["dist/client", "dist", "build", "out"];
 
 /** Adds the read token to git fetches of one repository; everything else to that host is refused. */
@@ -47,6 +48,8 @@ export class RegistryGateway extends WorkerEntrypoint<BraidEnv> {
 
 interface Busy { at: number; job?: RunJob }
 interface Plan { install: string | null; checks: [string, string][]; previewDir: string | null; previewApi: boolean }
+/** Where each toolchain's tools look for the certificate that vouches for the sandbox's gateway. Java keeps its own store and has it added (see `trust`). */
+const TRUST = { GIT_SSL_CAINFO: CA, NODE_EXTRA_CA_CERTS: CA, NPM_CONFIG_CAFILE: CA, SSL_CERT_FILE: CA, REQUESTS_CA_BUNDLE: CA, PIP_CERT: CA, CARGO_HTTP_CAINFO: CA, CURL_CA_BUNDLE: CA };
 
 export class Runner extends DurableObject<BraidEnv> {
 	constructor(ctx: DurableObjectState, env: BraidEnv) {
@@ -97,11 +100,15 @@ export class Runner extends DurableObject<BraidEnv> {
 
 		const host = new URL(job.remote);
 		await container.interceptOutboundHttps(host.hostname, this.ctx.exports.GitGateway({ props: { repo: job.repo, path: host.pathname } }));
-		for (const registry of REGISTRIES) await container.interceptOutboundHttps(registry, this.ctx.exports.RegistryGateway({ props: {} }));
-		container.start({ image: container.images.runner, enableInternet: false, instance: "standard-2" });
+		const toolchain: Toolchain = job.toolchain ?? "node";
+		for (const registry of registriesFor(toolchain)) await container.interceptOutboundHttps(registry, this.ctx.exports.RegistryGateway({ props: {} }));
+		// An instance deployed before an image existed for this toolchain runs it in the Node image, where its first step says what is missing.
+		const images = container.images as Record<string, typeof container.images.runner>;
+		container.start({ image: (toolchain !== "node" && images[toolchain]) || images.runner, enableInternet: false, instance: "standard-2" });
 
 		const steps: RunStep[] = [];
-		const env = { CI: "true", HOME: "/root", GIT_SSL_CAINFO: CA, NODE_EXTRA_CA_CERTS: CA, NPM_CONFIG_CAFILE: CA, NPM_CONFIG_UPDATE_NOTIFIER: "false", GIT_TERMINAL_PROMPT: "0", WRANGLER_SEND_METRICS: "false", DO_NOT_TRACK: "1" };
+		const env = { CI: "true", HOME: "/root", ...TRUST, NPM_CONFIG_UPDATE_NOTIFIER: "false", GIT_TERMINAL_PROMPT: "0", WRANGLER_SEND_METRICS: "false", DO_NOT_TRACK: "1",
+			PIP_DISABLE_PIP_VERSION_CHECK: "1", PIP_NO_INPUT: "1", UV_NO_PROGRESS: "1", PYTHONUNBUFFERED: "1", CARGO_TERM_COLOR: "never", GOFLAGS: "-buildvcs=false" };
 		const decode = (b: ArrayBuffer) => new TextDecoder().decode(b);
 		const exec = async (argv: string[], cwd?: string) => {
 			// `timeout` stops the command and everything it started.
@@ -120,7 +127,7 @@ export class Runner extends DurableObject<BraidEnv> {
 			await this.report(job, { steps });
 			return r.code === 0;
 		};
-		const finish = (patch: Partial<Run>) => this.report(job, { steps, finishedAt: Date.now(), ...patch });
+		const finish = (patch: Partial<Run>) => this.report(job, { steps, finishedAt: Date.now(), toolchain, ...patch });
 		const superseded = async () => !!(await this.ctx.storage.get("next"));
 
 		// The exact commit: a shallow fetch of the sha, so a push that lands mid-run cannot change what is verified.
@@ -128,12 +135,15 @@ export class Runner extends DurableObject<BraidEnv> {
 			`git init -q ${WORK} && cd ${WORK} && git remote add origin "$0" && (git fetch -q --depth=1 origin "$1" || git fetch -q --depth=50 origin "$2") && git checkout -q "$1"`, job.remote, job.sha, job.branch]);
 		if (!cloned) return finish({ status: "error", error: "could not fetch the commit" });
 
+		// Java does not read a certificate from the environment: the gateway's is added to its store before anything is fetched.
+		if (toolchain === "java") await exec(["sh", "-c", `keytool -importcert -noprompt -trustcacerts -cacerts -storepass changeit -alias braid-sandbox -file ${CA} >/dev/null 2>&1 || true`]);
+
 		if (job.regenerate) {
 			// Resolve only: the registry is asked what each dependency resolves to, and nothing from a package is run.
 			const files: Record<string, string> = {};
 			for (const path of job.regenerate) {
 				const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".", name = path.slice(path.lastIndexOf("/") + 1);
-				const command = name === "pnpm-lock.yaml" ? "pnpm install --lockfile-only --no-frozen-lockfile --ignore-scripts" : name === "package-lock.json" ? "npm install --package-lock-only --ignore-scripts --no-audit --no-fund" : null;
+				const command = lockOf(name)?.command;
 				if (!command) return finish({ status: "error", error: `Braid cannot regenerate ${name}` });
 				if (!(await step(`lockfile ${path}`.slice(0, 40), command, ["sh", "-c", command], `${WORK}/${dir}`))) return finish({ status: "fail" });
 				const out = await exec(["cat", path], WORK);
@@ -144,7 +154,7 @@ export class Runner extends DurableObject<BraidEnv> {
 			return finish({ status: "pass", nothingToRun: true });
 		}
 
-		const plan = await this.plan(exec, job.policy);
+		const plan = await this.plan(exec, toolchain, job.policy);
 		if (plan.install && !(await step("install", plan.install, ["sh", "-c", plan.install], WORK))) return finish({ status: "fail" });
 		for (const [name, command] of plan.checks) {
 			if (await superseded()) return finish({ status: "superseded" });
@@ -157,22 +167,21 @@ export class Runner extends DurableObject<BraidEnv> {
 		return finish({ status: passed ? "pass" : "fail", preview, previewApi: preview && plan.previewApi, nothingToRun: plan.checks.length === 0 });
 	}
 
-	/** What to run: the repository's braid.json if it has one, otherwise what its package.json offers. */
-	private async plan(exec: (argv: string[], cwd?: string) => Promise<{ code: number; text: string }>, policy?: RunPolicy): Promise<Plan> {
-		const read = async (file: string) => { const r = await exec(["cat", file], WORK); try { return r.code === 0 ? JSON.parse(r.text) : null; } catch { return null; } };
-		const has = async (path: string) => (await exec(["test", "-e", path], WORK)).code === 0;
-		// With a policy, trunk's braid.json decides and this commit's own copy is not consulted.
-		const config = policy ? policy.config : await read("braid.json"), pkg = await read("package.json");
-		let install: string | null = null;
-		if (typeof config?.install === "string") install = config.install;
-		else if (pkg) install = (await has("pnpm-lock.yaml")) ? "pnpm install --frozen-lockfile" : (await has("package-lock.json")) ? "npm ci --no-audit --no-fund" : "npm install --no-audit --no-fund";
-		const runner = install?.startsWith("pnpm") ? "pnpm" : "npm";
-		const checks: [string, string][] = config?.checks && typeof config.checks === "object"
-			? Object.entries(config.checks).map(([name, command]) => [name.slice(0, 40), String(command)])
-			: SCRIPTS.filter((s) => pkg?.scripts?.[s] || policy?.scripts.includes(s)).map((s) => [s, `${runner} run ${s}`]);
+	/**
+	 * What to run: how the commit's own files say it is installed and checked, with trunk deciding which checks there are
+	 * (see planFor). With a policy, trunk's braid.json decides and this commit's own copy only says what it is run in.
+	 */
+	private async plan(exec: (argv: string[], cwd?: string) => Promise<{ code: number; text: string }>, toolchain: Toolchain, policy?: RunPolicy): Promise<Plan> {
+		const files: Files = {
+			has: async (path) => (await exec(["test", "-e", path], WORK)).code === 0,
+			read: async (path) => { const r = await exec(["cat", path], WORK); return r.code === 0 ? r.text : null; },
+		};
+		const json = async (file: string) => { try { return JSON.parse((await files.read(file)) ?? "null"); } catch { return null; } };
+		const own = await json("braid.json"), config = policy ? policy.config : own;
+		const { install, checks } = await planFor(files, own, policy ?? null, toolchain);
 		let previewDir: string | null = typeof config?.preview?.dir === "string" ? config.preview.dir : null;
 		// Decided before the build, from what the project says or where builds usually land; checked again after.
-		if (!previewDir && config?.preview !== false) previewDir = pkg?.scripts?.build ? "auto" : (await has("index.html")) ? "." : null;
+		if (!previewDir && config?.preview !== false) previewDir = checks.some(([name]) => name === "build") && (await files.has("package.json")) ? "auto" : (await files.has("index.html")) ? "." : null;
 		return { install, checks, previewDir, previewApi: config?.preview?.api === "braid" };
 	}
 

@@ -8,6 +8,7 @@ import { redact } from "../shared/redact";
 import { ArtifactsHost } from "./host";
 import { handleMcp } from "./mcp";
 import type { BraidEnv, Project } from "./project";
+import { registriesFor, type Toolchain } from "./environment.ts";
 
 export type HostedKind = "claude" | "codex" | "selftest";
 export interface HostJob {
@@ -18,15 +19,17 @@ export interface HostJob {
 	task: "work" | "reconcile" | "fix" | "respond";
 	/** The model to run the agent on, when the attempt was started with one. Otherwise the instance's model for that agent. */
 	model?: string;
+	/** What the attempt's code needs to be run in. It decides the sandbox image and which package registries can be read. */
+	toolchain?: Toolchain;
 }
-interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string; kind: HostedKind }
+interface OutboundProps { slug: string; gitHost: string; repo: string; repoPath: string; trunkRepo: string; trunkPath: string; agentToken: string; kind: HostedKind; registries: string[] }
 
 /** A hostname that exists only inside the sandbox: requests to it are answered by this Worker. */
 const BRAID_HOST = "braid.internal";
 const GATEWAY_HOST = "gateway.ai.cloudflare.com";
 const CA = "/etc/cloudflare/certs/cloudflare-containers-ca.crt";
 // The CA alone replaces the system trust store, which works because every HTTPS request is intercepted.
-const TRUST = { NODE_EXTRA_CA_CERTS: CA, GIT_SSL_CAINFO: CA, CURL_CA_BUNDLE: CA, SSL_CERT_FILE: CA, NPM_CONFIG_CAFILE: CA };
+const TRUST = { NODE_EXTRA_CA_CERTS: CA, GIT_SSL_CAINFO: CA, CURL_CA_BUNDLE: CA, SSL_CERT_FILE: CA, NPM_CONFIG_CAFILE: CA, REQUESTS_CA_BUNDLE: CA, PIP_CERT: CA, CARGO_HTTP_CAINFO: CA };
 const REPO = "/workspace/repo", TASK = "/workspace/task";
 const POLL_MS = 4000;
 const MAX_RUN_MS = 45 * 60 * 1000;
@@ -91,7 +94,7 @@ export class AgentOutbound extends WorkerEntrypoint<BraidEnv, OutboundProps> {
 		}
 
 		// Packages, read-only, so the agent can install and run the project's own checks.
-		if (url.hostname === "registry.npmjs.org" && (request.method === "GET" || request.method === "HEAD")) return fetch(request);
+		if ((p.registries ?? ["registry.npmjs.org"]).includes(url.hostname) && (request.method === "GET" || request.method === "HEAD")) return fetch(request);
 		return refuse(`${url.hostname} is not reachable from this sandbox`);
 	}
 }
@@ -234,8 +237,9 @@ export class AgentHost extends DurableObject<BraidEnv> {
 		if (!container) throw new Error("no container is configured for hosted agents");
 		if (container.running) await container.destroy().catch(() => {});
 		const git = new URL(job.remote), env = this.env;
-		const props: OutboundProps = { slug: job.slug, gitHost: git.hostname, repo: job.repo, repoPath: git.pathname, trunkRepo: job.trunkRepo, trunkPath: new URL(job.trunkRemote).pathname, agentToken: job.agentToken, kind: job.kind };
-		container.start({ image: container.images.agent, enableInternet: false, instance: "standard-2" });
+		const props: OutboundProps = { slug: job.slug, gitHost: git.hostname, repo: job.repo, repoPath: git.pathname, trunkRepo: job.trunkRepo, trunkPath: new URL(job.trunkRemote).pathname, agentToken: job.agentToken, kind: job.kind, registries: registriesFor(job.toolchain ?? "node") };
+		const images = container.images as Record<string, typeof container.images.agent>;
+		container.start({ image: (job.toolchain && job.toolchain !== "node" && images[job.toolchain]) || images.agent, enableInternet: false, instance: "standard-2" });
 		const outbound = this.ctx.exports.AgentOutbound({ props });
 		await container.interceptAllOutboundHttp(outbound);
 		await container.interceptOutboundHttps("*", outbound);
@@ -256,7 +260,7 @@ The \`braid\` MCP server is connected. Use its tools: brief, claim, record, chec
 - \`trunk\` is the project's trunk, read-only: \`git fetch trunk ${job.branch}\` then \`git merge FETCH_HEAD\` brings your attempt up to date.
 - Push with \`git push origin HEAD:${job.branch}\`, then call \`checkpoint\`.
 - Do not commit BRAID.md or .mcp.json (they are ignored locally).
-- You are in a sandbox: it can reach Braid, this repository, trunk, the model and the npm registry, and nothing else.
+- You are in a sandbox${job.toolchain && job.toolchain !== "node" ? ` with ${job.toolchain === "python" ? "Python (uv, poetry, pytest, ruff, mypy)" : job.toolchain === "go" ? "Go" : job.toolchain === "rust" ? "Rust (cargo, clippy, rustfmt)" : "Java (a JDK and Maven)"} and Node` : ""}: it can reach Braid, this repository, trunk, the model and the package registr${registriesFor(job.toolchain ?? "node").length > 1 ? "ies" : "y"} (${registriesFor(job.toolchain ?? "node").join(", ")}), and nothing else.
 `);
 		await this.must("write mcp config", ["sh", "-c", "cat > .mcp.json"], REPO, JSON.stringify({ mcpServers: { braid: { type: "http", url: mcp } } }));
 

@@ -18,6 +18,7 @@ import { likelihoods, passage, signalName, supports, type SignalInput } from "./
 import { previewKey, SHOT_MIME, takeShot } from "./shot";
 import { diffText } from "./review.ts";
 import type { ModelPick } from "./model";
+import { conventionalChecks, LOCKFILE, lockOf, toolchainOf, type Files, type Toolchain } from "./environment.ts";
 import { DEMO_FILES } from "./template";
 import { redact } from "../shared/redact";
 import { drain, Log, type Effect, type Executor, type NewEffect, type NewEvent } from "./log.ts";
@@ -36,8 +37,7 @@ export type BraidEnv = Env & { ANTHROPIC_API_KEY?: string; BRAID_MODEL?: string;
 const LIVE = new Set(["working", "ready", "conflicted"]);
 /** How many agents Braid runs for one project at a time, unless HOSTED_MAX says otherwise. */
 const HOSTED_MAX = 6;
-/** Files a package manager writes. A conflict in one is not merged as text; it is regenerated. */
-const LOCKFILE = /(^|\/)(pnpm-lock\.yaml|package-lock\.json)$/;
+// Files a package manager writes (LOCKFILE, from environment.ts): a conflict in one is not merged as text; it is regenerated.
 /** Forks of trunk kept ready so that starting an attempt does not wait for one to be made, unless SPARE_FORKS says otherwise. */
 const SPARE_FORKS = 2, SPARE_FORKS_MAX = 8;
 /** After trunk moves, spare forks are replaced once it has been still this long, so a run of landings replaces them once. */
@@ -125,6 +125,7 @@ export class Project extends DurableObject<BraidEnv> {
 		`);
 		// Added after the first projects existed.
 		try { this.sql.exec("ALTER TABLE runs ADD COLUMN preview_api INTEGER DEFAULT 0"); } catch {}
+		try { this.sql.exec("ALTER TABLE runs ADD COLUMN toolchain TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE attempts ADD COLUMN hosted_detail TEXT"); } catch {}
 		try { this.sql.exec("ALTER TABLE reconciliations ADD COLUMN attempt_sha TEXT"); } catch {}
@@ -1128,7 +1129,11 @@ export class Project extends DurableObject<BraidEnv> {
 		const job: HostJob = {
 			slug: this.meta("slug"), attemptId: a.id, kind, agent: a.agent, repo: a.repo, remote: a.remote, trunkRepo: this.trunk,
 			trunkRemote: this.meta("remote"), branch: this.branch, agentToken: row.token, brief: this.briefText(a), task, ...(row.ask_model ? { model: row.ask_model } : {}),
+			toolchain: await this.toolchainAt(a.repo, a.headSha),
 		};
+		// It may have been stopped, or its attempt ended, while its files were being looked at.
+		const still = this.rows<any>("SELECT status, hosted FROM attempts WHERE id = ?", attemptId)[0];
+		if (!still || !LIVE.has(still.status) || still.hosted !== "starting") return;
 		try {
 			await this.agentHost(a.id)!.start(job);
 		} catch (e) {
@@ -1198,7 +1203,7 @@ export class Project extends DurableObject<BraidEnv> {
 	// ── verification: each commit of an attempt is run in a sandbox ──────────
 
 	private toRun = (r: any): Run => ({
-		id: r.id, ref: r.ref, sha: r.sha, status: r.status, steps: JSON.parse(r.steps), preview: !!r.preview, previewApi: !!r.preview_api, nothingToRun: !!r.nothing_to_run,
+		id: r.id, ref: r.ref, sha: r.sha, status: r.status, steps: JSON.parse(r.steps), preview: !!r.preview, previewApi: !!r.preview_api, nothingToRun: !!r.nothing_to_run, toolchain: r.toolchain ?? null,
 		error: r.error, startedAt: r.started_at, finishedAt: r.finished_at,
 	});
 	private latestRun(ref: string): Run | null {
@@ -1215,11 +1220,32 @@ export class Project extends DurableObject<BraidEnv> {
 	private async policy(): Promise<RunPolicy> {
 		const head = this.meta("head");
 		if (this.policyAt?.head === head) return this.policyAt.policy;
-		const read = async (path: string) => { try { return JSON.parse(asText(await this.host.readFile(this.trunk, head, path)) ?? "null"); } catch { return null; } };
-		const [config, pkg] = [await read("braid.json"), await read("package.json")];
-		const policy = { config: config && typeof config === "object" ? config : null, scripts: Object.keys(pkg?.scripts ?? {}) };
+		const files = this.filesAt(this.trunk, head);
+		const read = async (path: string) => { try { return JSON.parse((await files.read(path)) ?? "null"); } catch { return null; } };
+		const config = await read("braid.json");
+		const policy = { config: config && typeof config === "object" ? config : null, checks: await conventionalChecks(files, config).catch(() => []) };
 		this.policyAt = { head, policy };
 		return policy;
+	}
+
+	/** The files of one commit, as the repository in Artifacts has them. Names at the root are answered from one listing. */
+	private filesAt(repo: string, sha: string): Files {
+		let root: Promise<Set<string>> | null = null;
+		const names = () => (root ??= (async () => {
+			const tree = (await this.host.readCommit(repo, sha))?.treeHash;
+			return new Set(((tree && (await this.host.readTree(repo, tree))) || []).map((e) => e.name));
+		})().catch(() => new Set<string>()));
+		return {
+			has: async (path) => (path.includes("/") ? (await this.host.readFile(repo, sha, path).catch(() => null)) !== null : (await names()).has(path)),
+			read: async (path) => (path.includes("/") || (await names()).has(path) ? asText(await this.host.readFile(repo, sha, path).catch(() => null)) : null),
+		};
+	}
+	/** What a commit has to be run in. From its own files and its own braid.json: an attempt that moves a project to another toolchain is run in that one. */
+	private async toolchainAt(repo: string, sha: string): Promise<Toolchain> {
+		const files = this.filesAt(repo, sha);
+		let own: any = null;
+		try { own = JSON.parse((await files.read("braid.json")) ?? "null"); } catch {}
+		return toolchainOf(files, own).catch(() => "node" as const);
 	}
 
 	/**
@@ -1234,7 +1260,10 @@ export class Project extends DurableObject<BraidEnv> {
 
 	private async startRun(ref: string, target: { repo: string; remote: string; sha: string; branch: string }, regenerate?: string[]) {
 		const runId = this.rows<{ id: number }>("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at) VALUES (?, ?, 'queued', '[]', 0, 0, NULL, ?) RETURNING id", ref, target.sha, now())[0].id;
-		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy: await this.policy(), ...(regenerate ? { regenerate } : {}) };
+		// A lockfile is brought up to date in the image of the toolchain it belongs to.
+		const toolchain = (regenerate && lockOf(regenerate[0])?.toolchain) || (await this.toolchainAt(target.repo, target.sha));
+		this.sql.exec("UPDATE runs SET toolchain = ? WHERE id = ?", toolchain, runId);
+		const job: RunJob = { slug: this.meta("slug"), ref, repo: target.repo, remote: target.remote, branch: target.branch, sha: target.sha, runId, policy: await this.policy(), toolchain, ...(regenerate ? { regenerate } : {}) };
 		try {
 			await this.runner(ref)!.start(job);
 		} catch (e) {
@@ -1316,7 +1345,7 @@ export class Project extends DurableObject<BraidEnv> {
 			a.id, a.intentId, entry.trunk_sha, entry.attempt_sha,
 			json(paths.map((path) => ({ path, kind: "lockfile", base: null, trunk: null, attempt: null, regions: [], trunkWhy: [] }))),
 			json(paths.map((path) => ({ path, content: files[path] }))),
-			`Both sides changed dependencies. ${paths.join(", ")} was regenerated from the merged package.json in a sandbox, starting from trunk's version.`, now());
+			`Both sides changed dependencies. ${paths.join(", ")} was regenerated from the merged ${lockOf(paths[0])?.manifest ?? "manifest"} in a sandbox, starting from trunk's version.`, now());
 	}
 
 	/** What an agent is told about the verification of its current commit. */
@@ -2245,7 +2274,7 @@ export class Project extends DurableObject<BraidEnv> {
 		if (entry.state === "locking") {
 			const run = this.latestRun(`lock:${a.id}`);
 			if (entry.trunk_sha === this.meta("head") && run && run.sha === entry.candidate_sha) {
-				if ((run.status === "queued" || run.status === "running") && now() - run.startedAt < VERIFY_LIMIT_MS) return { kind: "wait", why: "regenerating the lockfile from the merged package.json" };
+				if ((run.status === "queued" || run.status === "running") && now() - run.startedAt < VERIFY_LIMIT_MS) return { kind: "wait", why: "regenerating the lockfile from the merged manifest" };
 				if (run.status !== "pass") return { kind: "refused", why: `both sides changed dependencies and the lockfile could not be regenerated${run.error ? ` (${run.error})` : this.failedSteps(run) ? ` (${this.failedSteps(run)} failed)` : ""}. Merge trunk into the attempt with git and run the install there` };
 			}
 			this.sql.exec("UPDATE queue SET state = 'waiting', candidate_sha = NULL WHERE attempt_id = ? AND at = ?", a.id, entry.at);
@@ -2473,13 +2502,17 @@ export class Project extends DurableObject<BraidEnv> {
 			message: this.landingMessage(intent, a, res.recon), author: this.authorOf(a),
 			resolutions: new Map([...res.map, ...step.conflicts.map((c) => [c.path, c.trunk!] as [string, string])]),
 			expect: { trunk: step.onto, attempt: step.attemptSha },
+			// As the batch was merged: where both sides added a dependency at the same place in the manifest, both are kept.
+			combining: await this.combining(),
 		});
+		// Not only the lockfiles after all: it is a conflict like any other.
+		if (!interim.ok && interim.reason === "conflict") return void this.openReconciliation(entry, a, interim.conflicts, step.onto, step.attemptSha, true);
 		if (!interim.ok) return; // something moved; the next pass starts over
 		await interim.stage(await this.host.token(a.repo, "write", 600));
 		if (!this.held(entry)) return;
-		this.sql.exec("UPDATE queue SET state = 'locking', candidate_sha = ?, trunk_sha = ?, note = ? WHERE attempt_id = ? AND at = ?", interim.sha, interim.parentSha, "regenerating the lockfile from the merged package.json", a.id, entry.at);
+		this.sql.exec("UPDATE queue SET state = 'locking', candidate_sha = ?, trunk_sha = ?, note = ? WHERE attempt_id = ? AND at = ?", interim.sha, interim.parentSha, "regenerating the lockfile from the merged manifest", a.id, entry.at);
 		await this.startRun(`lock:${a.id}`, { repo: a.repo, remote: a.remote, sha: interim.sha, branch: CANDIDATE }, locks);
-		this.note("land", by, `Both attempt ${a.id} and trunk changed ${locks.join(", ")}; regenerating it from the merged package.json`, a.intentId, a.id);
+		this.note("land", by, `Both attempt ${a.id} and trunk changed ${locks.join(", ")}; regenerating it from the merged manifest`, a.intentId, a.id);
 	}
 
 	private members(batchId: number) { return this.rows<any>("SELECT * FROM queue WHERE batch_id = ? ORDER BY position", batchId); }
@@ -2591,7 +2624,7 @@ export class Project extends DurableObject<BraidEnv> {
 		// Trunk is now the very commit that just passed. Its result stands for trunk, unless the project builds
 		// a preview: that is made by running trunk itself.
 		if (!passed.preview && !this.rows("SELECT 1 FROM runs WHERE ref = 'trunk' AND sha = ?", target).length) {
-			this.sql.exec("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at, finished_at) VALUES ('trunk', ?, 'pass', ?, 0, ?, NULL, ?, ?)", target, json(passed.steps), passed.nothingToRun ? 1 : 0, passed.startedAt, passed.finishedAt ?? now());
+			this.sql.exec("INSERT INTO runs (ref, sha, status, steps, preview, nothing_to_run, error, started_at, finished_at, toolchain) VALUES ('trunk', ?, 'pass', ?, 0, ?, NULL, ?, ?, ?)", target, json(passed.steps), passed.nothingToRun ? 1 : 0, passed.startedAt, passed.finishedAt ?? now(), passed.toolchain ?? null);
 		}
 		await this.recordBatch(batch, rows.slice(0, upto + 1));
 		this.sql.exec("DELETE FROM batches WHERE id = ?", batch.id);

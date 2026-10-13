@@ -34,6 +34,7 @@ const FLAG: Record<Flag["kind"], string> = {
 	"tests-deleted": "Tests were deleted",
 	"tests-changed": "Existing tests were changed",
 	checks: "The checks themselves were changed",
+	environment: "What the project is run in was changed",
 	lockfile: "The lockfile changed on its own",
 	"outside-claims": "It changed files it did not say it would",
 	history: "It rewrote its own history",
