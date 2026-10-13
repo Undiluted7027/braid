@@ -63,7 +63,9 @@ export class GitGateway extends WorkerEntrypoint<BraidEnv, { repo: string; path:
 export class RegistryGateway extends WorkerEntrypoint<BraidEnv> {
 	async fetch(request: Request): Promise<Response> {
 		if (request.method !== "GET" && request.method !== "HEAD") return new Response("Braid: the sandbox may only read from the package registry", { status: 403 });
-		return fetch(request);
+		// A registry that answers with a redirect (the Gradle wrapper's download goes by way of two other hosts) is followed here,
+		// so that the sandbox is handed the file and never has to reach a host that is not on its list.
+		return fetch(new Request(request, { redirect: "follow" }));
 	}
 }
 

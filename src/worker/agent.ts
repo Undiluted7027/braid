@@ -97,7 +97,7 @@ export class AgentOutbound extends WorkerEntrypoint<BraidEnv, OutboundProps> {
 		}
 
 		// Packages, read-only, so the agent can install and run the project's own checks.
-		if ((p.registries ?? ["registry.npmjs.org"]).includes(url.hostname) && (request.method === "GET" || request.method === "HEAD")) return fetch(request);
+		if ((p.registries ?? ["registry.npmjs.org"]).includes(url.hostname) && (request.method === "GET" || request.method === "HEAD")) return fetch(new Request(request, { redirect: "follow" }));
 		return refuse(`${url.hostname} is not reachable from this sandbox`);
 	}
 }

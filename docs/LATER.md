@@ -402,7 +402,17 @@ After the second deploy of the evening (October 12, 2026):
    - Agreed for Java: each project can name its mirror in `braid.json`, or have it taken from its own Java settings, with Google's mirror as the default.
    - Done: `environment.maven` on trunk; otherwise the mirrors in the repository's `.mvn/settings.xml`; otherwise Google's mirror. Trunk decides, since it is a host the sandbox may reach, and an attempt cannot name another. Braid allows the host and writes a Maven settings file and a Gradle init script for the sandbox's user, for runs and for hosted agents. A project with its own settings file is left to configure Maven itself.
    - Checked: `pnpm test` (144; two new). With real Maven and Maven Central made unreachable, the sample Java project builds and passes through the generated settings and fails without them.
-   - Not verified: Java on the deployed instance with the mirror (needs a deploy). The Gradle script has not been run by Gradle. Devcontainers and images by name on a real sandbox.
+   - Checked after the third deploy: the Java project verified on the deployed instance through Google's mirror (`mvn test`, 16 s). All five sample projects (Python, Go, Rust, Java, and one in its own image) now verify there.
+   - Checked on the deployed instance afterwards, per language: two attempts that each add something at the same place, and a third that breaks a test.
+     - Go: `go.mod` kept both new modules, `go.sum` was regenerated in the Go image, both landed (44 s), and trunk verifies outside Braid. The attempt that deleted the test file was flagged.
+     - Rust: `Cargo.toml` kept both crates, `Cargo.lock` was regenerated, both landed (20 s).
+     - Java (Maven): both attempts' methods and tests were kept and landed (23 s).
+     - Python: both attempts' functions and tests were kept and landed (13 s), each reviewed and approved first.
+     - In all four the broken attempt failed verification and was refused "ready".
+   - Checked on the deployed instance: an image by name (`"environment": { "image": "python:3.13-slim" }`: pulled in 4 s, loaded, dependencies and checkers installed from PyPI, checks passed), and a devcontainer (a `devcontainer.json` with comments and a trailing comma, its Dockerfile in `.devcontainer/` built from the repository root: built in 19 s, checks passed, a tool from its `apt-get` line was there).
+   - Gradle: the script that points Gradle at the mirror was run by real Gradle 8.14 with Maven Central made unreachable; the build passes with it and fails to resolve JUnit without it. On the deployed instance the project failed earlier than that: the Gradle wrapper's download is redirected from `services.gradle.org` to GitHub and then to another host, and the gateway handed the redirect back to the sandbox, which may not reach either. The gateway now follows a registry's redirects itself. Not yet re-run there.
+   - Checked after the fourth deploy: the Gradle project verified on the deployed instance (`sh ./gradlew --no-daemon test`, 25 s): the wrapper fetched Gradle through the gateway's followed redirects, and its dependencies came from the mirror.
+   - Not verified: uv and poetry projects and their lockfiles, anywhere.
 
 Timings on `scale-probe` before any of this, one call at a time with 19 live attempts: `brief` and `record` 0.12 s, `claim` 1.1 s, `checkpoint` 1.3 s with nothing changed and 5.8 s after a change, `join` 4.4 s (the Artifacts fork itself).
 
