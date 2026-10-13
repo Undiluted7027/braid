@@ -341,6 +341,14 @@ Checked on the deployed instance later on October 12, after the planner, race an
    - The send-back fix (`dep-sendback`, policy "auto"): an attempt that set the title once was reviewed as "changes" by `gpt-6.1-sol`; the hosted Claude Code brought back claimed `app.js` and the new test file before changing them, pushed, and marked it ready; the second review found all three criteria met; nothing was flagged; the policy landed it. 97 s from the first "ready" to trunk, with no person involved. The lines now say "to act on the note it was sent".
    - Still not verified: a model named per racer; three or more attempts; the wait running out with a real straggler; the pick of agreeing judges landing by policy on the deployed instance (seen locally); the comparison view in a browser on the deployed instance.
 
+Submission work, October 12, 2026:
+
+   - The source is public at https://github.com/Undiluted7027/braid (MIT). GitHub's push protection stopped the first push on a made-up Slack webhook address in `test/redact.test.mjs`, which the owner allowed as a test fixture. The whole history was searched first: neither token appears in it.
+   - Run instructions followed from a clean clone of that repository in an empty directory: `pnpm install`, `pnpm typecheck`, `pnpm run build`, `pnpm test` (132), then the Worker started locally with no secrets and `pnpm sim` run against it. All of it worked as written; the simulation's three intents landed. The first start builds the sandbox image and downloads a browser.
+   - The README was cut from about 19 kB to about 6 kB: the idea, how Braid answers the brief's four questions, measured results, how to run it, and what each Cloudflare product is used for. The detail moved, unchanged apart from its order, to `HOW-IT-WORKS.md`, `RUNNING.md`, `LIMITS.md`, and a new `SETTINGS.md` listing every `braid.json` key and instance setting.
+   - Not in the README yet: a link to the demo video (not recorded) and to a live project (the `braid` project is still private).
+   - Not checked: the instructions on an account that has never used Artifacts, where the `braid` namespace does not exist yet; deploying from the clean clone.
+
 Timings on `scale-probe` before any of this, one call at a time with 19 live attempts: `brief` and `record` 0.12 s, `claim` 1.1 s, `checkpoint` 1.3 s with nothing changed and 5.8 s after a change, `join` 4.4 s (the Artifacts fork itself).
 
 ## Interface overhaul (October 4, 2026)

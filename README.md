@@ -2,162 +2,95 @@
 
 **Intents, not branches.** A git platform for many agents changing one codebase at the same time, built on Cloudflare Workers and Artifacts.
 
-Git merges text. It has no idea what either side was trying to do, so when two agents collide it can only show you two sets of lines. Braid keeps the *why* next to every change and uses it at the three moments it matters: while agents are working (so they hear about collisions early, with the other agent's reasoning), when changes collide (so the resolution keeps both goals), and afterwards (so every line on trunk traces to the goal that put it there).
+Git merges text. It has no idea what either side was trying to do, so when two agents collide it can only show you two sets of lines. Braid keeps the *why* next to every change and uses it while agents are working, when their changes collide, and afterwards, when someone asks why a line is there.
 
-## How it works
+Agents connect over **MCP**, so Claude Code, Codex and any other MCP-capable agent work unchanged. Code moves over plain **git**.
 
-| Instead of | Braid has | What it is |
+## The idea
+
+| Instead of | Braid has | |
 |---|---|---|
-| Issue + branch + PR | **Intent** | A goal with acceptance criteria, stated once. |
-| Branch / worktree | **Attempt** | One agent's try at an intent: a fork of trunk in its own Artifacts repo. Several agents can attempt the same intent; you compare and pick one. |
-| Commit message | **Why log** | Decisions, rejected options, and assumptions the agent records as it works. Kept with the change forever. |
-| Finding out at merge time | **Overlaps** | On every push, Braid diffs every live attempt against every other and predicts, per file, whether they will merge. Both agents are told on their next tool call, with the other side's reasoning. |
-| CI on a pull request | **Verification** | Every commit of every attempt is run in a fresh sandbox: install, typecheck, tests, build. Results sit next to the diff, go back to the agent, and gate landing. Trunk is verified after each landing. |
-| Finding out at merge time that two tickets clash | **Plan** | When an intent is opened or edited, a model looks at it next to the other intents: which ask for opposite things, which need another to land first, which are the same thing twice. Agents are told before they start, the queue keeps the order, and a person decides the contradictions. A broad goal can be split into intents as a proposal to accept or edit. |
-| Reading every diff yourself | **Review** | When an agent marks an attempt ready and its checks have run, a model reads the diff against each of the intent's "Done when" criteria: met (with the lines that show it), not met, or not shown. Braid also raises flags by itself, with no model, that always need a person: changed tests or check scripts, files outside what the agent claimed, history pushed over, destructive commands. A project can have Braid land what is plainly good and bring a person the rest. |
-| Picking between two pull requests for the same ticket | **Race** | Start several agents on one intent at once. They work without seeing each other. When they are ready the attempts are compared: what code can measure (checks, size, time, what each touched), a decision model's reading of each criterion on every push, a picture of each preview, and every model the instance has acting as a judge, shown the attempts by letter and not by who made them. A person lands one, or the project's policy lands the one the judges agree on. Why it was chosen over the others is kept with what landed. |
-| Review comments | **Response** | A person sends an attempt back with a note, or answers a question the agent recorded. The agent hears it on its next step (Braid starts a hosted agent again to act on it), and the note is kept with the attempt's decisions, so it is in the landing commit too. |
-| Merge conflict | **Reconciliation** | Each place the two sides disagree, with their base and the intent and decisions behind each side. Resolved one conflict at a time by the agent, a model, or a person, with a rationale that is written into the landing commit. Two added dependencies are not a conflict: `package.json` is merged by key and the lockfile is regenerated in a sandbox. |
-| Merge | **Landing** | One commit on trunk per intent (parents: trunk, attempt head). The commit message carries the goal and the why log. Trunk only takes what has been run: the attempt's commit must have passed, and if trunk has moved since, the merge of the two is verified first. |
-| `git blame` | **Why view** | Every line on trunk, coloured by the intent that landed it. Select a line to see the commit the agent wrote it in, the decisions it recorded while writing it, and that moment in its session. Lines written during a reconciliation say so; lines pushed outside Braid show their commit. |
+| Issue + branch + pull request | **Intent** | A goal with "done when" criteria, stated once. |
+| Branch | **Attempt** | One agent's try at an intent, in its own fork of trunk. |
+| Commit message | **Why log** | The decisions, rejected options and assumptions an agent records as it works. |
+| Finding out at merge time | **Overlaps** | On every push, each attempt is compared with the others, and both agents are told, with the other's reasoning. |
+| Merge | **Landing** | One commit on trunk per intent. Trunk only takes what has been run in a sandbox. |
+| Two pull requests for one ticket | **Race** | Several agents on one intent, blind to each other, then compared. |
+| `git blame` | **Why view** | Every line on trunk traced to the intent, the decision and the moment in the session that wrote it. |
 
-Agents connect over **MCP**, so any MCP-capable coding agent works unchanged. For agents without MCP, every tool is also a shell command (`braid <tool>`). Code moves over plain **git**.
+The full table, and what runs where, is in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
+
+## Four questions
+
+**How do agents know what the others are doing?**
+Before work starts, a planner reads each intent next to the others and names the ones that contradict or depend on each other. While agents work, every push is compared with every other live attempt, and each agent hears about a collision on its next tool call, with the other agent's reasoning.
+
+**What happens when they make conflicting changes?**
+Most never become a conflict: where both sides only added lines at the same place, both are kept and the result is run before it lands. Landings that are ready together are merged and verified together. A real conflict is shown place by place with the intent behind each side, and a project can send it to the agent, then to a model, before it reaches a person.
+
+**How do you review everything they produce?**
+You do not read every diff. Each commit is run in a clean sandbox. An attempt marked ready is read against each criterion by a model from a different maker than the agent that wrote it, and plain facts are flagged without a model (tests deleted, files changed that were not claimed). A project can let what is plainly good land by itself. Competing attempts are compared by two judges who see them by letter, not by who made them.
+
+**How do you keep track of why?**
+The why is recorded when it is decided, not reconstructed. It travels with the landing commit, is copied to a context repository you can clone, and is shown on the lines it led to.
+
+## What it does, measured
+
+On a deployed instance, with scripted agents unless stated:
+
+| | |
+|---|---|
+| 40 agents at once, each joining, pushing and marking ready | tool calls answered in 0.1 to 0.6 seconds typically; starting an attempt took 3.2 seconds at worst |
+| Their 40 landings | 31 land by themselves in 63 seconds, in 6 batches; 9 are left as conflicts |
+| Those 9 | all named as contradictions by the planner before any agent started, with no false alarms among the other 30 intents |
+| An incomplete attempt, with real agents | reviewed, sent back, fixed by a hosted Claude Code, approved and landed in 97 seconds with no person involved |
+| A race between hosted Claude Code and Codex | both ready in about 70 seconds and compared 25 seconds later; the two judges disagreed, so it was left to a person |
+
+How each number was obtained, and what has not been verified, is in [docs/LATER.md](docs/LATER.md).
 
 ## Run it
 
-Needs Node 22.18 or newer, pnpm, git, Docker (running, for the verification sandbox), and a Cloudflare account on the Workers Paid plan (required for Artifacts).
+Needs Node 22.18 or newer, pnpm, git, Docker (running, for the sandboxes), and a Cloudflare account on the Workers Paid plan with Artifacts.
 
 ```sh
 pnpm install
 npx wrangler login
-pnpm dev            # builds the UI, runs the Worker at http://localhost:8787
+pnpm dev            # builds the interface and runs the Worker at http://localhost:8787
 ```
 
-Local dev uses the real Artifacts service through the binding; repos are created in the `braid` namespace of your account.
-
-### See four agents collide and reconcile (no model needed)
+Then, in another terminal, watch four agents work on three intents at once, with no model needed:
 
 ```sh
 pnpm sim --pause
 ```
 
-A scripted run with deterministic "agents". Everything else is real: Artifacts forks, git pushes, MCP calls, overlap prediction, the starter app's tests run in a sandbox for every commit and every merge, landing, and both ways of reconciling. Open the printed URL and press Enter to step through. Variants: `pnpm sim` (run straight through and clean up), `pnpm sim --until=conflict` (leave the project at the open reconciliation), `pnpm sim --until=ready`, `pnpm sim --keep`. `BRAID_PROJECT=<name>` names the project.
+The agents are scripted; everything else is real: Artifacts forks, git pushes, MCP calls, overlap prediction, the starter app's tests run in a sandbox for every commit and every merge, and landings. Open http://localhost:8787 and follow along.
 
-### Put real agents on it
+Local development uses the real Artifacts service: repositories are created in the `braid` namespace of your account. `pnpm test` runs the test suite, which needs no Cloudflare account.
 
-1. Open http://localhost:8787, create a project, and open an intent or two. A project's trunk can start from the built-in starter app, from an existing git repository imported by URL, or from a local repository:
+To put real agents on a project, start them in sandboxes on Cloudflare, or deploy your own instance, see [docs/RUNNING.md](docs/RUNNING.md). Every setting is in [docs/SETTINGS.md](docs/SETTINGS.md).
 
-```sh
-node cli/braid.mjs init http://localhost:8787 --name my-project --from /path/to/repo   # pushes that repo's HEAD as trunk
-```
+## Built on
 
-2. For each agent, in its own terminal:
+| Cloudflare product | What Braid uses it for |
+|---|---|
+| **Workers** | The API, the MCP endpoint for agents, the interface, and previews of every attempt. |
+| **Artifacts** | Trunk is a repository and every attempt is a fork of it. Push events tell Braid when an agent has pushed. |
+| **Durable Objects** | One per project, with SQLite: all coordination state, an event log, and the only writer to trunk. |
+| **Containers** | A fresh sandbox for every commit that is verified, and for every hosted agent. No Internet access and no credentials inside. |
+| **Workflows** | Carry each push event to the project that owns the repository. |
+| **AI Gateway** | Every model call (reviews, planning, judging, reconciliation, hosted agents), with the provider keys held in the gateway. |
+| **Workers AI** | Clef, a decision model, reads every push and says how likely each criterion is met. |
+| **Browser Run** | Takes a picture of each attempt's preview when attempts are compared. |
 
-```sh
-node cli/braid.mjs join http://localhost:8787/p/<project> --intent 1 --agent claude-code --run
-node cli/braid.mjs join http://localhost:8787/p/<project> --intent 2 --agent codex --run
-```
+## More
 
-`join` forks trunk into a new Artifacts repo, clones it, writes the MCP config and a `BRAID.md` brief, and (with `--run`) starts Claude Code or Codex headless in that directory. Without `--run` it prints the directory so you can start the agent yourself. Join the same intent twice to get competing attempts.
-
-On a machine without this repository, the instance serves the launcher as one file, and "Add an agent" on an intent shows the exact command:
-
-```sh
-curl -fsSLO https://<your-instance>/braid.mjs
-node braid.mjs join https://<your-instance>/p/<project> --intent 1 --agent claude-code --run
-```
-
-On an instance with an admin token, set `BRAID_ADMIN_TOKEN` in the environment first.
-
-`--model <model>` runs the agent on that model and shows it beside the agent's mark on the attempt. Without it each agent uses its own default; Claude Code still reports which model that was, Codex does not, so a Codex attempt then shows the agent's name.
-
-What a headless agent gets and what Braid keeps of its session:
-
-- The agent runs with a scrubbed environment: only what it needs to run and to sign in to its own provider. `--pass-env NAME,NAME` lets more through.
-- Its words, the commands it ran and the files it touched are recorded. Command output is recorded as a status line (`ok · 34 lines · 2.1 kB`); only git, test and build commands also keep the last few lines. Commands that name a credential file never keep output.
-- Everything is redacted on your machine before it is sent (known key formats, bearer headers, passwords in URLs, the attempt's own tokens, secret-looking values from your environment) and again on the server.
-- At landing, the intent, decisions and transcript are committed to `<project>--context`; `POST /api/p/<project>/context-credentials` returns a read token for cloning it.
-
-This reduces what can leak; it does not sandbox the agent. A headless agent can still read anything your user can, and Codex's login shell reloads whatever your shell profile exports.
-
-3. Watch the project page. When attempts are ready, open the intent, compare them (decisions, diff, live preview), and land one. Two agents joined to the same intent are a race: they are compared when both are ready (see "Race and compare" below).
-
-### Deploy
-
-```sh
-npx wrangler secret put BRAID_ADMIN_TOKEN     # required: the UI asks for it once, the CLI takes --token
-npx wrangler secret put ANTHROPIC_API_KEY     # optional: model-backed reconciliation with Claude, and hosted Claude Code
-npx wrangler secret put AI_GATEWAY_TOKEN      # optional: hosted agents through AI Gateway (also set AI_GATEWAY_ID in wrangler.jsonc)
-pnpm run deploy
-```
-
-To move a project between two instances that share an Artifacts namespace (local to deployed, say): `GET /api/p/<project>/export` on the old one, `POST /api/projects/import` with `{ "dump": <that> }` on the new one, then `DELETE /api/p/<project>?repos=keep` on the old one so it forgets the project without deleting its repositories.
-
-With the admin token set, everything needs it, reads included: project state contains agent session transcripts. Agents keep using their own attempt tokens. A deployed instance with no admin token refuses requests unless the `BRAID_OPEN` variable is `"true"`.
-
-A project's owner can make it public from its page ("Who can read this"). Anyone with the link can then read it live without signing in: intents, code, decisions, agent sessions and previews. They cannot change anything, and other projects stay private.
-
-With AI Gateway or `ANTHROPIC_API_KEY` set, the "Reconcile with a model" button uses Claude; otherwise Workers AI. Agents and people can always reconcile without any model.
-
-## What runs where
-
-- **Worker** (`src/worker/index.ts`): HTTP API, the MCP endpoint, static UI, and previews. `/preview/<project>/<attempt>/` serves any attempt's files straight out of its Artifacts repo, so a no-build web project is runnable per attempt with nothing deployed.
-- **Durable Object, one per project** (`src/worker/project.ts`): all coordination state in SQLite (intents, attempts, why log, overlaps, reconciliations, landings), WebSocket fan-out to the UI, and the only writer to trunk, so landings are serialized.
-- **Artifacts**: trunk is a repo; every attempt is a fork (`<project>--i<intent>-a<n>-<id>`). Reads use the Workers binding (`log`, `readTree`, `readBlob`, `readFile`, `fork`, `createToken`). The binding cannot write, so landing fetches trunk and the attempt into an in-memory repo with isomorphic-git, merges, and pushes over the Git protocol (`src/worker/land.ts`).
-- **Workflow on push events** (`PushWorkflow`): a `cf.artifacts.repo.pushed` trigger on the whole namespace starts a Workflow for every push, which tells the owning project to re-read that attempt and recompute overlaps. Agents also call `checkpoint` after pushing, which does the same thing synchronously.
-- **Landing queue** (in the project object): "Land this" is a request for the commit on screen. It is written down and answered at once; a worker in the project object does the rest, and how it turned out shows on the attempt.
-  - The attempt's own commit must have passed. If the attempt started from trunk's head, its merge is the tree that passed, and it lands at once.
-  - Otherwise Braid builds the merge commit, parks it on a staging repository, and runs it in a sandbox. Trunk moves to it only if it passes, so two changes that each pass and break each other in different files are caught before trunk has them. A reconciled merge is verified the same way.
-  - Landings that are ready together are verified together: trunk + A, that + B, that + C, with one run of the last merge. If it passes they all land, each as its own commit. If it fails, every step is run at once: those before the first failure land, that one is refused, and the rest are merged again. Up to eight at a time.
-  - Where trunk and an attempt both added lines at the same place and neither changed the other's, both are kept, trunk's first, and the result is run like any merge. A place where either side changed or removed the other's lines is a conflict and opens a reconciliation.
-  - Settings, in trunk's `braid.json`: `"landing": { "batch": 8, "combine": true, "conflicts": "person", "policy": "person" }` `"review": true` and `"plan": true`. With `"conflicts": "auto"` a conflict goes to the attempt's own agent first (if Braid runs it), then to the model, and to a person only after both.
-  - With `"policy": "auto"` Braid asks for a landing itself when the agent marked the attempt ready, its checks passed, the review found every criterion met, nothing is flagged, no question is unanswered, and it is the only live attempt at its intent. The request goes through the same queue as a person's. When the reviewer asks for changes the attempt is sent back with them, twice at most. Whatever stops it is written on the attempt. Because the setting is read from trunk, an attempt cannot change the policy it is judged by, and an attempt that touches `braid.json` is flagged.
-- **Planner** (`src/worker/plan.ts`, `planner.ts`): one structured model call when an intent is opened or edited, showing it next to the other open intents and the last few that landed. Its answer is checked before it is kept: a contradiction must point at the criteria that clash on both sides, a dependency must be on an open intent and cannot close a circle, and one relation is kept per pair. A dependency holds a landing back until the other intent lands (the queue waits; "Land now" overrides); a contradiction is for a person, who can also dismiss it or state a relation by hand. Splitting a goal is one more call that returns a proposal; nothing is opened until a person accepts it. `"plan": false` in `braid.json`, or the switch in the interface, turns it off.
-- **Race and compare** (`src/worker/race.ts`, `judge.ts`, `signal.ts`, `shot.ts`): any intent with two or more live attempts is a race. "Race" on an intent starts several hosted agents at once (the project's line-up, or the agents and models named).
-  - Attempts at one intent are made blind: the brief says another agent is attempting the same intent and nothing more, and `peek` and `message` refuse. What a person answers one of them, or changes in the intent, is told to all.
-  - They are compared when every one is ready or its agent has gone, or when the wait for the rest runs out (30 minutes after the first is ready; the others are then named as left out). A comparison is for the commits it read; when one moves, it is made again.
-  - Each judge is one structured call (Claude and an OpenAI model when both are set up), shown the attempts as A, B, C in a different order each, with each attempt's diff, review, checks, recorded decisions and picture. It answers with a pick, a ranking, why, how the approaches differ, and what is worth keeping from each. Two judges naming the same attempt is "agreed"; one judge alone only recommends.
-  - The decision model is Cloudflare's Clef on Workers AI (`@cf/cloudflare/clef`): it reads the diff and answers each criterion with a probability in a few hundred milliseconds, so it is asked on every push. It also reads the lines a reviewer cites and marks a citation that does not seem to show the criterion. It never lands or overturns anything. Tried on 30 patches before it was built in: it agreed with Claude and GPT on every clear case and was unsure, once wrong, where a change left something out (the smaller Clef models missed most of those and are not used).
-  - Pictures are taken with Browser Run (the `BROWSER` binding) of each compared attempt's preview and kept in the project object.
-  - With `"policy": "auto"` the pick lands by itself only when the judges agree, the decision model gives every criterion at least `landing.likelihood` (0.9 unless set; that number comes from the 30-patch trial on one small app, so treat it as a starting point and set your own), and the attempt passes the ordinary policy. Otherwise the attempt says what it is waiting for and a person chooses.
-  - Settings, in trunk's `braid.json`: `"race": { "agents": [{ "kind": "claude", "model": "claude-opus-5-5" }, "codex"], "wait": 30 }`, `"landing": { "likelihood": 0.9 }`, `"signal": false` to turn the decision model off.
-- **Review** (`src/worker/review.ts`, `reviewer.ts`, `flags.ts`): one structured model call per reviewed commit, to Claude or to an OpenAI model (through AI Gateway, or `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`; no review without one of them). Where the instance has both, an attempt is read by a model from a different maker than the agent that wrote it; `"reviewer": "claude"` or `"openai"` in `braid.json` fixes it. The reviewer is shown the criteria, the diff, the agent's decisions, the check results and Braid's flags; what the agent wrote is fenced off as material to judge, not instructions. Its answer is not taken whole: "met" needs lines in the diff, or the checks having actually passed for a criterion about the checks, and "approve" with any criterion short of that becomes a matter for a person. Reviews can be turned off per project (`"review": false`, or in the interface), and `pnpm sim` runs with them off.
-  - If the attempt moves after landing was asked for, the request is dropped. A saved resolution is only used for the two commits it was written against.
-  - While trunk is failing, only an attempt whose merge passes (one that fixes it) lands.
-  - "Land now" skips all of this, and the landing is recorded as forced.
-  - The landing is written down before trunk is pushed, so one that reaches trunk is recorded even if the Worker stops in between.
-- **Runner, one per attempt** (`src/worker/runner.ts`): a Durable Object with a container. For each new commit it starts a fresh Linux instance, fetches that commit, installs, and runs the project's checks, reporting each step to the project as it goes. After a build it copies the output into its own storage and serves it as the attempt's preview, so the preview outlives the sandbox.
-  - The instance has no Internet access and is given no credentials. Git and package traffic leave it only through two Worker entrypoints: one adds a read token for that attempt's repository and refuses everything else (pushes, other repositories); the other allows reads from the npm registry.
-  - What runs: `braid.json` at the repository root if present (`{ "install": "...", "checks": { "name": "command" }, "preview": { "dir": "dist", "api": "braid" } }`), otherwise the `typecheck`, `lint`, `test` and `build` scripts in `package.json`. A repository with neither is served as it is. Trunk decides: an attempt is run with trunk's `braid.json` and every check script trunk has, so it cannot pass by removing a check. (It can still change what a script does; that shows in its diff.)
-  - A built page is served under `/preview/<project>/<attempt>/` but was built to live at a site root, so Braid puts a small script in front of it that sends its `/...` requests under the preview path and shows its router the path it expects.
-  - `"api": "braid"` is for a project whose backend is Braid itself (this repository): the preview's `/api/` calls are answered by the instance it runs on, reads only and only for that project, so an attempt's UI can be reviewed against real data. Such a preview may only talk to its own instance.
-- **Agent host, one per hosted attempt** (`src/worker/agent.ts`): "Run Claude Code" or "Run Codex" on an intent starts a sandbox, clones a fresh attempt into it, gives the agent its brief and Braid's tools, and starts it headless. The host reads what the agent prints every few seconds and adds it to the attempt's session, then removes the sandbox when the agent exits.
-  - The sandbox has no Internet access and holds no credentials: no model key, no git token, not even its own Braid token. One Worker entrypoint sees every request it makes and allows only this project's Braid tools, fetch and push of its own attempt, fetch of trunk, its own provider's inference calls, and reads from the npm registry, adding the token for each outside the sandbox. Abandoning or superseding the attempt stops the agent.
-  - Model access is through AI Gateway (`AI_GATEWAY_ID` and the `AI_GATEWAY_TOKEN` secret, with Unified Billing or stored provider keys), or through `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` secrets. `HOSTED_CLAUDE_MODEL` and `HOSTED_CODEX_MODEL` override the models.
-- **Model** (`src/worker/resolver.ts`): optional. Claude via AI Gateway or the Anthropic SDK if a key is set, otherwise Workers AI. It is shown the merged file with the conflicts marked in place (long unchanged stretches left out) and answers with one replacement per conflict, so the size of the file does not matter and it cannot touch lines that were never in conflict.
-
-## Agent tools (MCP)
-
-`brief` · `claim` · `record` · `checkpoint` · `peek` · `message` · `check` · `ready` · `reconciliation` · `resolve` · `sync`
-
-Every response carries `heads_up`: overlaps, messages from other agents, and trunk movement since the agent's last call. Endpoint: `POST /mcp/<project>` with the attempt token as the bearer.
-
-## Limits
-
-- A built preview is static files. An app that needs its own backend loads but its API calls fail. Braid's own UI is the exception: it reads from the instance it is previewed on. Assets a build loads by root path from inside JavaScript or CSS (lazy chunks, `url(/...)`) are not redirected.
-- Verification supports Node projects (npm or pnpm). Each step has ten minutes.
-- Overlap prediction is per file, by three-way line merge. It does not see semantic conflicts in different files.
-- A file deleted on one side and edited on the other cannot be reconciled in the UI; the agent merges trunk with git (`sync`). A rename shows up as exactly that.
-- Lockfiles are regenerated for npm and pnpm only.
-- A hosted agent runs once, for at most 45 minutes. A person can bring it back to act on a note, reconcile a conflicted landing or fix failed checks. Only a conflict can bring it back by itself, and only in a project that asks for that (`landing.conflicts`).
-- Reverting a landing adds one commit that undoes it and reopens the intent. It is refused if a later landing changed the same lines, and the revert itself is verified on trunk afterwards, not before.
-- Braid refuses a resolution that is identical to one side unless told that is intended.
-- One merge is verified at a time, so landings queue behind each other; each takes as long as the project's checks.
-- A project runs at most six hosted agents at once (`HOSTED_MAX`), which also bounds a race. A race has no budget in money.
-- Braid compares attempts; it does not combine them. What a judge finds worth keeping in a losing attempt is shown, and a person can send it to the winner as a note.
-- A picture shows the page as it loads. It cannot show behaviour (a click, a reload), and inherits the limits of previews.
-- Attempts at one intent cannot see each other through Braid. Two people running agents by hand can of course show each other anything.
-- Tests (`pnpm test`) cover git analysis, the tree merge, redaction, session capture, the tar reader, and the project object itself run under Node against real git repositories with stand-ins for the models; `pnpm sim` exercises a deployed or local instance end to end.
+- [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md): every idea, and what runs where.
+- [docs/RUNNING.md](docs/RUNNING.md): real agents, hosted agents, deploying, the agent tools.
+- [docs/SETTINGS.md](docs/SETTINGS.md): every `braid.json` key and instance setting.
+- [docs/LIMITS.md](docs/LIMITS.md): what Braid does not do.
+- [docs/DIRECTION.md](docs/DIRECTION.md): how well it answers the questions above, and what comes next.
+- [docs/LATER.md](docs/LATER.md): what was built, checked and left open at each step.
 
 ## License
 
